@@ -61,7 +61,7 @@ contract LedgerSettlement is LedgerBase {
         returns (uint256 taken, uint256 collateralOut)
     {
         if (msg.sender != redeemer) revert Unauthorized();
-        bytes32 ilk = ilkOf[id];
+        bytes32 ilk = ilkOf(id);
         ParametersBase.Config memory c = params.config(ilk);
         ParametersBase.Risk memory r = params.storedRisk(ilk);
         Position storage p = _positions[id];
@@ -111,7 +111,7 @@ contract LedgerSettlement is LedgerBase {
         returns (uint256 repaid, uint256 seized, uint256 bad)
     {
         if (msg.sender != liquidator) revert Unauthorized();
-        bytes32 ilk = ilkOf[id];
+        bytes32 ilk = ilkOf(id);
         ParametersBase.Config memory c = params.config(ilk);
         ParametersBase.Risk memory r = params.storedRisk(ilk);
         Position storage p = _positions[id];
@@ -291,7 +291,7 @@ contract LedgerSettlement is LedgerBase {
         // any rate the owner chose, and the top-up premium was paid at that).
         if (newRate != oldRate) p.premiumRate = inCooldown ? (p.premiumRate != 0 ? p.premiumRate : uint64(oldRate)) : 0;
         else if (!inCooldown) p.premiumRate = 0; // the clock restarts below: a lapsed premium must not come back with it
-        p.lastRateChange = uint64(block.timestamp);
+        p.lastRateChange = uint40(block.timestamp);
         _record(s, p, oldDebt, oldRate, debt, newRate);
         if (c.redeemable) _relist(ilk, id, true, true, true, prevHint, nextHint);
         emit RateSet(id, ilk, newRate, premium);

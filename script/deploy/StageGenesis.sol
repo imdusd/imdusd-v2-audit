@@ -273,7 +273,13 @@ abstract contract StageGenesis is StagePeg {
             _rec("ImdDepth", g, type(ImdDepth).creationCode.length + 32);
         }
         uint256 n = cfg.depth.samplers.length;
-        if (d.samplers.length != n) d.samplers = new DepthSampler[](n);
+        if (d.samplers.length != n) {
+            // Keep the recorded ones (each is still compared with its spec below): discarding the array redeployed samplers
+            // the first run had already listed (audit wave 2, low).
+            DepthSampler[] memory kept = new DepthSampler[](n);
+            for (uint256 i; i < n && i < d.samplers.length; ++i) kept[i] = d.samplers[i];
+            d.samplers = kept;
+        }
         address[] memory list = new address[](n);
         for (uint256 i; i < n; ++i) {
             DeployTypes.SamplerSpec memory sp = cfg.depth.samplers[i];
@@ -300,6 +306,10 @@ abstract contract StageGenesis is StagePeg {
             g = gasleft();
             d.params.setGenesisImdDepth(address(d.imdDepth), list);
             _rec("params.setGenesisImdDepth", g, CALL_DATA + 32 * n);
+        } else if (keccak256(abi.encode(d.imdDepth.samplers())) != keccak256(abi.encode(list))) {
+            // A resume found ImdDepth already listing samplers: they must be the config's, in its order (audit wave 2, low:
+            // a changed list redeployed samplers that were never listed, and the run sealed measuring the old ones).
+            revert Mismatch("ImdDepth samplers");
         }
     }
 

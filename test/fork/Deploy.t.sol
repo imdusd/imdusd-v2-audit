@@ -21,6 +21,7 @@ import {IFeed} from "../../src/interfaces/IFeed.sol";
 import {ChainlinkFeed} from "../../src/feeds/ChainlinkFeed.sol";
 import {ProductFeed} from "../../src/feeds/ProductFeed.sol";
 import {LivePoolPrice} from "../../src/feeds/LivePoolPrice.sol";
+import {ProvenPoolPrice} from "../../src/feeds/ProvenPoolPrice.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {RateFeed} from "../../src/feeds/RateFeed.sol";
 import {PegHook} from "../../src/peg/PegHook.sol";
@@ -91,7 +92,7 @@ contract DeployForkTest is Test {
         assertEq(cfg.governor, Mainnet.GOVERNANCE_SAFE);
         assertEq(cfg.v1, Mainnet.V1_IMDUSD);
         assertEq(cfg.ilks.length, 9);
-        assertEq(cfg.feeds.length, 23); // + wstETH's second leg (ETH/USD x stEthPerToken), + sIMD's median nodes
+        assertEq(cfg.feeds.length, 25); // + wstETH's second leg (ETH/USD x stEthPerToken), + sIMD's median nodes, + the depth samplers' proven IMD reference (audit wave 2)
         assertEq(cfg.ilks[1].spot, MainnetConfig.F_WSTETH_ETH, "wstETH spot = ETH/USD x stEthPerToken");
         assertEq(cfg.ilks[2].spot, MainnetConfig.F_BTC, "cbBTC spot = BTC/USD");
         assertEq(cfg.ilks[3].spot, MainnetConfig.F_BTC, "WBTC spot = BTC/USD");
@@ -493,6 +494,11 @@ contract DeployForkTest is Test {
                 assertEq(SwarmFeed(f).maxAge(), n.maxAge, "leaf maxAge");
                 assertEq(SwarmFeed(f).maxDeviationBps(), n.cap, "leaf cap");
                 assertEq(SwarmFeed(f).MAX_ALLOWANCE_BPS(), 20_000, "leaf stale cap");
+            } else if (n.kind == DeployTypes.PROVEN_POOL) {
+                assertEq(ProvenPoolPrice(f).manager(), n.source, "proven manager");
+                assertEq(PoolId.unwrap(ProvenPoolPrice(f).poolId()), n.poolId, "proven pool");
+                assertEq(ProvenPoolPrice(f).baseIsToken0(), n.passOneE18, "proven base side");
+                assertEq(ProvenPoolPrice(f).maxAge(), n.maxAge, "proven max age");
             } else if (n.kind == DeployTypes.LIVE_POOL) {
                 assertEq(address(LivePoolPrice(f).manager()), n.source, "manager");
                 assertEq(PoolId.unwrap(LivePoolPrice(f).poolId()), n.poolId, "pool");
@@ -508,7 +514,7 @@ contract DeployForkTest is Test {
             // them: deployed empty, unpriced until the first relay.
             bool empty = i == MainnetConfig.F_IMD_MEDIAN || i == MainnetConfig.F_IMD_SPOT || i == MainnetConfig.F_IMD_USD_SPOT
                 || i == MainnetConfig.F_SIMD_SPOT || i == MainnetConfig.F_NHI || i == MainnetConfig.F_IMD_USD_MEDIAN
-                || i == MainnetConfig.F_SIMD_MEDIAN;
+                || i == MainnetConfig.F_SIMD_MEDIAN || i == MainnetConfig.F_IMD_PROVEN || i == MainnetConfig.F_IMD_USD_PROVEN;
             (uint256 v,) = IFeed(f).latestValue();
             if (empty) assertEq(v, 0, "empty until the first relay");
             else assertGt(v, 0, "feed reads zero");

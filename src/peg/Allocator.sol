@@ -54,6 +54,7 @@ interface ISwapRoute {
 interface IBackstopSale {
     function imdUSD() external view returns (IERC20);
     function coll(address token) external view returns (uint256);
+    function collIn(address token) external view returns (uint256);
     function oracle() external view returns (IBackstopPriceAlloc);
     function sell(address token, uint256 amount, uint256 minOut, bytes calldata data) external returns (uint256 got);
 }
@@ -150,6 +151,10 @@ contract Allocator is GovernedByKind, TransientReentrancyGuard {
     uint256 public constant AUCTION_START_BPS = 10_300;
     uint256 public constant AUCTION_FLOOR_BPS = 9_800; // = Backstop.MAX_SALE_SLIPPAGE_BPS: below it the sleeve refuses
     uint256 public constant AUCTION_DURATION = 2 hours;
+    /// @notice New collateral restarts a running sale (and stops its price) only past this share of the sleeve's holding (audit
+    /// wave 2, low): any arrival used to, so a ~9 imdUSD dust self-liquidation reset the whole holding to the top every 90 min.
+    /// Arrivals under it are sold at the run's price, never under the sleeve's floor.
+    uint256 public constant RESTART_ARRIVAL_BPS = 500;
     uint8 private constant ROUTE_SALE = 1;
     uint8 private constant AUCTION_SALE = 2;
     /// @notice LP actions need the peg pool's spot within this many ticks of its 30-minute TWAP: a push
@@ -173,9 +178,10 @@ contract Allocator is GovernedByKind, TransientReentrancyGuard {
     bool public frozen;
     uint16 public maxSlippageBps;
     mapping(bytes32 auction => uint64 startedAt) public auctionStart; // keccak256(backstop, collateral)
-    /// @notice The sleeve's holding of the token when its run started, lowered by each buy: more than this now means new
-    /// collateral the run has not offered from its top, and the run's price stops until a restart.
-    mapping(bytes32 auction => uint256 coll) public auctionColl;
+    /// @notice The sleeve's `collIn` (all collateral ever credited) when its run started: more than this now means new
+    /// collateral the run has not offered from its top, and the run's price stops until a restart. A count of arrivals,
+    /// not the holding: an in-kind exit lowered the holding and hid the next arrival under it (audit wave 2, medium).
+    mapping(bytes32 auction => uint256 collIn) public auctionColl;
     mapping(address asset => address vault) public autoVault;
     mapping(address asset => uint256 amount) public keepLiquid;
     mapping(address lpVault => uint256 shares) public lpTarget;
@@ -325,15 +331,15 @@ contract Allocator is GovernedByKind, TransientReentrancyGuard {
 
     /// @notice Start (or restart) the descending sale of `collateral` held by sleeve `backstop`. Allowed when none has run
     /// yet, when the last one has reached its floor (so a restart cannot hold the price up for longer than one run), or when
-    /// the sleeve holds more of the token than the run has offered (new collateral is always offered from the top).
+    /// more than RESTART_ARRIVAL_BPS of the holding has arrived since the run started (it is then offered from the top).
     function startAuction(address backstop, address collateral) external {
         if (frozen) revert Frozen();
         if (!allowed[_key(BACKSTOP_SALE, backstop)]) revert NotAllowed(BACKSTOP_SALE, backstop);
         bytes32 k = _auctionKey(backstop, collateral);
         uint256 s = auctionStart[k];
-        uint256 held = IBackstopSale(backstop).coll(collateral);
-        if (s != 0 && block.timestamp < s + AUCTION_DURATION && held <= auctionColl[k]) revert AuctionRunning();
-        (auctionStart[k], auctionColl[k]) = (uint64(block.timestamp), held);
+        uint256 arrived = IBackstopSale(backstop).collIn(collateral);
+        if (s != 0 && block.timestamp < s + AUCTION_DURATION && !_newArrivals(backstop, collateral, k)) revert AuctionRunning();
+        (auctionStart[k], auctionColl[k]) = (uint64(block.timestamp), arrived);
         emit AuctionStarted(backstop, collateral);
     }
 
@@ -363,7 +369,6 @@ contract Allocator is GovernedByKind, TransientReentrancyGuard {
         if (pay > maxPay) revert PriceAbove(pay, maxPay);
         _draw(BACKSTOP_SALE, backstop, pay);
         _sell(backstop, collateral, amount, pay, abi.encode(AUCTION_SALE, msg.sender, pay));
-        auctionColl[_auctionKey(backstop, collateral)] = IBackstopSale(backstop).coll(collateral);
         emit Bought(backstop, collateral, msg.sender, amount, pay);
     }
 
@@ -699,12 +704,18 @@ contract Allocator is GovernedByKind, TransientReentrancyGuard {
         }
     }
 
+    /// @dev Whether more collateral arrived since the run's start than RESTART_ARRIVAL_BPS of what the sleeve holds.
+    function _newArrivals(address backstop, address collateral, bytes32 k) internal view returns (bool) {
+        uint256 arrived = IBackstopSale(backstop).collIn(collateral) - auctionColl[k];
+        return arrived != 0 && arrived * 10_000 > IBackstopSale(backstop).coll(collateral) * RESTART_ARRIVAL_BPS;
+    }
+
     /// @dev The auction's price now and the sleeve's `low` it floors on.
     function _auction(address backstop, address collateral) internal view returns (uint256 price, uint256 low) {
         bytes32 k = _auctionKey(backstop, collateral);
         uint256 s = auctionStart[k];
         if (s == 0) revert AuctionIdle();
-        if (IBackstopSale(backstop).coll(collateral) > auctionColl[k]) revert AuctionStale();
+        if (_newArrivals(backstop, collateral, k)) revert AuctionStale();
         IBackstopPriceAlloc o = IBackstopSale(backstop).oracle();
         uint256 high;
         bool ok;

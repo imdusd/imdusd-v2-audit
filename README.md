@@ -37,8 +37,9 @@ What this core adds over a plain CDP:
   Safe) that can stop it. Its four discretionary jobs are RULE-DRIVEN: anyone may call them and the contract picks amount,
   price and route. Seized collateral sells by a descending auction per (sleeve, token) (103% of the sleeve's highest
   price, `max(low, high, redemption payout)`, falling to 98% of `low` over 2 hours, paid in imdUSD straight to the sleeve
-  through `Backstop.sell` and never under its floor; collateral that arrives later stops the price until anyone restarts
-  the run, so it is always offered from the top);
+  through `Backstop.sell` and never under its floor; collateral that arrives later, once it passes 5% of the sleeve's
+  holding, stops the price until anyone restarts the run, which offers all of it from the top; smaller arrivals sell at
+  the run's price, never under the floor);
   `rebalanceVault` keeps a Safe-set amount of an asset liquid and deposits the rest in its one approved vault;
   `topUpBuffer` fills the peg buffer to its target; `rebalanceLp` moves protocol-owned `PegLPVault` shares toward a target
   behind a spot-versus-TWAP gate (no target set means no rule). A keeper role still exists for manual actions; the beta
@@ -52,7 +53,10 @@ What this core adds over a plain CDP:
 - **Measured IMD depth.** The sIMD line obeys `line x (1 + chop) + redeemCap (+ other chains' IMD lines) <= k x depth`.
   `DepthSampler` measures each IMD exit pool's depth to -15% on chain from the pool's own liquidity, in hourly buckets;
   `ImdDepth` sums the samplers and keeps a robust 7-day low, min'd with a swarm-attested depth leg once configured. A
-  posted figure is only a ceiling.
+  posted figure is only a ceiling. The band's reference price is IMD/ETH pool 0xb07d's END-OF-BLOCK price, proven from
+  Ethereum state (`ProvenPoolPrice`: the block header against `blockhash`, then the PoolManager's account proof and the
+  pool's `slot0` storage proof, verified with Optimism's MerkleTrie/RLPReader, vendored in `src/vendor/optimism`), x
+  Chainlink ETH/USD; a proven price lives 6 hours and anyone may prove a newer block.
 - **RateManager.** Optional, outside the core: owners grant it SET_RATE only; a manager key re-rates members within fixed
   bounds, each member's own floor and ceiling, and only outside their 7-day rate cooldown.
 
@@ -73,7 +77,7 @@ network is needed for the offline suites.
 
 ```bash
 forge build                                                    # solc via_ir: a clean build takes a long time
-forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,267 tests)
+forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,297 tests)
 forge build --use solar && forge test --use solar --no-match-path 'test/fork/*'   # fast dev loop (see below)
 
 # Fork suites: one file at a time, single-threaded (in parallel, set-up calls hit RPC rate limits)
@@ -94,7 +98,7 @@ with a small script (the same rule as `cloc`'s code lines; pragma and import lin
 higher figures than the previous snapshot's table (for example 1,049 against 1,014 for the same old core files), so
 compare areas within this table, not across snapshots.
 
-**Round 1: what the beta deploys (7,537 nSLOC)**
+**Round 1: what the beta deploys (7,728 nSLOC, plus 349 vendored)**
 
 The beta is `script/DeployBeta.s.sol`, which runs `script/Deploy.s.sol` with `BetaConfig` (`script/DeployConfig.sol`):
 the full mainnet config with lower lines, a 300k chain-wide debt cap, seats on, and LoopVault and the DEX off. It
@@ -102,15 +106,16 @@ deploys every contract below.
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,577 |
-| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 553 |
-| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min` | 609 |
+| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,604 |
+| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 554 |
+| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min`, `ProvenPoolPrice` | 711 |
 | D. Peg | `PegHook`, `FeeNotes` | 596 |
-| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,124 |
-| F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 829 |
+| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,129 |
+| F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 853 |
 | G. Peg LP vault and PEG positions | `PegLPVault`, `PegCollateral`, `PegShareFeed`, `PegPositionZap` | 599 |
-| H. Backstop and Allocator | `Backstop`, `IBackstop`, `PricerOracle`, `Allocator` | 1,245 |
-| I. Measured depth | `DepthSampler`, `ImdDepth` | 405 |
+| H. Backstop and Allocator | `Backstop`, `IBackstop`, `PricerOracle`, `Allocator` | 1,252 |
+| I. Measured depth | `DepthSampler`, `ImdDepth` | 430 |
+| Vendored (in scope as used) | `src/vendor/optimism`: `MerkleTrie`, `SecureMerkleTrie`, `RLPReader`, `RLPErrors`, `Bytes` (op-contracts/v9.0.0, imports made relative; PROVENANCE.md) | 349 |
 
 **Round 2: later modules (2,195 nSLOC)**
 
@@ -129,7 +134,7 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
 
 1. **Supply equation.** At rest, `totalSupply == Σ debt + Σ badDebt + reserveBacked + migrator outstanding + peg keeper
    outstanding + bridge received − bridge sent` (see the `LedgerBase` header). Flash-minted amounts exist only inside a
-   transaction (`circulating()` excludes them). The edge premium and interest are minted on both sides at once.
+   transaction (`circulating()` is the supply before the transaction's first mint or burn). The edge premium and interest are minted on both sides at once.
 2. **Solvency and health.** No action that adds debt or removes collateral leaves a position below its type's liquidation
    ratio at the borrow price (`min(low, cap)`), and none is allowed unless the price is fresh and its two legs agree
    within `skew`. Repayments and deposits
@@ -156,13 +161,15 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
 - **Governor:** a 2-of-3 Safe, immutable in each contract. It acts only through the 48-hour timelocks of `Parameters`,
   `Treasury` and `Allocator`, except instant actions: the risk-reducing ones (lowering a line, a cap, a keeper cap, a
   depth ceiling, a bucket; disabling a sleeve listing; freezing the Allocator), unfreezing the Allocator, and
-  `Allocator.returnToTreasury` (funds held there back to the Treasury, no bucket). It cannot move user collateral or
+  `Allocator.returnToTreasury` (funds held there back to the Treasury, no bucket), and `Treasury.retireReserve` (burning
+  Treasury imdUSD against reserve-backed supply; it was permissionless before wave 2). It cannot move user collateral or
   mint imdUSD directly. It can name one bridge minter, once, through the 48-hour timelock (`SET_BRIDGE`): that minter
   can mint without limit and burn from any holder. The beta leaves the slot empty.
 - **Swarm attester:** swarm-priced feeds (sIMD legs, NHI, seat median and spot, the depth leg) accept an EIP-712
   attestation only from one pinned signer, for one pinned question (bound by hash), with absolute floors (panel of at
   least 100, at least 51 agreeing); a value moves at most a fixed cap per epoch, widened at most 2x after an hour of
-  staleness. Relaying is permissionless. A compromised attester can move those feeds within the cap per epoch, and nothing
+  staleness, and once an epoch has expired may return in one step to within the cap of a level the feed held in the last
+  two epochs (Known issues). Relaying is permissionless. A compromised attester can move those feeds within the cap per epoch, and nothing
   on chain checks the sIMD pair against the market (see Known issues).
 - **Chainlink:** aggregators are trusted within staleness bounds; answers at the aggregator's min/max clamp or above a
   sanity cap read as unpriced.
@@ -199,7 +206,8 @@ Items below are known and do not need to be reported unless you find a materiall
 - One wei of sIMD sent to the shared `Join` in a block makes that block's `viaAsset` unwraps revert (sIMD's one-block
   hold); matters mainly once `LoopVault` is on.
 - While a price is stale, borrowing up to the line can use the last attested `low` (bounded by the per-epoch cap).
-- An honest large sIMD redemption can hold the sIMD redemption fee at its 5% cap for hours (by design).
+- An honest large sIMD redemption can hold the sIMD redemption fee at its 5% cap for hours (by design). A type never
+  redeemed starts its base rate at 0.5% (fee about 1% at the seal), decaying with a 12 h half-life.
 - The redemption fee is sized on the requested amount while the base-rate rise uses the filled amount.
 - `PegHook`'s quote feed and max age are immutable; a v4 protocol fee at or above the keeper margin would make small
   keeper trades revert.
@@ -277,17 +285,17 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
 
 **Measured depth**
 
-- **Depth griefing (cost corrected after the first public audit).** A push, a sample and the push back fit in one
-  transaction (between two PoolManager unlocks) or one bundle, so no capital is held: the cost is the pool fee both ways
-  plus gas, about 2% of the pushed notional (~$200 per hour for a 25% push at this snapshot's depth, ~$450 for 50%; the
-  earlier "$9,998" was the IMD sold, which the attacker buys back). Four such hours in one UTC day lower the measured
-  depth for about 8 days (depth 61,954 to 45,251 and sIMD line 21,636 to 10,500 at 25%; depth 36,648 and line 4,765 at
-  50%). It can only lower the sIMD line; positions are untouched. The samplers use the live pool price x ETH/USD as their
-  band reference (an attested reference would need an IMD price at most 1 hour old at every sample). Sampler 0 references
-  its own pool (0xb07d), so its `maxDeviationTicks` guard is inert; samplers 1 and 2 are measured against 0xb07d's price,
-  so a large push of 0xb07d makes them refuse `PoolOffReference` rather than deflate. A public sample can also be sandwiched
-  to INFLATE a bucket (+L / sample / -L); the operator samples through private relays, an operational defence, not the
-  contract's. A fix needs a reference a push cannot move (an attested leg, or a proven end-of-previous-block pool price).
+- **Depth reference (changed: wave 2 fixed the depth griefing).** The samplers' reference used to be the LIVE pool price,
+  and a push, a sample and the push back in one transaction or bundle deflated a bucket for ~2% of the push. It is now
+  pool 0xb07d's end-of-block price, proven from state, which nothing inside the sampling transaction can move: a push
+  within `maxDeviationTicks` (400) leaves the reading unchanged (the walk counts positions around the reference), a larger
+  one is refused `PoolOffReference`. What is left: (1) a push held across a block's END (the attacker exposed to every
+  arbitrageur for a block, or one party building two consecutive blocks) is proven like an honest price; (2) the proof may
+  be up to 6 hours old, so after a real move the band is measured around the older price (bounded by the 400-tick guard);
+  anyone may prove a newer block, and the operator re-proves on drift; (3) a change of Ethereum's state trie
+  (binary/Verkle) ends these proofs: the samplers then read stale (zero depth, fail closed) until the Safe swaps them;
+  (4) a public sample can still be sandwiched to INFLATE a bucket (+L / sample / -L): the operator samples through private
+  relays, an operational defence, not the contract's.
 - **Keeper outage closes new sIMD borrowing.** If no sampler is sampled for about 6 hours of a 26-hour window, it reads 0
   depth and the 7-day low holds new sIMD borrowing at 0 for about 8 days. Existing positions are untouched. Fail-closed by
   design.
@@ -340,7 +348,7 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
   only; mainnet has no Pulse).
 - **Flash cap is per loan in flight, not per transaction.** Sequential flash loans in one transaction each get the full
   cap; `circulating()` stays correct.
-- **`circulating()` and flash loans.** Inside a native flash loan it reads at least the supply when the outermost loan
+- **`circulating()` and flash loans (superseded in wave 2: now the supply before the transaction's first mint or burn).** Inside a native flash loan it reads at least the supply when the outermost loan
   began, so real burns inside the loan (a redemption split in chunks) also read against that supply: second order. The
   fix covers imdUSD's own flash mint only: imdUSD borrowed elsewhere to repay one's own debt, redeem and re-borrow still
   deflates the supply for the redemption, bounded by outside imdUSD liquidity, the upfront fee and the 5% fee cap.
@@ -353,10 +361,48 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
   value only moves between protocol addresses. The collateral auction's top is 103% of the sleeve's highest price
   (`max(low, high, payout)`; the payout follows the type's live pool), its floor 98% of `low`: a type with no live pool
   leg tops at its attested `high`, so in a rally the pair has not caught up with a buyer can pay under market. Anyone may
-  restart a run once it reaches its floor (griefing: up to 2 hours per restart before the floor again).
+  restart a run once it reaches its floor (griefing: up to 2 hours per restart before the floor again), or once more than
+  5% of the holding has arrived since it started (a buyer who can make the sleeve take 5% of its holding through
+  liquidations can reset the run for the chop on that amount).
   `rebalanceVault` deposits at the vault's share price of that moment: only rate-based vaults (sUSDS-like) are meant for
   it; changing the auto vault leaves the old vault's shares to a keeper or the Safe. `rebalanceLp` exits with zero
   minimums behind the spot-versus-TWAP gate. Each is bounded by its bucket, and `freeze()` (the Safe) stops all of them.
+
+### Known issues added after the second public audit (wave 2, 5de80a6)
+
+- **SwarmFeed way back (trade-off).** After an epoch expires, a value within the cap of the expired epoch's level, its
+  anchor or the previous epoch's anchor is accepted in one step, whatever the last value was: a pushed or compromised
+  attestation can move the feed back to within the cap of where it stood one to two lifetimes ago in one step (wave 1
+  had bounded any one step at 2x the cap). In exchange three boundary-timed pushes (or two after a silence) no longer lock
+  the honest level out. A lock-out still needs FOUR boundary-timed pushes in a row with no honest value between them
+  (`test_fourBoundaryPushesInARowStillLockOut`); recovery is the Safe re-pointing the leaf (48 h).
+- **BATCH proposals are dry-run at propose.** An item that fails only because of an earlier item in the same batch is
+  refused at propose; an item that would fail on its own (waiting on state: a retire before its feed stops, a line raise
+  before depth) is still accepted and fails at apply if the state never arrives, as a single proposal does.
+- **Seat auction clock needs both legs.** Priced time counts only seconds in which the median leaf and the ETH/USD leg
+  were both fresh. ETH/USD fresh at the last tick and fresh now counts as fresh throughout (its heartbeat keeps it so); an
+  ETH/USD gap that opened and closed between two ticks is not seen (the operator ticks an auction when its type goes
+  unpriced). The median's reconstruction runs slow, never fast.
+- **Gas-driven layout (new since 5de80a6).** `SortedPositions` keeps only each node's links: a node's rate is the
+  position's recorded rate read from `Ledger.rateOf` (the Ledger lists, re-lists and removes with exactly that rate).
+  A position's type is a 16-bit index in its own record (`ilkIndex`; `lastUpdate`/`lastRateChange` are uint40), and
+  `ilkOf(id)` a view over it; the first position ever opened on a type registers its index (one-time cost). Samplers
+  measure only the side `depth()` reports (the other reads 0) and store readings in whole USD, rounded down.
+- **Sleeves hold up to 10 tokens** (was 6); the beta lists 6 on the blue sleeve.
+
+### What changed since the second public audit (5de80a6)
+
+For the re-check: the third commit of this repository is the whole delta. Fixes: `SwarmFeed` way back two epochs deep
+with no step bound from the last value, and a remote window's upper bound measured from the first value's fixed origin;
+the Allocator's auction keyed on `Backstop.collIn` (arrivals, not the holding an in-kind exit lowers) with a 5% restart
+threshold; `ImdUSD.circulating()` = supply before the transaction's first mint or burn; the seat auction clock stops while
+ETH/USD is stale; claim rules refuse ERC-4626 redeem/withdraw, burn and burnFrom (the denylist is a packed byte scan);
+`retireReserve` governor only; a never-redeemed type's base rate starts at 0.5%; `lowerOtherImdLines` removed;
+ADD_DEPTH_SAMPLER and SET_DEPTH_LEG checked at propose as at apply; BATCH dry-run at propose; a resumed stage 4 keeps
+recorded samplers and stops if ImdDepth lists others. New: the proven depth reference (`ProvenPoolPrice` + vendored
+trie/RLP), 10-token sleeves, and a gas review (one-sided samplers with packed buckets; an open creates 7 storage slots,
+not 9). Each fix has a test named `AuditW2*` (the auditors' proofs, adapted and made strict) or sits in the existing
+suites; `test/fork/GasPaths.fork.t.sol` and `test/unit/GasSlots.t.sol` measure the gas changes.
 
 ### What changed since the first public audit (2875ffb)
 

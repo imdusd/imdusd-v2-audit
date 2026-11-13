@@ -93,9 +93,10 @@ abstract contract LedgerBase is TransientReentrancyGuard {
         uint128 collateral;
         uint128 debt; // recorded at lastUpdate
         uint64 rate; // annual, 1e18
-        uint64 lastUpdate;
-        uint64 lastRateChange;
+        uint40 lastUpdate; // uint40 (to year 36812): room for ilkIndex in this slot, which every open writes (gas review)
+        uint40 lastRateChange;
         uint64 premiumRate; // the rate before the last rate change: debt added inside the cooldown pays 7 days of it
+        uint16 ilkIndex; // 1 + the position's type's index in `_ilkList`; 0 = no such position (gas review)
         uint192 yieldMark; // capped share rate at the last harvest (high-water mark)
         uint32 version; // liquidation-risk version bound at the last risk-increasing action
     }
@@ -152,8 +153,11 @@ abstract contract LedgerBase is TransientReentrancyGuard {
     address public liquidator;
 
     mapping(uint256 id => Position) internal _positions;
-    /// @notice The collateral type of a position (zero: no such position).
-    mapping(uint256 id => bytes32) public ilkOf;
+    /// @dev The collateral types positions were created for, in first-use order. A position records 1 + its type's index here
+    /// in its own third slot (`Position.ilkIndex`, written on open anyway) instead of a slot of its own (gas review:
+    /// one storage slot fewer per open, 110k gas at Glamsterdam prices). `ilkOf(id)` reads it back.
+    bytes32[] internal _ilkList;
+    mapping(bytes32 ilk => uint16) internal _ilkIndex;
     mapping(bytes32 ilk => IlkState) public ilkState;
 
     /// @notice imdUSD whose position debt was repaid by harvested yield now held by the Treasury.
@@ -241,8 +245,14 @@ abstract contract LedgerBase is TransientReentrancyGuard {
         } catch {}
     }
 
+    /// @notice The collateral type of a position (zero: no such position).
+    function ilkOf(uint256 id) public view returns (bytes32) {
+        uint256 i = _positions[id].ilkIndex;
+        return i == 0 ? bytes32(0) : _ilkList[i - 1];
+    }
+
     function _ilkOf(uint256 id) internal view returns (bytes32 ilk) {
-        ilk = ilkOf[id];
+        ilk = ilkOf(id);
         if (ilk == bytes32(0)) revert UnknownPosition();
     }
 
@@ -347,7 +357,7 @@ abstract contract LedgerBase is TransientReentrancyGuard {
         s.weighted = s.weighted - oldDebt * oldRate + newDebt * newRate;
         p.debt = newDebt.toUint128();
         p.rate = newRate.toUint64();
-        p.lastUpdate = uint64(block.timestamp);
+        p.lastUpdate = uint40(block.timestamp);
     }
 
     /// @dev Pay `debt` down from yield accrued since `p.yieldMark` (see the contract docstring). Returns

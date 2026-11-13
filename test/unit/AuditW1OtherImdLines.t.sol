@@ -50,13 +50,13 @@ contract AuditW1OtherImdLinesTest is Test {
         params.seal();
     }
 
+    /// Audit wave 2: the instant act is gone (it could only widen the line); the selector is not served at all.
     function test_instantLowerDoesNotRaiseDepthGatedLine() public {
         uint256 before = params.risk(SIMD).line;
         assertEq(before, 37_000e18);
         vm.prank(gov);
-        vm.expectRevert(ParametersBase.OutOfBounds.selector); // the depth line binds: refused, not raised
-        params.lowerOtherImdLines(0); // the other chain still runs its 3,000 line; nothing checks that
-        // Expected (README invariant 7 / trust model: instant acts only reduce risk): the sIMD line does not rise.
-        assertLe(params.risk(SIMD).line, before, "instant act raised the sIMD line"); // before the fix: 40,000
+        (bool ok,) = address(params).call(abi.encodeWithSignature("lowerOtherImdLines(uint256)", uint256(0)));
+        assertFalse(ok, "no instant lower of the other chains' lines");
+        assertEq(params.risk(SIMD).line, before);
     }
 }

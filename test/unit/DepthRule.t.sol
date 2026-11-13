@@ -164,15 +164,7 @@ contract DepthRuleTest is System {
         params.applyPending();
         vm.prank(governor);
         params.cancel();
-        // Lowering is instant, governor only.
-        vm.expectRevert(Governed.NotGovernor.selector);
-        params.lowerOtherImdLines(0);
-        vm.prank(governor);
-        params.lowerOtherImdLines(1_000e18);
-        assertEq(params.otherImdLines(), 1_000e18);
-        vm.prank(governor);
-        vm.expectRevert(ParametersBase.OutOfBounds.selector);
-        params.lowerOtherImdLines(2_000e18);
+        // There is no instant lower of the other chains' lines (audit wave 2): it changes through SET_OTHER_IMD only.
     }
 
     function test_batchAppliesInOrderAndChecksAtApply() public {

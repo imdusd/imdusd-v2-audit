@@ -70,9 +70,10 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
     using SafeERC20 for IERC20;
 
     struct Auction {
-        uint176 startPrice; // fall-capped median (SeatFeed.medianUsd), USD per seat
+        uint136 startPrice; // fall-capped median (SeatFeed.medianUsd), USD per seat (uint136: room for ethAt in slot 1)
         uint40 startAt; // wall clock of the opening
         uint40 lastTick; // priced time is reconstructed from here
+        uint40 ethAt; // `updatedAt` of the ETH/USD leg at `lastTick` (audit wave 2)
         address marker;
         uint40 attestedAt; // `updatedAt` of the median attestation live at `lastTick`
         uint40 ran; // priced seconds counted up to `lastTick`
@@ -405,12 +406,14 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
     function _open(uint256 id, address marker) private {
         SeatFeed f = _feed();
         uint256 start = f.medianUsd();
-        if (start == 0) revert NoAuction();
+        if (start == 0 || start > type(uint136).max) revert NoAuction();
         (, uint64 at) = f.median().latestValue();
+        (, uint64 ethAt) = f.ethUsd().latestValue();
         auctions[id] = Auction({
-            startPrice: uint176(start),
+            startPrice: uint136(start),
             startAt: uint40(block.timestamp),
             lastTick: uint40(block.timestamp),
+            ethAt: uint40(ethAt),
             marker: marker,
             attestedAt: uint40(at),
             ran: 0
@@ -451,6 +454,8 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
         a.lastTick = uint40(block.timestamp);
         (, uint64 at) = _feed().median().latestValue();
         a.attestedAt = uint40(at);
+        (, uint64 ethAt) = _feed().ethUsd().latestValue();
+        a.ethAt = uint40(ethAt);
     }
 
     /// @dev Priced seconds since the opening: `ran` plus, since `lastTick`, the time the median attestation
@@ -459,33 +464,64 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
     /// every opening, take and tick); with more, the time between the old window's end and the NEWEST
     /// attestation is treated as stale (not counted) even where an intermediate attestation priced it:
     /// the clock only ever runs slow, never fast (a slower decay, a longer life), and a `tick` after each
-    /// relay makes it exact. The ETH/USD leg's own staleness blocks a sale (`NotPriced`) but is not
-    /// reconstructed here.
+    /// relay makes it exact.
     /// The new attestation's window opens when the chain first held it, max(signed, relayed), not at its signature
     /// (audit wave 1, panel 6): one signed before the old window closed but relayed after it, or signed in the gap and relayed
     /// later, must not count the hours the chain read stale (when `take` refused `NotPriced`) as priced time.
+    /// BOTH LEGS (audit wave 2, medium): the seat is unpriced while either the median or the ETH/USD leg is stale, so only
+    /// seconds in which both were fresh count; a Chainlink gap past its maxAge no longer runs the sale toward its floor
+    /// while `take` refuses. The ETH/USD leg updates about hourly, so it is NOT reconstructed like the median (that read
+    /// every hour between two ticks as a gap and all but stopped the clock): fresh at the last tick and fresh now counts
+    /// as fresh throughout (the heartbeat keeps it so); a stretch counts as stale only while the leg is stale NOW (up to
+    /// its last update + maxAge) or was already stale at the last tick (from its newest update on). A gap that opened and
+    /// closed between two ticks is not seen: the keeper ticks an auction when its type goes unpriced, which records it.
     function _elapsed(Auction memory a) private view returns (uint256 ran) {
-        ran = a.ran;
-        IFeed m = _feed().median();
+        SeatFeed f = _feed();
+        IFeed m = f.median();
         (, uint64 newAt) = m.latestValue();
-        uint256 life = m.maxAge();
-        uint256 t = block.timestamp;
-        uint256 from = a.lastTick;
-        uint256 freshUntil = uint256(a.attestedAt) + life;
         uint256 opened = Math.max(uint256(newAt), uint256(IRelayedAt(address(m)).acceptedAt()));
+        uint256[4] memory mw = _fresh(a.lastTick, a.attestedAt, newAt, opened, m.maxAge());
+        IFeed e = f.ethUsd();
+        (, uint64 ethNow) = e.latestValue();
+        uint256[4] memory ew = _freshEth(a.lastTick, a.ethAt, ethNow, e.maxAge());
+        ran = a.ran + _overlap(mw[0], mw[1], ew[0], ew[1]) + _overlap(mw[0], mw[1], ew[2], ew[3])
+            + _overlap(mw[2], mw[3], ew[0], ew[1]) + _overlap(mw[2], mw[3], ew[2], ew[3]);
+    }
+
+    /// @dev The fresh stretches of one leg from `from` to now, as up to two disjoint intervals [w0, w1) and [w2, w3): the
+    /// value live at `from` (`oldAt`) until it aged out, then the one live now from when the chain first held it.
+    function _fresh(uint256 from, uint256 oldAt, uint256 newAt, uint256 opened, uint256 life)
+        private
+        view
+        returns (uint256[4] memory w)
+    {
+        uint256 t = block.timestamp;
+        uint256 freshUntil = oldAt + life;
         if (opened <= freshUntil) {
-            // The current attestation (the same one, or a refresh relayed before the old one aged out): fresh
-            // without a gap until the newest window closes.
-            uint256 end = Math.min(t, Math.max(freshUntil, uint256(newAt) + life));
-            if (end > from) ran += end - from;
+            // The same value, or a refresh before the old one aged out: fresh without a gap until the newest closes.
+            (w[0], w[1]) = (from, Math.min(t, Math.max(freshUntil, newAt + life)));
         } else {
-            // A gap: the old window closed before the new attestation reached the chain.
-            uint256 end1 = Math.min(t, freshUntil);
-            if (end1 > from) ran += end1 - from;
-            uint256 from2 = Math.max(from, opened);
-            uint256 end2 = Math.min(t, uint256(newAt) + life);
-            if (end2 > from2) ran += end2 - from2;
+            // A gap: the old value aged out before the new one reached the chain.
+            (w[0], w[1]) = (from, Math.min(t, freshUntil));
+            (w[2], w[3]) = (Math.max(from, opened), Math.min(t, newAt + life));
         }
+    }
+
+    /// @dev The ETH/USD leg's fresh stretch from `from` to now (see `_elapsed`): one interval, from `from` if it was fresh
+    /// at the last tick, else from its newest update, to now or to where it went stale.
+    function _freshEth(uint256 from, uint256 oldAt, uint256 newAt, uint256 life)
+        private
+        view
+        returns (uint256[4] memory w)
+    {
+        uint256 start = oldAt + life >= from ? from : Math.max(from, newAt);
+        (w[0], w[1]) = (start, Math.min(block.timestamp, newAt + life));
+    }
+
+    function _overlap(uint256 a0, uint256 a1, uint256 b0, uint256 b1) private pure returns (uint256) {
+        uint256 lo = Math.max(a0, b0);
+        uint256 hi = Math.min(a1, b1);
+        return hi > lo ? hi - lo : 0;
     }
 
     function _expired(Auction memory a) private view returns (bool) {

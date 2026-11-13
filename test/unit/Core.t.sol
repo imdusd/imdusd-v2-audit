@@ -820,6 +820,7 @@ contract CoreTest is System {
         vm.prank(dave);
         usd.transfer(address(treasury), 100e18);
         uint256 reserveBefore = ledger.reserveBacked();
+        vm.prank(governor);
         treasury.retireReserve(100e18);
         assertEq(ledger.reserveBacked(), reserveBefore - 100e18);
         _assertSupply();

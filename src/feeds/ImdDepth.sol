@@ -90,6 +90,17 @@ contract ImdDepth {
         emit SamplerAdded(sampler);
     }
 
+    /// @notice Whether `addSampler(sampler)` would succeed now: Parameters refuses ADD_DEPTH_SAMPLER at propose otherwise
+    /// (audit wave 2, low: a listed sampler, a listed pool or a 7th passed propose and always failed at apply).
+    function canAdd(address sampler) external view returns (bool) {
+        if (sampler.code.length == 0 || _index(sampler) != type(uint256).max || _samplers.length >= MAX_SAMPLERS) return false;
+        (address m, bytes32 id) = (IDepthPool(sampler).manager(), IDepthPool(sampler).poolId());
+        for (uint256 i; i < _samplers.length; ++i) {
+            if (IDepthPool(_samplers[i]).poolId() == id && IDepthPool(_samplers[i]).manager() == m) return false;
+        }
+        return true;
+    }
+
     function removeSampler(address sampler) external onlyParams {
         uint256 i = _index(sampler);
         if (i == type(uint256).max) revert BadSampler();

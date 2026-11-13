@@ -5,9 +5,14 @@ import "./ParametersBase.sol";
 
 /// @notice Parameters' per-kind validation and application (EIP-170 split; the LedgerSettlement pattern). Deployed
 /// by Parameters' constructor and run ONLY by delegatecall from it, on Parameters' storage; a direct call is refused.
+/// @dev Parameters' own BATCH dry run (audit wave 2), reached by a self-call: this module runs in Parameters' context.
+interface IBatchCheck {
+    function checkBatch(bytes[] calldata items) external;
+}
+
 contract ParametersRules is ParametersBase {
     address private immutable self;
-    uint256 internal constant SLEEVE_MAX_TOKENS = 6; // Backstop.MAX_TOKENS
+    uint256 internal constant SLEEVE_MAX_TOKENS = 10; // Backstop.MAX_TOKENS
     uint256 internal constant SLEEVE_MAX_ILKS = 12; // Backstop.MAX_ILKS
 
     error NotDelegated();
@@ -74,10 +79,11 @@ contract ParametersRules is ParametersBase {
             if (depthIlk == bytes32(0)) revert OutOfBounds();
         } else if (kind == ADD_DEPTH_SAMPLER) {
             (, address sampler) = abi.decode(payload, (uint8, address));
-            if (address(imdDepth) == address(0) || sampler.code.length == 0) revert OutOfBounds();
+            if (address(imdDepth) == address(0) || !imdDepth.canAdd(sampler)) revert OutOfBounds();
         } else if (kind == SET_DEPTH_LEG) {
             (, address leg, address price) = abi.decode(payload, (uint8, address, address));
             if (address(imdDepth) == address(0) || (leg == address(0)) != (price == address(0))) revert OutOfBounds();
+            if (leg != address(0) && (leg.code.length == 0 || price.code.length == 0)) revert OutOfBounds(); // as ImdDepth.setLeg
         } else if (kind == SET_OTHER_IMD) {
             (, , uint64 chop) = abi.decode(payload, (uint8, uint256, uint64));
             if (depthIlk == bytes32(0) || chop > 1e18) revert OutOfBounds();
@@ -133,6 +139,9 @@ contract ParametersRules is ParametersBase {
                 if (abi.decode(items[i], (uint8)) == BATCH) revert UnknownKind();
                 _validate(items[i]);
             }
+            // Each item above was checked against the state BEFORE the batch; apply re-checks item i after items 0..i-1
+            // (audit wave 2, low): `Parameters.checkBatch` dry-runs it in order and refuses an item broken by an earlier one.
+            IBatchCheck(address(this)).checkBatch(items);
         } else if (kind == OPEN_NOTE_SERIES) {
             (, uint64 tenor, uint32 discountBps, uint128 cap) = abi.decode(payload, (uint8, uint64, uint32, uint128));
             if (notes == address(0)) revert BadConfig();
@@ -221,32 +230,50 @@ contract ParametersRules is ParametersBase {
 
     /// @dev A SeatAccount forwards any calldata after an allowlisted (target, selector), so a claim rule may never
     /// name a selector that moves or approves the account's tokens (ERC-20 / 721 / 1155 / 777 / 1363 transfers, approvals,
-    /// permits, and multicall, which reaches any of them): allowlisting one would let anyone move every account's unpaid rewards. Removing a rule (rule 0) is always allowed.
-    function _movesTokens(bytes4 s) private pure returns (bool) {
-        return s == 0x095ea7b3 // approve(address,uint256)
-            || s == 0xa9059cbb // transfer(address,uint256)
-            || s == 0x23b872dd // transferFrom(address,address,uint256)
-            || s == 0xd505accf // permit(address,address,uint256,uint256,uint8,bytes32,bytes32) (EIP-2612)
-            || s == 0x8fcbaf0c // permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32) (DAI)
-            || s == 0x39509351 // increaseAllowance(address,uint256)
-            || s == 0xd73dd623 // increaseApproval(address,uint256) (older Zeppelin tokens)
-            || s == 0x87517c45 // approve(address,address,uint160,uint48) (Permit2)
-            || s == 0xa22cb465 // setApprovalForAll(address,bool)
-            || s == 0x42842e0e // safeTransferFrom(address,address,uint256)
-            || s == 0xb88d4fde // safeTransferFrom(address,address,uint256,bytes)
-            || s == 0xf242432a // safeTransferFrom(address,address,uint256,uint256,bytes) (ERC-1155)
-            || s == 0x2eb2c2d6 // safeBatchTransferFrom(address,address,uint256[],uint256[],bytes) (ERC-1155)
-            || s == 0x1296ee62 // transferAndCall(address,uint256) (ERC-1363)
-            || s == 0x4000aea0 // transferAndCall(address,uint256,bytes) (ERC-677, ERC-1363)
-            || s == 0xd8fbe994 // transferFromAndCall(address,address,uint256) (ERC-1363)
-            || s == 0xc1d34b89 // transferFromAndCall(address,address,uint256,bytes) (ERC-1363)
-            || s == 0x3177029f // approveAndCall(address,uint256)
-            || s == 0xcae9ca51 // approveAndCall(address,uint256,bytes)
-            || s == 0x9bd9bbc6 // send(address,uint256,bytes) (ERC-777)
-            || s == 0x62ad1b83 // operatorSend(address,address,uint256,bytes,bytes) (ERC-777)
-            || s == 0x959b8c3f // authorizeOperator(address) (ERC-777)
-            || s == 0xac9650d8 // multicall(bytes[])
-            || s == 0x5ae401dc; // multicall(uint256,bytes[])
+    /// permits, ERC-4626 redeem/withdraw, burns, and multicall, which reaches any of them): allowlisting one would let anyone move every account's unpaid rewards. Removing a rule (rule 0) is always allowed.
+    /// @dev The selectors refused, packed 4 bytes each (a scan is smaller than 28 comparisons; ParametersRules is at the
+    /// size limit), in this order:
+    ///   0x095ea7b3 approve(address,uint256)
+    ///   0xa9059cbb transfer(address,uint256)
+    ///   0x23b872dd transferFrom(address,address,uint256)
+    ///   0xd505accf permit(address,address,uint256,uint256,uint8,bytes32,bytes32) (EIP-2612)
+    ///   0x8fcbaf0c permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32) (DAI)
+    ///   0x39509351 increaseAllowance(address,uint256)
+    ///   0xd73dd623 increaseApproval(address,uint256) (older Zeppelin tokens)
+    ///   0x87517c45 approve(address,address,uint160,uint48) (Permit2)
+    ///   0xa22cb465 setApprovalForAll(address,bool)
+    ///   0x42842e0e safeTransferFrom(address,address,uint256)
+    ///   0xb88d4fde safeTransferFrom(address,address,uint256,bytes)
+    ///   0xf242432a safeTransferFrom(address,address,uint256,uint256,bytes) (ERC-1155)
+    ///   0x2eb2c2d6 safeBatchTransferFrom(address,address,uint256[],uint256[],bytes) (ERC-1155)
+    ///   0x1296ee62 transferAndCall(address,uint256) (ERC-1363)
+    ///   0x4000aea0 transferAndCall(address,uint256,bytes) (ERC-677, ERC-1363)
+    ///   0xd8fbe994 transferFromAndCall(address,address,uint256) (ERC-1363)
+    ///   0xc1d34b89 transferFromAndCall(address,address,uint256,bytes) (ERC-1363)
+    ///   0x3177029f approveAndCall(address,uint256)
+    ///   0xcae9ca51 approveAndCall(address,uint256,bytes)
+    ///   0x9bd9bbc6 send(address,uint256,bytes) (ERC-777)
+    ///   0x62ad1b83 operatorSend(address,address,uint256,bytes,bytes) (ERC-777)
+    ///   0x959b8c3f authorizeOperator(address) (ERC-777)
+    ///   0xba087652 redeem(uint256,address,address) (ERC-4626: owner = the account, no allowance; audit wave 2)
+    ///   0xb460af94 withdraw(uint256,address,address) (ERC-4626)
+    ///   0x42966c68 burn(uint256)
+    ///   0x79cc6790 burnFrom(address,uint256)
+    ///   0xac9650d8 multicall(bytes[])
+    ///   0x5ae401dc multicall(uint256,bytes[])
+    bytes private constant MOVES_TOKENS = hex"095ea7b3a9059cbb23b872ddd505accf8fcbaf0c39509351d73dd62387517c45a22cb46542842e0eb88d4fdef242432a2eb2c2d61296ee624000aea0d8fbe994c1d34b893177029fcae9ca519bd9bbc662ad1b83959b8c3fba087652b460af9442966c6879cc6790ac9650d85ae401dc";
+
+    function _movesTokens(bytes4 s) private pure returns (bool hit) {
+        bytes memory m = MOVES_TOKENS;
+        assembly ("memory-safe") {
+            let p := add(m, 32)
+            for { let end := add(p, mload(m)) } lt(p, end) { p := add(p, 4) } {
+                if eq(and(mload(p), shl(224, 0xffffffff)), s) {
+                    hit := 1
+                    break
+                }
+            }
+        }
     }
 
     function _apply(bytes memory payload) internal override {

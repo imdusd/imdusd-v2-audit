@@ -148,6 +148,13 @@ contract MockBackstop is IBackstopSale {
         return IERC20(t).balanceOf(address(this));
     }
 
+    /// @dev Backstop.collIn: everything ever credited (here: held + sold, since the mock is credited by plain transfers).
+    function collIn(address t) external view returns (uint256) {
+        return IERC20(t).balanceOf(address(this)) + soldOf[t];
+    }
+
+    mapping(address => uint256) public soldOf;
+
     function setImdUSD(IERC20 t) external {
         imdUSD = t;
     }
@@ -163,6 +170,7 @@ contract MockBackstop is IBackstopSale {
         (uint256 low,,) = prices.priceOf(token);
         require(got >= amount * low / 1e18 * 9_800 / 10_000, "floor"); // Backstop.MAX_SALE_SLIPPAGE_BPS
         sold += amount;
+        soldOf[token] += amount;
         proceedsBooked += got;
     }
 }

@@ -75,8 +75,11 @@ contract W1RkProofRetireBlocksNotes is Test {
         vm.warp(block.timestamp + 37 days + 1);
         assertEq(imd.balanceOf(address(treasury)), 1_000e18, "Treasury holds the face");
 
-        // No bad debt is booked, so anyone may burn the Treasury's whole balance against reserveBacked.
+        // A stranger may no longer burn it at all (audit wave 2: governor only); the governor's burn keeps the notes' face.
         vm.prank(attacker);
+        vm.expectRevert();
+        treasury.retireReserve(type(uint256).max);
+        vm.prank(address(0x5AFE)); // the governor
         treasury.retireReserve(type(uint256).max);
 
         // Expected: the matured note is still payable from the interest that backed it.

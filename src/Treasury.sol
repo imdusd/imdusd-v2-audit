@@ -139,7 +139,9 @@ contract Treasury is Governed {
     /// @notice Burn `amount` of Treasury imdUSD against reserve-backed supply. Never while bad debt is booked: the same balance is
     /// what covers it, and anyone may call this. It leaves the fee notes' outstanding face (audit
     /// wave 1: a stranger could burn what pays matured notes, so every redemption reverted until the Safe refunded it).
-    function retireReserve(uint256 amount) external {
+    /// GOVERNOR ONLY (audit wave 2, low): the same balance is the same-transaction bad-debt cover, so a stranger could burn it one
+    /// block before a liquidation booked bad debt and leave the hole to the brake. It is the yield burn, not time-critical.
+    function retireReserve(uint256 amount) external onlyGovernor {
         if (ledger.totalBadDebt() != 0) revert BadDebtOutstanding();
         uint256 bal = token.balanceOf(address(this));
         uint256 keep = notes == address(0) ? 0 : INoteBook(notes).outstanding();

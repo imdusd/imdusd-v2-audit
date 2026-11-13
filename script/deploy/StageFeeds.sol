@@ -6,6 +6,7 @@ import {ChainlinkFeed} from "../../src/feeds/ChainlinkFeed.sol";
 import {ProductFeed} from "../../src/feeds/ProductFeed.sol";
 import {RateFeed} from "../../src/feeds/RateFeed.sol";
 import {LivePoolPrice} from "../../src/feeds/LivePoolPrice.sol";
+import {ProvenPoolPrice} from "../../src/feeds/ProvenPoolPrice.sol";
 import {
     SwarmPriceFeed, SwarmSpotFeed, SwarmNhiFeed, SwarmSeatMedianFeed, SwarmSeatSpotFeed
 } from "../../src/feeds/SwarmFeeds.sol";
@@ -43,6 +44,7 @@ abstract contract StageFeeds is DeployBase {
         else if (kind == DeployTypes.SWARM_SEAT_MEDIAN) len = type(SwarmSeatMedianFeed).creationCode.length;
         else if (kind == DeployTypes.SWARM_SEAT_SPOT) len = type(SwarmSeatSpotFeed).creationCode.length;
         else if (kind == DeployTypes.LIVE_POOL) len = type(LivePoolPrice).creationCode.length;
+        else if (kind == DeployTypes.PROVEN_POOL) len = type(ProvenPoolPrice).creationCode.length;
         return len + 192;
     }
 
@@ -70,6 +72,10 @@ abstract contract StageFeeds is DeployBase {
         if (n.kind == DeployTypes.LIVE_POOL) {
             if (n.source.code.length == 0) revert BadNode(i);
             return new LivePoolPrice(IPoolManager(n.source), n.poolId, n.passOneE18);
+        }
+        if (n.kind == DeployTypes.PROVEN_POOL) {
+            if (n.source.code.length == 0) revert BadNode(i);
+            return new ProvenPoolPrice(n.source, n.poolId, n.passOneE18, n.maxAge);
         }
         revert BadNode(i);
     }

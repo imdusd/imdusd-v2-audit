@@ -30,6 +30,9 @@ library DeployTypes {
     // Deployed EMPTY: the first value of each is bought and relayed after the deploy.
     uint8 internal constant SWARM_SEAT_MEDIAN = 8;
     uint8 internal constant SWARM_SEAT_SPOT = 9;
+    // ProvenPoolPrice(source = PoolManager, poolId, passOneE18 = base is token0, maxAge): a v4 pool's end-of-block price,
+    // proven from state (audit wave 2: the depth samplers' reference).
+    uint8 internal constant PROVEN_POOL = 10;
 
     struct FeedNode {
         uint8 kind;
@@ -41,7 +44,7 @@ library DeployTypes {
         uint256 cap;
         uint8 a;
         uint8 b;
-        bytes32 poolId; // LIVE_POOL only
+        bytes32 poolId; // LIVE_POOL and PROVEN_POOL only
     }
 
     struct IlkSpec {
@@ -345,6 +348,13 @@ library MainnetConfig {
     /// @dev The sIMD median: IMD/ETH median x ETH/USD x sIMD's share rate (what v1's SharePriceFeed computed from v1's legs).
     uint8 internal constant F_IMD_USD_MEDIAN = 21;
     uint8 internal constant F_SIMD_MEDIAN = 22;
+    /// @dev The depth samplers' reference (audit wave 2): pool 0xb07d's END-OF-BLOCK price, proven from state, x ETH/USD.
+    uint8 internal constant F_IMD_PROVEN = 23;
+    uint8 internal constant F_IMD_USD_PROVEN = 24;
+    /// @dev A proven price is fresh for 6 hours after its block (gas review; a proof is ~887k gas). A push cannot move a proven
+    /// reference whatever its age; age matters only when the market really moved, and each sampler still refuses a live tick more
+    /// than 400 ticks (~4%) from it. The keeper re-proves when the pool drifts > 1.5% from it, a sample refuses it, or it nears 6 h.
+    uint256 internal constant PROVEN_MAX_AGE = 6 hours;
     /// @dev v1's lifetimes and caps (1 h and 20% on the prices, 1 day and 20% on NHI).
     uint256 internal constant IMD_LEG_MAX_AGE = 1 hours;
     uint256 internal constant NHI_MAX_AGE = 1 days;
@@ -369,15 +379,13 @@ library MainnetConfig {
     /// spacing-60 pool 0x5e0b6d80..6c8e, stranded at IMD 4.17 imdUSD with nothing in range (the sampler refused PoolOffReference).
     bytes32 internal constant IMDUSD_V1_IMD_POOL_ID = 0x617d697bdafcfd21b137e811149af6e13328d644ac18f189ffd54e079aefb472;
 
-    /// @dev Band 1500 = -15%, the analysis' definition. The IMD reference is the LIVE pool price x ETH/USD (F_IMD_USD_LIVE), on
-    /// purpose, not an attested leg: the attested legs are bought on demand and are stale most hours, and DepthSampler refuses to
-    /// sample on a stale feed, so an attested reference would stop sampling and read as zero depth. The live reference can be
-    /// pushed with no capital held: push, sample, push back in one transaction (between two unlocks) or one bundle, for the
-    /// pool fee both ways, ~2% of the push (audit wave 1; DepthSampler header). The 4th-lowest bucket and 4th-lowest hour
-    /// (ImdDepth) must be moved for it to count, so four pushed hours (~$200 each for 25%) lower the sIMD line for ~8 days.
-    /// Accepted for the beta (audit wave 1); it can only lower the sIMD line. Sampler 0's
-    /// reference is its own pool's price, so its `maxDeviationTicks` guard can never fire; samplers 1 and 2 are measured
-    /// against pool 0xb07d's price.
+    /// @dev Band 1500 = -15%, the analysis' definition. The IMD reference is pool 0xb07d's END-OF-BLOCK price, proven from
+    /// Ethereum state (ProvenPoolPrice), x ETH/USD (F_IMD_USD_PROVEN). Audit wave 2: the LIVE price used before could be pushed
+    /// with no capital held (push, sample, push back in one transaction or bundle, ~2% of the push; four pushed hours lowered
+    /// the sIMD line ~8 days). A proven price cannot move inside the sampling transaction; distorting it needs a push held
+    /// across a block's end. It is fresh for PROVEN_MAX_AGE (6 h): the keeper proves the previous block before a sample only when it is due (drift, a refusal, age), in the same bundle;
+    /// a stale reference refuses the sample (fail closed). An attested reference was rejected: bought on demand, stale most
+    /// hours. Each sampler still refuses a live tick more than `maxDeviationTicks` (400) from the reference.
     function _depthSamplers(DeployTypes.Config memory c) private pure {
         c.depth.enabled = true;
         c.depth.samplers = new DeployTypes.SamplerSpec[](3);
@@ -400,7 +408,7 @@ library MainnetConfig {
             hooks: hooks,
             poolId: id,
             feed0: feed0,
-            feed1: F_IMD_USD_LIVE,
+            feed1: F_IMD_USD_PROVEN,
             bandBps: 1_500,
             maxDeviationTicks: 400,
             maxSteps: 4_096,
@@ -435,7 +443,7 @@ library MainnetConfig {
         // E2: Robinhood's IMD type sells into the same IMD market: its line counts against this rule.
         (c.otherImdLines, c.otherImdChop) = (RobinhoodConfig.IMD_LINE, RobinhoodConfig.IMD_CHOP);
 
-        c.feeds = new DeployTypes.FeedNode[](23);
+        c.feeds = new DeployTypes.FeedNode[](25);
         c.feeds[F_ETH] = _cl(CL_ETH_USD, 18, 1 hours + 10 minutes);
         c.feeds[F_STETH] = _cl(CL_STETH_USD, 18, 1 hours + 10 minutes);
         c.feeds[F_WSTETH] = _rate(WSTETH, bytes4(keccak256("stEthPerToken()")), false, F_STETH);
@@ -463,6 +471,8 @@ library MainnetConfig {
         c.feeds[F_WSTETH_ETH] = _rate(WSTETH, bytes4(keccak256("stEthPerToken()")), false, F_ETH);
         c.feeds[F_IMD_USD_MEDIAN] = _product(F_IMD_MEDIAN, F_ETH);
         c.feeds[F_SIMD_MEDIAN] = _rate(SIMD, CONVERT, true, F_IMD_USD_MEDIAN);
+        c.feeds[F_IMD_PROVEN] = _proven(UNIV4_POOL_MANAGER, IMD_ETH_POOL_ID, false, PROVEN_MAX_AGE);
+        c.feeds[F_IMD_USD_PROVEN] = _product(F_IMD_PROVEN, F_ETH);
 
         uint8 N = DeployTypes.NONE;
         c.ilks = new DeployTypes.IlkSpec[](9);
@@ -502,9 +512,9 @@ library MainnetConfig {
     }
 
     /// @notice On mainnet: the blue sleeve bids on ETH, wstETH, cbBTC, WBTC and the two staked stables (six
-    /// tokens = the sleeve's MAX_TOKENS); the edge sleeve on sIMD, with a bootstrap allowance of the sIMD line TARGET (the
+    /// tokens of the sleeve's MAX_TOKENS 10: four slots stay free for later blue collateral); the edge sleeve on sIMD, with a bootstrap allowance of the sIMD line TARGET (the
     /// genesis line is 0 in the beta: a 0 bootstrap would shut sIMD until the sleeve filled). Held USDC/USDT are not covered
-    /// (the sleeve's token slots are full; they are $1 collateral the caller path clears at no loss). Daily sale limits,
+    /// (they are $1 collateral the caller path clears at no loss). Daily sale limits,
     /// roughly $100k-200k of each token at 2026-11 prices.
     function backstopSpec(uint256 simdBootstrap) internal pure returns (DeployTypes.BackstopSpec memory b) {
         b.enabled = true;
@@ -585,6 +595,18 @@ library MainnetConfig {
         n.source = manager;
         n.poolId = poolId;
         n.passOneE18 = baseIsToken0;
+    }
+
+    function _proven(address manager, bytes32 poolId, bool baseIsToken0, uint256 maxAge)
+        private
+        pure
+        returns (DeployTypes.FeedNode memory n)
+    {
+        n.kind = DeployTypes.PROVEN_POOL;
+        n.source = manager;
+        n.poolId = poolId;
+        n.passOneE18 = baseIsToken0;
+        n.maxAge = maxAge;
     }
 
     function _swarm(uint8 kind, uint256 maxAge) private pure returns (DeployTypes.FeedNode memory n) {
@@ -717,8 +739,8 @@ library BetaConfig {
         _seats(c);
     }
 
-    uint8 internal constant F_SEAT_MEDIAN = 23; // appended after MainnetConfig's 23 nodes
-    uint8 internal constant F_SEAT_SPOT = 24;
+    uint8 internal constant F_SEAT_MEDIAN = 25; // appended after MainnetConfig's 25 nodes
+    uint8 internal constant F_SEAT_SPOT = 26;
     /// @dev Both legs are refreshed about daily (2 x 0.5 IMD); a day and two hours of life covers one missed slot.
     uint256 internal constant SEAT_MAX_AGE = 26 hours;
     /// @dev Per-epoch move caps of the leaves (SwarmFeed). The median also has SeatFeed's 20%-per-update fall cap.

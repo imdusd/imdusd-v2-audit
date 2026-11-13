@@ -15,9 +15,8 @@ import {IFeed} from "../interfaces/IFeed.sol";
 /// reading 0 or stale sets the payout to 0 and clears `agree`; a pool more than `skew` below `low` clears `agree`.
 /// `agree` gates the sleeve's standing bid (Liquidator.bite) and a charged rate change (LedgerSettlement.setRate), so
 /// a push below the pair can stop both. What the leg buys is that a rally between attested updates no longer pays the
-/// redeemer the gap (the rally-stripping finding). The beta's DepthSampler references also read it
-/// (DeployConfig `_depthSamplers`): there a push-sample-push-back in one transaction lowers the measured depth, and
-/// with it the sIMD line, for the pool fee both ways (DepthSampler header).
+/// redeemer the gap (the rally-stripping finding). The depth samplers do NOT read it any more (audit wave 2):
+/// a push-sample-push-back in one transaction lowered the measured depth; they read ProvenPoolPrice instead.
 /// Never stale: it is the current block. Chained into USD with `ProductFeed` (x Chainlink ETH/USD) and into
 /// a share price with `RateFeed`, exactly like the attested legs.
 contract LivePoolPrice is IFeed {

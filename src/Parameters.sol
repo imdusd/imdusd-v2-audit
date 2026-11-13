@@ -208,17 +208,9 @@ contract Parameters is ParametersBase {
     }
 
 
-    /// @notice Lower the other chains' IMD lines at once (after the other chain lowered its line). Refused while the depth
-    /// line binds this chain's depth-gated type (audit wave 1): less exposure counted elsewhere is more room here, so then it
-    /// would RAISE the enforced line without the timelock; SET_OTHER_IMD (48h) does that.
-    function lowerOtherImdLines(uint256 lines) external onlyGovernor {
-        if (depthIlk == bytes32(0) || lines >= otherImdLines) revert OutOfBounds();
-        if (depthLine() < _risk[depthIlk].line) revert OutOfBounds();
-        _cancelPending(SET_OTHER_IMD, 0);
-        otherImdLines = lines;
-        emit OtherImdSet(lines, otherImdChop);
-        _flagDepth();
-    }
+    /// lowerOtherImdLines (an instant act) was REMOVED (audit wave 2, low): less exposure counted on other chains is more room
+    /// here, so it could only ever widen the sIMD line; wave 1 refused it while the depth line bound, but a lower made while
+    /// depth was slack still raised the enforced line once depth fell, without the timelock. SET_OTHER_IMD (48h) changes it.
 
     // ---------------------------------------------------------------- D1: instant lowering (governor, no delay)
 
@@ -413,6 +405,34 @@ contract Parameters is ParametersBase {
     // ---------------------------------------------------------------- checks
 
     // ---------------------------------------------------------------- governance (in ParametersRules)
+
+    /// @notice A BATCH's check at propose (audit wave 2, low: two ADD_ILK of one type, two SET_KEEPER, two sleeve listings
+    /// past MAX_TOKENS each passed propose against the state before the batch and always failed at apply). Dry-run the items
+    /// in order, rolled back; if item i fails there but would apply alone, an earlier item broke it: refused (BadConfig). One
+    /// that fails alone too is waiting on state (a retire before its feed stops, a line before its depth), as a single
+    /// proposal may: allowed. Only this contract may call it (ParametersRules' BATCH check runs in this context).
+    function checkBatch(bytes[] calldata items) external {
+        if (msg.sender != address(this)) revert Unauthorized();
+        if (_dry(items, 0, items.length)) return;
+        uint256 n = 1;
+        while (_dry(items, 0, n)) ++n;
+        if (_dry(items, n - 1, n)) revert BadConfig();
+    }
+
+    /// @notice Validate and apply `items[from..to)` in order and always revert: `DryRunOk` when every one applied. Self only.
+    function dryRun(bytes[] calldata items, uint256 from, uint256 to) external {
+        if (msg.sender != address(this)) revert Unauthorized();
+        for (uint256 i = from; i < to; ++i) {
+            _validate(items[i]);
+            _apply(items[i]);
+        }
+        revert DryRunOk();
+    }
+
+    function _dry(bytes[] calldata items, uint256 from, uint256 to) private returns (bool) {
+        (, bytes memory ret) = address(this).call(abi.encodeCall(this.dryRun, (items, from, to)));
+        return ret.length == 4 && bytes4(ret) == DryRunOk.selector;
+    }
 
     function _validate(bytes memory payload) internal override {
         _delegate(abi.encodeCall(ParametersRules.validateKind, (payload)));

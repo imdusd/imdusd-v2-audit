@@ -151,7 +151,7 @@ contract Ledger is LedgerBase {
         IlkState storage s = ilkState[ilk];
         _accrue(ilk, s);
         for (uint256 i; i < ids.length; ++i) {
-            if (ilkOf[ids[i]] != ilk) revert WrongType();
+            if (ilkOf(ids[i]) != ilk) revert WrongType();
             Position storage p = _positions[ids[i]];
             uint256 debt = _debtOf(p);
             uint256 oldDebt = p.debt;
@@ -167,7 +167,7 @@ contract Ledger is LedgerBase {
     /// change hands in the middle of a Ledger call.
     function onTransfer(uint256 id, address from, address to) external nonReentrant {
         if (msg.sender != address(nft)) revert Unauthorized();
-        ParametersBase.Config memory c = params.config(ilkOf[id]);
+        ParametersBase.Config memory c = params.config(ilkOf(id));
         if (c.token == c.join) IHolderJoin(c.join).onPositionTransfer(from, to, _positions[id].collateral);
     }
 
@@ -240,7 +240,7 @@ contract Ledger is LedgerBase {
                     if (!self) nft.checkRights(id, actor, RIGHT_SET_RATE);
                     bool charged = oldRate != 0 && block.timestamp < p.lastRateChange + RATE_COOLDOWN;
                     p.premiumRate = charged ? (p.premiumRate != 0 ? p.premiumRate : oldRate) : 0; // first of a chain
-                    p.lastRateChange = uint64(block.timestamp);
+                    p.lastRateChange = uint40(block.timestamp);
                 }
                 p.rate = a.rate;
             }
@@ -335,9 +335,15 @@ contract Ledger is LedgerBase {
     /// @dev Create `positionId(owner, ilk, salt)` if it does not exist yet.
     function _create(address owner, bytes32 ilk, uint256 salt) private returns (uint256 id) {
         id = positionId(owner, ilk, salt);
-        if (ilkOf[id] == bytes32(0)) {
+        if (_positions[id].ilkIndex == 0) {
             _config(ilk);
-            ilkOf[id] = ilk;
+            uint16 i = _ilkIndex[ilk];
+            if (i == 0) {
+                _ilkList.push(ilk);
+                i = uint16(_ilkList.length);
+                _ilkIndex[ilk] = i;
+            }
+            _positions[id].ilkIndex = i;
             nft.mint(owner, id);
             emit Opened(id, ilk, owner, salt);
         }
@@ -408,6 +414,11 @@ contract Ledger is LedgerBase {
 
     // ================================================================ views
 
+    /// @notice A position's recorded rate: what SortedPositions orders it by (the list keeps no copy: gas review).
+    function rateOf(uint256 id) external view returns (uint64) {
+        return _positions[id].rate;
+    }
+
     function position(uint256 id) external view returns (Position memory) {
         return _positions[id];
     }
@@ -435,7 +446,7 @@ contract Ledger is LedgerBase {
     function liquidationNeed(uint256 id, uint256 price) external view returns (uint256) {
         (, ParametersBase.Risk memory r, bool auction, uint256 mat, uint256 chop, uint256 collateral, uint256 debt) =
             _liqView(id);
-        uint256 buffer = auction ? 0 : params.targetBuffer(ilkOf[id]);
+        uint256 buffer = auction ? 0 : params.targetBuffer(ilkOf(id));
         return _liquidationNeed(collateral, debt, price, mat, chop, buffer, r.dust);
     }
 
@@ -460,7 +471,7 @@ contract Ledger is LedgerBase {
             uint256 debt
         )
     {
-        bytes32 ilk = ilkOf[id];
+        bytes32 ilk = ilkOf(id);
         Position storage p = _positions[id];
         ParametersBase.Config memory c = params.config(ilk);
         q = pricer.quote(ilk);

@@ -309,23 +309,23 @@ contract RedemptionTest is System {
         assertEq(got, out);
     }
 
-    // ------------------------------------------------------------ C9: launch at the cap
+    // ------------------------------------------------------------ C9: launch at LISTING_BASE (was the cap until audit wave 2)
 
-    function test_baseRateStartsAtCapAndDecaysFromLaunch() public {
-        uint256 cap = redeemer.FEE_CAP();
+    function test_baseRateStartsAtListingBaseAndDecaysFromLaunch() public {
+        uint256 start = redeemer.LISTING_BASE();
         uint256 launch = params.listedAt(ETH);
         assertEq(launch, params.sealedAt(), "a genesis type goes live at the seal");
-        assertEq(redeemer.decayedBaseRate(ETH), cap, "0h: at the cap");
-        assertEq(redeemer.decayedBaseRate(STABLE), cap);
-        assertEq(redeemer.decayedBaseRate(SIMD), cap);
-        assertEq(redeemer.feeFor(ETH, 1e18), cap, "the fee is capped at launch");
+        assertEq(redeemer.decayedBaseRate(ETH), start, "0h: at the listing base");
+        assertEq(redeemer.decayedBaseRate(STABLE), start);
+        assertEq(redeemer.decayedBaseRate(SIMD), start);
+        assertLe(redeemer.feeFor(STABLE, 1e18), 0.01e18, "the fee at launch is at or under the toll's 1% wall");
         _keepFresh(launch + 12 hours);
-        assertApproxEqRel(redeemer.decayedBaseRate(ETH), cap / 2, 0.001e18, "12h: one half-life");
+        assertApproxEqRel(redeemer.decayedBaseRate(ETH), start / 2, 0.001e18, "12h: one half-life");
         _keepFresh(launch + 40 hours);
-        // 5% x 2^(-40/12) = 0.496%
-        assertApproxEqRel(redeemer.decayedBaseRate(ETH), 0.00496e18, 0.002e18, "40h: ~0.5%");
+        // 0.5% x 2^(-40/12) = 0.0496%
+        assertApproxEqRel(redeemer.decayedBaseRate(ETH), 0.000496e18, 0.002e18, "40h: ~0.05%");
         uint256 f = redeemer.feeFor(STABLE, 1e18);
-        assertApproxEqRel(f, 0.001e18 + 0.00496e18, 0.002e18, "floor + decayed base");
+        assertApproxEqRel(f, 0.001e18 + 0.000496e18, 0.002e18, "floor + decayed base");
         // A redemption starts from the decayed launch rate, not from zero.
         uint256 before = redeemer.decayedBaseRate(ETH);
         _redeem(ETH, 1_000e18);
@@ -334,7 +334,7 @@ contract RedemptionTest is System {
         assertEq(at, block.timestamp);
     }
 
-    function test_typeAddedLaterStartsAtCap() public {
+    function test_typeAddedLaterStartsAtListingBase() public {
         _keepFresh(vm.getBlockTimestamp() + 10 days);
         ParametersBase.Config memory c = params.config(ETH);
         Join j = new Join(c.token, address(this));
@@ -347,10 +347,10 @@ contract RedemptionTest is System {
         _keepFresh(vm.getBlockTimestamp() + 48 hours);
         params.applyPending();
         assertEq(params.listedAt(NEW), block.timestamp, "a later type goes live when added");
-        assertEq(redeemer.decayedBaseRate(NEW), redeemer.FEE_CAP());
+        assertEq(redeemer.decayedBaseRate(NEW), redeemer.LISTING_BASE());
         assertLt(redeemer.decayedBaseRate(ETH), 1e12, "the genesis type has long decayed (12 days: ~3e-9)");
         _keepFresh(vm.getBlockTimestamp() + 12 hours);
-        assertApproxEqRel(redeemer.decayedBaseRate(NEW), redeemer.FEE_CAP() / 2, 0.001e18);
+        assertApproxEqRel(redeemer.decayedBaseRate(NEW), redeemer.LISTING_BASE() / 2, 0.001e18);
     }
 
     function _keepFresh(uint256 t) internal {

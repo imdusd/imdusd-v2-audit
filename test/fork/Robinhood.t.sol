@@ -316,10 +316,12 @@ contract RobinhoodForkTest is RobinhoodFork {
     // ------------------------------------------------------------ the sequencer grace
 
     function test_sequencerGapLiquidationWaitsOutTheGrace() public {
-        _adjust(ETH, 10e18, 15_000e18, false);
+        // borrow 80% of what 10 ETH carries at 140% at the LIVE price (a fixed 15,000 went under 140% once ETH fell
+        // below ~$2,100), so the position opens at ~175% and a 30% fall puts it at ~122%: unhealthy whatever ETH is
+        (, int256 eth,,,) = _round(RobinhoodConfig.CL_ETH_USD);
+        _adjust(ETH, 10e18, int256(10 * uint256(eth) * 1e10 * 80 / 140), false);
         // the sequencer is down for 2 hours; ETH falls 30% meanwhile and the first block after carries the new price
         vm.warp(vm.getBlockTimestamp() + 2 hours);
-        (, int256 eth,,,) = _round(RobinhoodConfig.CL_ETH_USD);
         _mockEthPrice(uint256(eth) * 70 / 100);
         (bool ok,) = d.ledger.healthy(_pid(ETH, alice));
         assertFalse(ok);

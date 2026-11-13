@@ -134,6 +134,15 @@ contract DeployFullForkTest is CompoundSystem {
     /// @dev Chainlink ETH/USD at its forked answer stamped now; v2's swarm leaves (sIMD's attested legs + NHI) fresh, at the
     /// live pool (they deploy empty).
     function _freshen() internal {
+        // The depth reference (ProvenPoolPrice) is the keeper's end-of-block proof; a forge fork cannot produce a storage proof
+        // that verifies, so stand in for the keeper's prove: the live pool price, dated now (storage: _value, then
+        // provenBlock | provenAt << 64). The proof itself is tested on real mainnet proofs (ProvenPoolPrice.t.sol).
+        if (d.feeds.length > MainnetConfig.F_IMD_PROVEN) {
+            (uint256 livePrice,) = IFeed(address(d.feeds[MainnetConfig.F_IMD_LIVE])).latestValue();
+            address proven = address(d.feeds[MainnetConfig.F_IMD_PROVEN]);
+            vm.store(proven, bytes32(uint256(0)), bytes32(livePrice));
+            vm.store(proven, bytes32(uint256(1)), bytes32(uint256(block.number) | (uint256(block.timestamp) << 64)));
+        }
         vm.mockCall(
             Mainnet.CL_ETH_USD,
             abi.encodeWithSignature("latestRoundData()"),

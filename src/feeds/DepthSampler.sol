@@ -34,18 +34,15 @@ import {IFeed} from "../interfaces/IFeed.sol";
 /// THE PREMISE HOLDS ONLY WHILE THE FEEDS CANNOT BE MOVED AROUND A SAMPLE: a feed that reads a
 /// pool's live price (LivePoolPrice) moves the reference with a push of that pool, so a pushed sample is deflated. An
 /// attested/Chainlink reference (for IMD: the attested IMD median x Chainlink ETH/USD) is the stronger choice when it can
-/// be kept fresh; a stale feed refuses the sample, so a reference that goes stale reads as zero depth. The beta wires the
-/// LIVE reference (DeployConfig `_depthSamplers`): its attested IMD leg has a 1 h max age. With that wiring a push
-/// moves the reference with the pool, so `maxDeviationTicks` never fires for a sampler whose reference is its own pool
-/// (the beta's sampler 0, on pool 0xb07d; samplers 1 and 2 are measured against 0xb07d's price, so a push of 0xb07d makes
-/// them refuse PoolOffReference instead), and a pushed sample reads the thinner liquidity around the pushed price.
-/// THE PUSH NEEDS NO CAPITAL HELD (audit wave 1, finding 3-oracles-depth): push the pool and settle, call `sample()`
-/// with the PoolManager locked again, push back and settle, all in one transaction (or as three transactions of one
-/// builder bundle). The cost is the pool fee both ways plus gas, about 2% of the pushed notional: about $200 per hour
-/// for a 25% push at the beta's depth, and four such hours lower the sIMD line for about 8 days. It can only LOWER the
-/// reading. No rule built from the samplers' own reads can stop it (sampling is permissionless, so a remembered price
-/// can be walked by the same calls, and a bundle is as atomic as a transaction): the fixes are a reference a push cannot
-/// move (an attested leg) or a proven end-of-previous-block pool price. Accepted for the beta.
+/// be kept fresh; a stale feed refuses the sample, so a reference that goes stale reads as zero depth.
+/// A LIVE reference (LivePoolPrice) could be pushed with no capital held (audit wave 1, finding 3-oracles-depth): push the
+/// pool and settle, call `sample()` with the PoolManager locked again, push back and settle, in one transaction or one
+/// builder bundle, for the pool fee both ways (~2% of the push; four such hours lowered the sIMD line ~8 days). No rule
+/// built from the samplers' own reads can stop that (a remembered or "armed" price is set by the same calls).
+/// SO THE DEPLOYED REFERENCE IS PROVEN (audit wave 2): pool 0xb07d's END-OF-BLOCK price from Ethereum state
+/// (ProvenPoolPrice, x ETH/USD), proven by the keeper right before it samples. It cannot move inside the sampling
+/// transaction; a push now either stays within `maxDeviationTicks` and changes nothing (the walk counts positions around
+/// the reference, not the price), or is refused (PoolOffReference). Distorting it needs a push held across a block's end.
 ///
 /// NOT WHILE THE POOLMANAGER IS UNLOCKED. `sample()` reverts inside any v4 unlock callback, so a sample
 /// cannot be taken in the middle of a flash-accounted push. This does NOT stop the push above: v4 clears the unlock
@@ -111,13 +108,19 @@ contract DepthSampler {
     /// @notice Which side `depth()` reports: true = sales of token0 (`sellDepth0`).
     bool public immutable soldIsToken0;
 
+    /// @notice An hour's reading as `bucket(i)` returns it (the reported side's field; the other is 0).
     struct Bucket {
         uint32 hour; // block.timestamp / 1 hours
         uint112 sell0;
         uint112 sell1;
     }
 
-    Bucket[24] internal _buckets;
+    /// @dev PACKED (gas review): four hourly buckets per slot, 64 bits each = 24-bit hour (block.timestamp / 1 hours;
+    /// fits until the year ~3884) | 40-bit reading in WHOLE USD (to ~$1.1 trillion), the reported side only. `depth()` is read
+    /// by every sIMD borrow through ImdDepth and by every poke: 6 slots instead of 24.
+    uint256[6] internal _packed;
+    uint256 internal constant USD_BITS = 40;
+    uint256 internal constant USD_MAX = (1 << USD_BITS) - 1;
     uint64 public lastSampleAt;
 
     error InvalidConfig();
@@ -172,7 +175,8 @@ contract DepthSampler {
         return soldIsToken0 ? d0 : d1;
     }
 
-    /// @notice Both sides' window readings (ROBUST_RANK-th lowest bucket, USD, 1e18).
+    /// @notice Both sides' window readings (ROBUST_RANK-th lowest bucket, USD, 1e18). Only the `soldIsToken0` side is measured;
+    /// the other reads 0.
     function depths() external view returns (uint256 sell0, uint256 sell1) {
         return _depths();
     }
@@ -185,13 +189,19 @@ contract DepthSampler {
     /// @notice Buckets filled inside the window.
     function filledBuckets() external view returns (uint256 n) {
         uint256 nowHour = block.timestamp / 1 hours;
+        uint256[6] memory w = _packed;
         for (uint256 i; i < BUCKETS; ++i) {
-            if (_inWindow(_buckets[i].hour, nowHour)) ++n;
+            (uint32 hour,) = _entry(w, i);
+            if (_inWindow(hour, nowHour)) ++n;
         }
     }
 
-    function bucket(uint256 i) external view returns (Bucket memory) {
-        return _buckets[i];
+    function bucket(uint256 i) external view returns (Bucket memory b) {
+        uint256[6] memory w = _packed;
+        (uint32 hour, uint256 usd) = _entry(w, i);
+        b.hour = hour;
+        if (soldIsToken0) b.sell0 = uint112(usd);
+        else b.sell1 = uint112(usd);
     }
 
     /// @notice What a sample would read now (USD, 1e18), without recording. Reverts as `sample` would.
@@ -211,12 +221,15 @@ contract DepthSampler {
         if (down <= TickMath.MIN_SQRT_PRICE) down = TickMath.MIN_SQRT_PRICE + 1;
         uint160 up = upRaw >= TickMath.MAX_SQRT_PRICE ? TickMath.MAX_SQRT_PRICE - 1 : uint160(upRaw);
 
-        // Token0 sold: the price falls from the reference to `down`; token1 is paid out.
-        uint256 out1 = _side(Walk(sqrtP, tick, l, 0), sqrtRef, down);
-        // Token1 sold: the price rises from the reference to `up`; token0 is paid out.
-        uint256 out0 = _side(Walk(sqrtP, tick, l, 0), sqrtRef, up);
-        sell0 = Math.mulDiv(out1, p1, 1e18);
-        sell1 = Math.mulDiv(out0, p0, 1e18);
+        // ONE SIDE ONLY (gas review): the side `depth()` reports; the other reads 0. Nothing on chain reads it (ImdDepth
+        // uses `depth()`), and the walk is most of a sample's gas, run hourly on every sampler for good.
+        if (soldIsToken0) {
+            // Token0 sold: the price falls from the reference to `down`; token1 is paid out.
+            sell0 = Math.mulDiv(_side(Walk(sqrtP, tick, l, 0), sqrtRef, down), p1, 1e18);
+        } else {
+            // Token1 sold: the price rises from the reference to `up`; token0 is paid out.
+            sell1 = Math.mulDiv(_side(Walk(sqrtP, tick, l, 0), sqrtRef, up), p0, 1e18);
+        }
     }
 
     // ---------------------------------------------------------------- sample
@@ -229,40 +242,52 @@ contract DepthSampler {
         (uint256 d0, uint256 d1) = _depths();
         recorded0 = d0 != 0 && s0 > MAX_RISE * d0 ? MAX_RISE * d0 : s0;
         recorded1 = d1 != 0 && s1 > MAX_RISE * d1 ? MAX_RISE * d1 : s1;
-        if (recorded0 > type(uint112).max) recorded0 = type(uint112).max;
-        if (recorded1 > type(uint112).max) recorded1 = type(uint112).max;
+        // Stored in whole USD (rounded down) and capped at USD_MAX: what is recorded is what `depth()` will read.
+        uint256 usd = (soldIsToken0 ? recorded0 : recorded1) / 1e18;
+        if (usd > USD_MAX) usd = USD_MAX;
+        if (soldIsToken0) recorded0 = usd * 1e18;
+        else recorded1 = usd * 1e18;
 
-        uint32 hour = uint32(block.timestamp / 1 hours);
-        Bucket storage b = _buckets[hour % BUCKETS];
-        if (b.hour != hour) {
-            (b.hour, b.sell0, b.sell1) = (hour, uint112(recorded0), uint112(recorded1));
-        } else {
-            if (recorded0 < b.sell0) b.sell0 = uint112(recorded0);
-            if (recorded1 < b.sell1) b.sell1 = uint112(recorded1);
+        uint256 hour = block.timestamp / 1 hours;
+        uint256 i = hour % BUCKETS;
+        uint256 shift = (i % 4) * 64;
+        uint256 word = _packed[i / 4];
+        uint256 e = (word >> shift) & type(uint64).max;
+        if (e >> USD_BITS != hour) {
+            e = (hour << USD_BITS) | usd;
+        } else if (usd < (e & USD_MAX)) {
+            e = (hour << USD_BITS) | usd; // a bucket only goes down within its hour
         }
+        _packed[i / 4] = (word & ~(uint256(type(uint64).max) << shift)) | (e << shift);
         lastSampleAt = uint64(block.timestamp);
         emit Sampled(msg.sender, s0, s1, recorded0, recorded1);
     }
 
     // ---------------------------------------------------------------- internals
 
+    /// @dev The reported side's window reading in its field; the other side is 0 (only one is measured).
     function _depths() internal view returns (uint256 d0, uint256 d1) {
         uint256 nowHour = block.timestamp / 1 hours;
         uint256 n;
-        uint256[ROBUST_RANK] memory low0;
-        uint256[ROBUST_RANK] memory low1;
+        uint256[ROBUST_RANK] memory low;
         for (uint256 k; k < ROBUST_RANK; ++k) {
-            (low0[k], low1[k]) = (type(uint256).max, type(uint256).max);
+            low[k] = type(uint256).max;
         }
+        uint256[6] memory w = _packed;
         for (uint256 i; i < BUCKETS; ++i) {
-            Bucket memory b = _buckets[i];
-            if (!_inWindow(b.hour, nowHour)) continue;
+            (uint32 hour, uint256 usd) = _entry(w, i);
+            if (!_inWindow(hour, nowHour)) continue;
             ++n;
-            _keepLowest(low0, b.sell0);
-            _keepLowest(low1, b.sell1);
+            _keepLowest(low, usd);
         }
         if (n < MIN_BUCKETS) return (0, 0);
-        return (low0[ROBUST_RANK - 1], low1[ROBUST_RANK - 1]);
+        return soldIsToken0 ? (low[ROBUST_RANK - 1], uint256(0)) : (uint256(0), low[ROBUST_RANK - 1]);
+    }
+
+    /// @dev Bucket `i` from the packed words: its hour and its reading (USD, 1e18).
+    function _entry(uint256[6] memory w, uint256 i) internal pure returns (uint32 hour, uint256 usd) {
+        uint256 e = (w[i / 4] >> ((i % 4) * 64)) & type(uint64).max;
+        return (uint32(e >> USD_BITS), (e & USD_MAX) * 1e18);
     }
 
     /// @dev Insert `v` into the ascending list of the ROBUST_RANK lowest values seen so far.

@@ -123,14 +123,19 @@ abstract contract DepthSamplerTest is Test {
 
     function _xSell() internal view returns (uint256) {
         (uint256 s0, uint256 s1) = sampler.measure();
-        return xIs0 ? s0 : s1;
+        return (xIs0 ? s0 : s1) / 1e18 * 1e18; // what a sample records: whole USD (buckets packed, gas review)
     }
 
     // ---------------------------------------------------------------- measurement
 
     /// The reading equals what a real fee-free swap to the band edge pays out, on both sides.
+    /// One sampler per side (gas review: a sampler measures only the side `depth()` reports; the other reads 0).
     function test_measureEqualsSwapToBandEdge() public {
-        (uint256 sell0, uint256 sell1) = sampler.measure();
+        (IFeed f0, IFeed f1) = xIs0 ? (IFeed(address(fx)), IFeed(address(0))) : (IFeed(address(0)), IFeed(address(fx)));
+        (uint256 sell0, uint256 unmeasured1) = new DepthSampler(pm, key, f0, f1, BAND, 500, 4096, true).measure();
+        (uint256 unmeasured0, uint256 sell1) = new DepthSampler(pm, key, f0, f1, BAND, 500, 4096, false).measure();
+        assertEq(unmeasured1, 0, "a token0-sold sampler does not walk the other side");
+        assertEq(unmeasured0, 0, "a token1-sold sampler does not walk the other side");
         assertGt(sell0, 0);
         assertGt(sell1, 0);
         (uint160 down, uint160 up) = _edges();

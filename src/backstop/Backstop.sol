@@ -63,7 +63,7 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
     uint256 public constant QUEUE = 7 days;
     uint256 public constant BOOTSTRAP = 60 days;
     uint256 public constant EDGE_MULTIPLE = 3;
-    uint256 public constant MAX_TOKENS = 6;
+    uint256 public constant MAX_TOKENS = 10; // was 6: BetaConfig filled blue at genesis (wave 2, 3-running Q4)
     uint256 public constant MAX_ILKS = 12;
     /// @notice How long a matured withdrawal request stays payable before it must be re-queued.
     uint256 public constant CLAIM_WINDOW = 2 days;
@@ -136,6 +136,9 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
     mapping(address token => bool) public isToken;
     /// @notice Collateral held per token (bought in bids, not yet paid out or sold).
     mapping(address token => uint256) public coll;
+    /// @notice Every unit of `token` the standing bid has ever credited: only rises. The Allocator's auction compares it
+    /// with the run's start to see new collateral; `coll` cannot tell, since an in-kind exit lowers it (audit wave 2).
+    mapping(address token => uint256) public collIn;
     mapping(address token => Limit) public saleLimit;
     /// @notice The last good high price seen per held token (imdUSD per 1e18 raw), for the dust rule.
     mapping(address token => uint256) public lastHigh;
@@ -569,6 +572,7 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
         }
         tracked -= spent;
         coll[token] += received;
+        collIn[token] += received;
         emit Bid(ilk, spent, received);
     }
 

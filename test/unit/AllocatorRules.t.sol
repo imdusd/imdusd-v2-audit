@@ -82,17 +82,28 @@ contract AllocatorRulesTest is AllocatorTest {
         vm.warp(vm.getBlockTimestamp() + 10 minutes);
         vm.expectRevert(Allocator.AuctionRunning.selector);
         al.startAuction(address(backstop), address(weth));
+        // Dust (1 of ~101 held, under RESTART_ARRIVAL_BPS): the run goes on at its price; no restart (audit wave 2, low).
+        uint256 mid = al.auctionPrice(address(backstop), address(weth));
         weth.mint(address(backstop), 1e18);
+        assertEq(al.auctionPrice(address(backstop), address(weth)), mid, "dust does not stop the run");
+        vm.expectRevert(Allocator.AuctionRunning.selector);
+        al.startAuction(address(backstop), address(weth));
+        // Past 5% of the holding: the price stops until a restart, which offers it all from the top.
+        weth.mint(address(backstop), 9e18);
+        vm.expectRevert(Allocator.AuctionStale.selector);
+        al.auctionPrice(address(backstop), address(weth));
         al.startAuction(address(backstop), address(weth));
         assertEq(al.auctionPrice(address(backstop), address(weth)), 2060e18);
     }
 
-    function test_buysLowerTheRecordedHolding() public {
+    /// A buy is not an arrival: the run's snapshot of everything credited stays, and the run goes on (audit wave 2: the
+    /// snapshot used to be the holding, lowered by each buy, which an in-kind exit could also lower).
+    function test_buysKeepTheArrivalSnapshot() public {
         al.startAuction(address(backstop), address(weth));
         vm.warp(vm.getBlockTimestamp() + 2 hours);
         vm.prank(bob);
         al.buyCollateral(address(backstop), address(weth), 5e18, type(uint256).max);
-        assertEq(al.auctionColl(keccak256(abi.encode(address(backstop), address(weth)))), 95e18);
+        assertEq(al.auctionColl(keccak256(abi.encode(address(backstop), address(weth)))), 100e18);
         vm.prank(bob);
         al.buyCollateral(address(backstop), address(weth), 1e18, type(uint256).max); // the run goes on
     }

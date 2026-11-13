@@ -19,6 +19,7 @@ import {RateFeed} from "../../src/feeds/RateFeed.sol";
 import {ChainlinkFeed} from "../../src/feeds/ChainlinkFeed.sol";
 import {ProductFeed} from "../../src/feeds/ProductFeed.sol";
 import {LivePoolPrice} from "../../src/feeds/LivePoolPrice.sol";
+import {ProvenPoolPrice} from "../../src/feeds/ProvenPoolPrice.sol";
 import {ImdDepth} from "../../src/feeds/ImdDepth.sol";
 import {DepthSampler} from "../../src/feeds/DepthSampler.sol";
 import {Backstop} from "../../src/backstop/Backstop.sol";
@@ -178,6 +179,10 @@ abstract contract DeployBase is Script {
             return address(LivePoolPrice(f).manager()) == n.source && PoolId.unwrap(LivePoolPrice(f).poolId()) == n.poolId
                 && LivePoolPrice(f).baseIsToken0() == n.passOneE18;
         }
+        if (n.kind == DeployTypes.PROVEN_POOL) {
+            return ProvenPoolPrice(f).manager() == n.source && PoolId.unwrap(ProvenPoolPrice(f).poolId()) == n.poolId
+                && ProvenPoolPrice(f).baseIsToken0() == n.passOneE18 && ProvenPoolPrice(f).maxAge() == n.maxAge;
+        }
         // Every swarm leaf: its lifetime and cap, its question and its signer (a resume used to adopt on code alone).
         bytes memory q = _swarmQuestion(n.kind);
         if (q.length == 0) return false;
@@ -209,6 +214,7 @@ abstract contract DeployBase is Script {
     function _emptyAtDeploy(DeployTypes.FeedNode[] memory nodes, uint256 i) internal pure returns (bool) {
         DeployTypes.FeedNode memory n = nodes[i];
         if (_swarmQuestion(n.kind).length != 0) return true;
+        if (n.kind == DeployTypes.PROVEN_POOL) return true; // empty until the keeper's first prove (audit wave 2)
         if (n.kind == DeployTypes.PRODUCT) return _emptyAtDeploy(nodes, n.a) || _emptyAtDeploy(nodes, n.b);
         if (n.kind == DeployTypes.RATE) return _emptyAtDeploy(nodes, n.a);
         return false;

@@ -16,6 +16,8 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {DepthSampler} from "../../src/feeds/DepthSampler.sol";
 import {ImdDepth} from "../../src/feeds/ImdDepth.sol";
 import {LivePoolPrice} from "../../src/feeds/LivePoolPrice.sol";
+import {ProvenPoolPrice} from "../../src/feeds/ProvenPoolPrice.sol";
+import {ProvenPoolFixture as F} from "../fixtures/ProvenPoolFixture.sol";
 import {ProductFeed} from "../../src/feeds/ProductFeed.sol";
 import {IFeed} from "../../src/interfaces/IFeed.sol";
 import {DeployTypes, MainnetConfig} from "../../script/DeployConfig.sol";
@@ -194,6 +196,45 @@ contract PanelDepthForkTest is Test {
         console2.log("after a 3% push (USD)", pushed / 1e18);
         assertEq(pushed, honest, "positions only: the push does not change the reading");
         _swap(false, -int256(1e30), _limitDown(1_500)); // further: off the reference, refused
+        vm.expectPartialRevert(DepthSampler.PoolOffReference.selector);
+        sampler.sample();
+    }
+
+    /// Audit wave 2 (2-prices Q5): the DEPLOYED reference is now pool 0xb07d's end-of-block price, proven from state
+    /// (ProvenPoolPrice x ETH/USD). On a fork at the fixture's block, the real proof is the fork's own state. Wave 1's attack
+    /// (push, sample, push back between two unlocks of one transaction) no longer changes the reading: a 3% push reads the
+    /// same depth, and a 15% push is refused as off the reference instead of deflating it.
+    function test_W2_provenReferenceIgnoresThePushBetweenUnlocks() public {
+        string memory rpc = vm.envOr("MAINNET_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) return vm.skip(true);
+        vm.createSelectFork(rpc, F.BLOCK); // state at the end of F.BLOCK = what the fixture proves
+        sp = MainnetConfig.get().depth.samplers[0];
+        key = PoolKey(Currency.wrap(sp.currency0), Currency.wrap(sp.currency1), sp.fee, sp.tickSpacing, IHooks(sp.hooks));
+        (, int256 e8,,,) = IAgg(CL_ETH_USD).latestRoundData();
+        fEth = new PanelFreshFeed(uint256(e8) * 1e10);
+        vm.roll(F.BLOCK + 1);
+        vm.warp(F.TIMESTAMP + 12);
+        vm.setBlockhash(F.BLOCK, F.BLOCK_HASH);
+        ProvenPoolPrice proven = new ProvenPoolPrice(address(PM), sp.poolId, false, MainnetConfig.PROVEN_MAX_AGE);
+        proven.prove(F.header(), F.accountProof(), F.storageProof());
+        (uint256 provenV,) = proven.latestValue();
+        (uint256 liveV,) = new LivePoolPrice(PM, sp.poolId, false).latestValue();
+        assertEq(provenV, liveV, "the proven end-of-block price is the fork's price");
+        _deploy(IFeed(address(new ProductFeed(IFeed(address(proven)), IFeed(address(fEth))))));
+        (, uint256 honest) = sampler.measure();
+        assertGt(honest, 0);
+
+        deal(IMD, address(this), 1e30);
+        (uint160 sqrtStart,,,) = PM.getSlot0(key.toId());
+        uint256 ethOut = _swap(false, -int256(1e30), _limitDown(300)); // 3% push, its own unlock
+        (, uint256 pushed) = sampler.measure();
+        sampler.sample(); // between two unlocks: the attack form the live reference allowed
+        _swap(true, -int256(ethOut), sqrtStart / 2);
+        console2.log("honest (USD)", honest / 1e18);
+        console2.log("after a 3% push, proven reference (USD)", pushed / 1e18);
+        assertEq(pushed, honest, "the push does not move a proven reference: positions only");
+
+        _swap(false, -int256(1e30), _limitDown(1_500)); // 15%: off the proven reference, refused, not deflated
         vm.expectPartialRevert(DepthSampler.PoolOffReference.selector);
         sampler.sample();
     }

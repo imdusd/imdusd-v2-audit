@@ -202,6 +202,8 @@ abstract contract SwarmFeed is IFeed {
     /// bounded from its anchor alone.
     uint80 private _epochFirst;
     uint256 private _anchorValue;
+    /// @dev The anchor of the epoch before the stored one (`_returnAnchor`); 0 until a second epoch opens.
+    uint256 private _prevAnchorValue;
 
     /// @notice A data chain on which `block.number` here reports its blocks (see the port note), 0 if none.
     uint256 public immutable blockClockChainId;
@@ -212,6 +214,9 @@ abstract contract SwarmFeed is IFeed {
     /// @notice The time clock of a remote feed: a data-chain block and the signed time it was known to exist by.
     uint64 public clockBlock;
     uint64 public clockAt;
+    /// @notice The first value's window end and signature time: the fixed origin the upper bound on a window is measured from.
+    uint64 public originBlock;
+    uint64 public originAt;
 
     uint256 internal constant ETHEREUM = 1;
     uint256 internal constant ROBINHOOD_CHAIN = 4663; // Arbitrum stack on Ethereum: block.number is Ethereum's
@@ -432,14 +437,19 @@ abstract contract SwarmFeed is IFeed {
     }
 
     /// @dev Refuse a window older than one lifetime against the time clock, or one ending past the most blocks the data
-    /// chain can have made since the clock (one per 12 s, plus PARENT_SLACK; audit wave 1: a validly signed future-dated
+    /// chain can have made since the ORIGIN (one per 12 s, plus PARENT_SLACK; audit wave 1: a validly signed future-dated
     /// window moved the clock ahead and every honest window after it was refused as behind), then move the clock forward.
+    /// The bound is measured from the first value's fixed origin, not from the clock it moves (audit wave 2, low): measured
+    /// from the clock, each future window let the next reach ~PARENT_SLACK further, so ten of them locked honest windows out
+    /// for ~12 days. Ethereum makes at most one block per 12 s, so the bound is never below the honest head.
     function _tickClock(uint64 toBlock, uint64 issuedAt) private {
         uint256 projected = projectedHead(issuedAt);
         if (clockAt != 0) {
             if (uint256(toBlock) + maxAge / 12 < projected) revert WindowBehindClock(toBlock, projected);
-            uint256 most = uint256(clockBlock) + (issuedAt > clockAt ? issuedAt - clockAt : 0) / 12 + PARENT_SLACK;
+            uint256 most = uint256(originBlock) + (issuedAt > originAt ? issuedAt - originAt : 0) / 12 + PARENT_SLACK;
             if (toBlock > most) revert WindowInFuture(toBlock, most);
+        } else {
+            (originBlock, originAt) = (toBlock, issuedAt);
         }
         uint256 next = toBlock > projected ? toBlock : projected;
         clockBlock = uint64(next);
@@ -529,26 +539,33 @@ abstract contract SwarmFeed is IFeed {
     /// the honest level it had moved away from was refused until the pushed value had been silent long enough
     /// to widen the allowance: for a spot feed, one block of a pushed pool attested honestly refused the honest
     /// spot for two hours, and the vault refused every priced action for disagreement, then staleness, long
-    /// enough to expire a liquidation mark (final sweep panel 4 2026-10-09, medium). It reaches no level the
-    /// expired epoch did not already allow, and only until that epoch is older than two lifetimes and one
-    /// STALE_GROWTH_PERIOD, when the stale allowance from the last value takes over. It applies only to a value
+    /// enough to expire a liquidation mark (final sweep panel 4 2026-10-09, medium). It applies only to a value
     /// the epoch rule refuses (`_fitsEpoch`), so every value accepted before is accepted and anchored as before.
-    /// Zero when no way back applies. It is also bounded from the LAST accepted value, by STALE_DEVIATION_MULTIPLE x the cap
-    /// (the most any one step may move, as with the stale allowance): before, a fresh feed's way back allowed
-    /// (1 + cap) / (1 - cap) - 1 = 50% from the last value in one step (audit wave 1). Bounding it to the values between the
-    /// last one and the level instead refused an honest fall just past the level after a push the other way (a push to
-    /// 120 over a level of 100 refused 95) for about two hours: the lock-out this rule exists to prevent.
+    /// Zero when no way back applies.
+    /// TWO EPOCHS DEEP, NO STEP BOUND (audit wave 2, high). The way back reaches the cap around any of three held levels:
+    /// the expired epoch's level, its anchor (they differ in a wide epoch) and the anchor of the epoch before it
+    /// (`_prevAnchorValue`), with no horizon. Remembering one epoch was not enough: a new epoch anchors at the LAST value of
+    /// the old one, so a relayer who lands the last value of one epoch and the first of the next moves the anchor two caps
+    /// in a minute (A, 1.2A at minute 59, 1.44A at minute 60, 1.72A an hour later; or 1.4A and 1.67A after a two-hour
+    /// silence), and from there no rule admitted the honest A again while the market stayed there: a halt bought for three
+    /// attestations. Wave 1's bound of 2x the cap from the last value (it stopped a +50% one-step return past the level,
+    /// low) is what made that halt permanent (1.72A back to A is 42%) and is dropped: a return may move one step as far as
+    /// the cap around a level held in the last two epochs, and no further. A lock-out now needs four boundary-timed pushes
+    /// in a row (README known issues).
     function _returnAnchor(uint256 value) private view returns (uint256 level) {
-        uint256 opened = uint256(_anchorAt);
-        if (block.timestamp - opened < maxAge || block.timestamp - opened >= 2 * maxAge + STALE_GROWTH_PERIOD) {
-            return 0;
-        }
-        level = _epochFirst != 0 ? uint256(_epochFirst) : (_anchorValue == 0 ? _value : _anchorValue);
+        if (block.timestamp - uint256(_anchorAt) < maxAge) return 0;
+        uint256 anchor = _anchorValue == 0 ? _value : _anchorValue;
+        level = _epochFirst != 0 ? uint256(_epochFirst) : anchor;
+        if (_withinCap(value, level)) return level;
+        if (_withinCap(value, anchor)) return anchor;
+        level = _prevAnchorValue;
+        if (level != 0 && _withinCap(value, level)) return level;
+        return 0;
+    }
+
+    function _withinCap(uint256 value, uint256 level) private view returns (bool) {
         uint256 change = value > level ? value - level : level - value;
-        if (change > Math.mulDiv(level, maxDeviationBps, 10_000)) return 0;
-        uint256 last = _value;
-        uint256 step = value > last ? value - last : last - value;
-        if (step > Math.mulDiv(last, maxDeviationBps * STALE_DEVIATION_MULTIPLE, 10_000)) return 0;
+        return change <= Math.mulDiv(level, maxDeviationBps, 10_000);
     }
 
     /// @notice The anchor the next value is measured against and the move it may make from it, in bps.
@@ -652,6 +669,7 @@ abstract contract SwarmFeed is IFeed {
         } else if (block.timestamp - uint256(_anchorAt) >= maxAge) {
             uint256 back = _fitsEpoch(value) ? 0 : _returnAnchor(value);
             (uint256 anchor, uint256 bound) = back != 0 ? (back, maxDeviationBps) : _epoch();
+            _prevAnchorValue = _anchorValue == 0 ? _value : _anchorValue; // the expired epoch's anchor: the way back's third level
             (_anchorValue, _anchorBound, _anchorAt) = (anchor, uint24(bound), uint40(block.timestamp));
             // A wide epoch remembers its first value (`_checkValue` holds the rest to the cap around it);
             // a fresh-opened one clears any left from an earlier wide epoch, and otherwise writes nothing.

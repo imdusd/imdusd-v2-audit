@@ -721,12 +721,12 @@ contract BackstopTest is BackstopBase {
         blue.addIlk("X", address(simd), 0, 0, 0);
         vm.expectRevert(Backstop.Exists.selector);
         blue.addIlk(ETH, address(weth), 0, 0, 0);
-        for (uint256 i; i < 5; ++i) {
+        for (uint256 i = blue.tokenCount(); i < blue.MAX_TOKENS(); ++i) {
             blue.addIlk(bytes32(i + 1), address(new BToken("T")), 0, 0, 0);
         }
-        address t7 = address(new BToken("T7"));
+        address extra = address(new BToken("EXTRA"));
         vm.expectRevert(Backstop.TooManyTokens.selector);
-        blue.addIlk("T7", t7, 0, 0, 0);
+        blue.addIlk("EXTRA", extra, 0, 0, 0);
     }
 
     // ------------------------------------------------------------ fuzz

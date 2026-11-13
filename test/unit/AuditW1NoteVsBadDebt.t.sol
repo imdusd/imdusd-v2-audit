@@ -88,6 +88,7 @@ contract W1NbProofNoteRedeemAheadOfBadDebt is Test {
         assertEq(ledger.totalBadDebt(), 1_000e18);
         // retireReserve refuses while bad debt is booked...
         vm.expectRevert(Treasury.BadDebtOutstanding.selector);
+        vm.prank(governor);
         treasury.retireReserve(1);
         // ...a note redemption should hold for the same reason, or at least leave what the bad debt needs.
         vm.prank(buyer);

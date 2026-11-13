@@ -201,9 +201,13 @@ contract ReviewLedgerTest is CoreTest {
         _makeBadDebt();
         deal(address(usd), address(treasury), 100e18, true);
         vm.expectRevert(Treasury.BadDebtOutstanding.selector);
+        vm.prank(governor);
         treasury.retireReserve(100e18);
         treasury.coverBadDebt(ETH);
-        if (ledger.totalBadDebt() == 0) treasury.retireReserve(1); // covered: retiring is allowed again
+        if (ledger.totalBadDebt() == 0) {
+            vm.prank(governor);
+            treasury.retireReserve(1);
+        } // covered: retiring is allowed again
     }
 
     function test_review_F3_badDebtKeepsItsLineRoom() public {

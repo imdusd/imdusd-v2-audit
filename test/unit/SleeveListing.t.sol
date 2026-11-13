@@ -121,7 +121,7 @@ contract SleeveListingTest is System {
     /// slot 48 h; propose refuses it.
     function test_auditW1_addSleeveIlkRefusesAFullSleeve() public {
         // ParametersRules writes Backstop's limits out as constants (code size): they must stay equal.
-        assertEq(blue.MAX_TOKENS(), 6, "ParametersRules.SLEEVE_MAX_TOKENS");
+        assertEq(blue.MAX_TOKENS(), 10, "ParametersRules.SLEEVE_MAX_TOKENS");
         assertEq(blue.MAX_ILKS(), 12, "ParametersRules.SLEEVE_MAX_ILKS");
         uint8 k = params.ADD_SLEEVE_ILK();
         assertEq(blue.ilkCount(), 1);
@@ -164,11 +164,11 @@ contract SleeveListingTest is System {
 
     // ---------------------------------------------------------------- listing checked at propose
 
-    /// (a) The blue sleeve holds at most MAX_TOKENS tokens (mainnet lists six at genesis). A listing of a NEW token
+    /// (a) The blue sleeve holds at most MAX_TOKENS tokens (mainnet lists six of ten at genesis). A listing of a NEW token
     /// in a full sleeve used to pass propose and revert TooManyTokens at apply, holding the slot; now it is refused at
     /// propose. A type whose token the sleeve already holds still lists.
     function test_panelG3_fullSleeveRefusedAtPropose() public {
-        for (uint256 i; i < 5; ++i) {
+        for (uint256 i = blue.tokenCount(); i < blue.MAX_TOKENS(); ++i) {
             MockERC20 t = new MockERC20("FILL", 18);
             vm.prank(address(params));
             blue.addIlk(bytes32(uint256(0x100 + i)), address(t), 0, 1e30, 0);

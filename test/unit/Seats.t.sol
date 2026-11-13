@@ -51,6 +51,9 @@ contract SeatsTest is SeatSystem {
         weth = new MockERC20("WETH", 18);
         reward = new MockERC20("IMD", 18);
         ethFeed = new MockFeed(2000e18); // USD per 1e18 wei
+        // These tests are about the median's clock: the ETH/USD leg never lapses here (audit wave 2: the seat auction clock
+        // now stops while either leg is stale; AuditW2SeatClockEthUsd covers a lapsing ETH/USD leg).
+        ethFeed.setMaxAge(3650 days);
         median = new MockSeatFeed(2e18, 150); // 2 ETH per seat: $4,000; 150 distinct seats sold in 7 days
         median.setMaxAge(26 hours); // the live leaf's life (beta config); the auction clock runs on it
         spot = new MockFeed(2e18);
@@ -1209,14 +1212,14 @@ contract SeatsTest is SeatSystem {
         seatJoin.reopen(_pid(SEAT, alice));
         assertEq(seatJoin.price(_pid(SEAT, alice)), 3_200e18, "a fresh Dutch clock from the current median");
         assertFalse(seatJoin.expired(_pid(SEAT, alice)));
-        (, uint40 startAt,,,,) = seatJoin.auctions(_pid(SEAT, alice));
+        (, uint40 startAt,,,,,) = seatJoin.auctions(_pid(SEAT, alice));
         assertEq(startAt, uint40(block.timestamp));
         _skip(24 hours);
         _refresh();
         assertTrue(seatJoin.expired(_pid(SEAT, alice)));
         vm.prank(keeper);
         liquidator.liquidate(_pid(SEAT, alice)); // `open` replaces a void auction instead of reverting AuctionLive
-        (,, , address marker,,) = seatJoin.auctions(_pid(SEAT, alice));
+        (,,,, address marker,,) = seatJoin.auctions(_pid(SEAT, alice));
         assertEq(marker, keeper, "the restart's marker");
         assertEq(seatJoin.price(_pid(SEAT, alice)), 3_200e18);
         vm.startPrank(bob);
@@ -1412,8 +1415,48 @@ contract SeatsTest is SeatSystem {
     /// A claim rule may never allowlist a selector that moves or approves the account's tokens (SeatAccount.claim
     /// forwards any calldata): approving `reward.approve` would let anyone make every account approve them. Refused at
     /// propose; a token-moving selector can still be REMOVED (rule 0), and an ordinary claim selector is still accepted.
+    /// Every selector in ParametersRules' packed denylist is refused (the list became a byte scan for size, audit wave 2).
+    function test_claimRuleRefusesEveryDenylistedSelector() public {
+        bytes4[28] memory all = [
+            bytes4(0x095ea7b3),
+            0xa9059cbb,
+            0x23b872dd,
+            0xd505accf,
+            0x8fcbaf0c,
+            0x39509351,
+            0xd73dd623,
+            0x87517c45,
+            0xa22cb465,
+            0x42842e0e,
+            0xb88d4fde,
+            0xf242432a,
+            0x2eb2c2d6,
+            0x1296ee62,
+            0x4000aea0,
+            0xd8fbe994,
+            0xc1d34b89,
+            0x3177029f,
+            0xcae9ca51,
+            0x9bd9bbc6,
+            0x62ad1b83,
+            0x959b8c3f,
+            0xba087652,
+            0xb460af94,
+            0x42966c68,
+            0x79cc6790,
+            0xac9650d8,
+            0x5ae401dc
+        ];
+        for (uint256 i; i < all.length; ++i) {
+            bytes memory p = abi.encode(params.SET_SEAT_CLAIM(), address(seatJoin), address(reward), all[i], uint8(1));
+            vm.prank(governor);
+            vm.expectRevert(ParametersBase.BadConfig.selector);
+            params.propose(p);
+        }
+    }
+
     function test_panelG4_claimRuleRefusesTokenMovingSelectors() public {
-        bytes4[8] memory bad = [
+        bytes4[12] memory bad = [
             bytes4(0x095ea7b3), // approve
             0xa9059cbb, // transfer
             0x23b872dd, // transferFrom
@@ -1421,7 +1464,11 @@ contract SeatsTest is SeatSystem {
             0xa22cb465, // setApprovalForAll
             0x42842e0e, // safeTransferFrom
             0xd73dd623, // increaseApproval (audit wave 1)
-            0x87517c45 // Permit2 approve (audit wave 1)
+            0x87517c45, // Permit2 approve (audit wave 1)
+            0xba087652, // ERC-4626 redeem (audit wave 2)
+            0xb460af94, // ERC-4626 withdraw (audit wave 2)
+            0x42966c68, // burn (audit wave 2)
+            0x79cc6790 // burnFrom (audit wave 2)
         ];
         for (uint256 i; i < bad.length; ++i) {
             for (uint8 rule = 1; rule <= 2; ++rule) {

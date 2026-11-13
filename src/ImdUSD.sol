@@ -21,8 +21,8 @@ import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/Signa
 /// these gaslessly; the `bytes` overloads accept ERC-1271 signers), ERC-3156 flash mint at zero fee up
 /// to `flashCap` IN FLIGHT AT ANY MOMENT: loans in flight are counted in transient storage (`flashOutstanding`), so
 /// nested loans share the cap (review T1); a loan repaid frees its room, so sequential loans in one transaction each
-/// get the full cap (audit wave 1: this said "per transaction"). `circulating()` is the supply less what is only
-/// flash-minted, for every rule that must not be diluted by a flash mint.
+/// get the full cap (audit wave 1: this said "per transaction"). `circulating()` is the supply before the transaction's
+/// first mint or burn, for every rule that nothing earlier in the same transaction may move.
 contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
     /// @notice The address allowed to call `wire` exactly once.
     address public immutable wirer;
@@ -30,8 +30,9 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
     uint256 public immutable flashCap;
     /// @dev Transient slot holding the flash loans in flight: keccak256("imdusd.flashOutstanding").
     uint256 private constant FLASH_SLOT = 0x43bba977711567fa248257e733d781f48e8e6b2665846d63f26d68e91b5ab029;
-    /// @dev Transient slot holding `totalSupply()` when the outermost flash loan began: keccak256("imdusd.flashSupplyAtStart").
-    uint256 private constant FLASH_START_SLOT = 0x2af7f92ca8a0eae1ce080315941f9df81b5d51a7887eae3434185c3d2d05b349;
+    /// @dev Transient slot holding `totalSupply() + 1` before the transaction's first mint or burn (0: none yet):
+    /// keccak256("imdusd.supplyAtTxStart").
+    uint256 private constant TX_SUPPLY_SLOT = 0x654c867b2e0cd8bac45bebbff143cd6989a37592126a64fcb154d5200677e52f;
 
     address public ledger;
     address public migrator;
@@ -145,21 +146,36 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
         }
     }
 
-    /// @notice The supply less the flash loans in flight: what the Redeemer's fee ramp and the savings uptake divide by,
-    /// so a flash mint (any nesting) cannot dilute them. Equals `totalSupply()` outside a flash loan.
-    /// Never below the supply when the outermost loan began (audit wave 1, panel 2): a minter burn of flash-minted imdUSD (debt
-    /// repaid with the loan) lowers `totalSupply()` while the loan stays counted, which would under-read the real supply
-    /// and multiply a redemption's fee rise or the savings uptake. Real mints inside the loan still raise it.
+    /// @notice The supply as it stood before this transaction's first mint or burn: what the Redeemer's fee ramp and
+    /// base-rate rise, the savings uptake and the unbacked brake divide by, so nothing done earlier in the same transaction
+    /// moves them. Equals `totalSupply()` outside a transaction that has minted or burned.
+    /// History: it was the supply less flash loans in flight (review T1), then held at the outermost loan's start (audit
+    /// wave 1, panel 2: a minter burn of flash-minted imdUSD under-read it). Audit wave 2 (medium): real debt borrowed earlier in
+    /// the transaction and repaid before its end still raised it, diluting a redemption's fee and base-rate rise (a 9,000
+    /// redemption on a 90,000 supply paid 3% instead of 5% behind 90,000 of same-transaction debt).
     function circulating() external view returns (uint256) {
-        uint256 inFlight = flashOutstanding();
-        uint256 supply = totalSupply();
-        if (inFlight == 0) return supply;
         uint256 start;
         assembly ("memory-safe") {
-            start := tload(FLASH_START_SLOT)
+            start := tload(TX_SUPPLY_SLOT)
         }
-        uint256 net = supply > inFlight ? supply - inFlight : 0;
-        return net > start ? net : start;
+        return start == 0 ? totalSupply() : start - 1;
+    }
+
+    /// @dev Record the supply before the transaction's first mint or burn (`circulating`). Flash mints are mints.
+    function _update(address from, address to, uint256 value) internal override {
+        if (from == address(0) || to == address(0)) {
+            uint256 start;
+            assembly ("memory-safe") {
+                start := tload(TX_SUPPLY_SLOT)
+            }
+            if (start == 0) {
+                uint256 mark = totalSupply() + 1;
+                assembly ("memory-safe") {
+                    tstore(TX_SUPPLY_SLOT, mark)
+                }
+            }
+        }
+        super._update(from, to, value);
     }
 
     /// @dev OpenZeppelin's `flashLoan` with the in-flight counter around the callback. `maxFlashLoan` already subtracts
@@ -173,12 +189,6 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
         uint256 maxLoan = maxFlashLoan(token);
         if (value > maxLoan) revert ERC3156ExceededMaxLoan(maxLoan);
         uint256 before = flashOutstanding();
-        if (before == 0) {
-            uint256 supply = totalSupply();
-            assembly ("memory-safe") {
-                tstore(FLASH_START_SLOT, supply)
-            }
-        }
         _setFlashOutstanding(before + value);
         uint256 fee = flashFee(token, value);
         _mint(address(receiver), value);

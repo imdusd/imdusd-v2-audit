@@ -8,6 +8,7 @@ interface IImdDepth {
     function params() external view returns (address);
     function depth() external view returns (uint256);
     function addSampler(address sampler) external;
+    function canAdd(address sampler) external view returns (bool);
     function removeSampler(address sampler) external;
     function setLeg(address leg, address price) external;
 }
@@ -327,6 +328,8 @@ abstract contract ParametersBase is GovernedByKind {
     error BadConfig();
     error OutOfBounds();
     error DepthRuleFails(uint256 need, uint256 room);
+    /// @dev The end of a BATCH's dry run at propose (`Parameters.dryRun`): every item applied in order.
+    error DryRunOk();
 
     event IlkAdded(bytes32 indexed ilk, Config config);
     event RiskSet(bytes32 indexed ilk, Risk risk);

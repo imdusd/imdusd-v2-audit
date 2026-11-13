@@ -65,7 +65,10 @@ contract AuditW1WayBackTest is Test {
         vm.roll(block.number + secs / 12);
     }
 
-    function test_wayBackRefusesAFiftyPercentStepPastTheLevel() public {
+    /// Wave 1 refused this +50% one-step return; wave 2 (high, AuditW2Ratchet) dropped that step bound because it made a
+    /// pushed ratchet permanent. The way back now reaches the cap around a held level and no further: 1.2A is taken,
+    /// 1.21A is not.
+    function test_wayBackReachesTheCapAroundAHeldLevelAndNoFurther() public {
         uint256 A = 4e15; // wei of ETH per 1e18 IMD, the order of the live feed
         // t0: the first value anchors epoch 1 at A with the 20% cap.
         SwarmFeed.OracleAttestation memory first = _att(A);
@@ -84,11 +87,17 @@ contract AuditW1WayBackTest is Test {
         assertEq(anchor, A * 80 / 100, "the next epoch anchors on the last value");
         assertEq(allowanceBps, 2000, "with the plain cap: the feed is fresh");
 
-        // Yet 1.2A, +50% from the last accepted value, is accepted through the way back (within the cap of A).
-        SwarmFeed.OracleAttestation memory hi = _att(A * 120 / 100);
-        bytes memory sig = _sign(hi);
+        // 1.21A is past the cap of every held level (A; no epoch before it): refused.
+        SwarmFeed.OracleAttestation memory over = _att(A * 121 / 100);
+        bytes memory sig = _sign(over);
         vm.expectRevert(SwarmFeed.ExcessDeviation.selector);
-        f.submitAttestation(hi, sig);
+        f.submitAttestation(over, sig);
+        // 1.2A, +50% from the last accepted value, is within the cap of the held level A: accepted, anchored at A.
+        SwarmFeed.OracleAttestation memory hi = _att(A * 120 / 100);
+        f.submitAttestation(hi, _sign(hi));
+        (anchor, , allowanceBps) = f.epoch();
+        assertEq(anchor, A, "the way back anchors the new epoch at the held level");
+        assertEq(allowanceBps, 2000);
     }
 
     /// A push to 1.2A in the last minute of an epoch anchored at A, then the market at 0.95A: the way back must take the
