@@ -34,6 +34,7 @@ import {PegLPVault} from "../../src/earn/PegLPVault.sol";
 import {LoopVault} from "../../src/earn/LoopVault.sol";
 import {SeatJoin} from "../../src/seats/SeatJoin.sol";
 import {SwarmFeed} from "../../src/feeds/SwarmFeed.sol";
+import {FeedTraits} from "../../src/feeds/FeedTraits.sol";
 import {SwarmQuestions} from "../../src/feeds/SwarmFeeds.sol";
 import {SeatFeed, SeatSpotLeg} from "../../src/feeds/SeatFeed.sol";
 import {CompoundHook} from "../../src/dex/CompoundHook.sol";
@@ -176,20 +177,41 @@ abstract contract DeployBase is Script {
                 && RateFeed(f).maxGrowthPerSecond() == n.cap;
         }
         if (n.kind == DeployTypes.LIVE_POOL) {
-            return address(LivePoolPrice(f).manager()) == n.source && PoolId.unwrap(LivePoolPrice(f).poolId()) == n.poolId
-                && LivePoolPrice(f).baseIsToken0() == n.passOneE18;
+            // A ProvenPoolPrice answers the same three getters for the same pool (audit wave 3, low): a LivePoolPrice is the
+            // one that never ages (maxAge = 2^64 - 1, its pure constant) and has no `provenBlock()`.
+            (bool proven,) = f.staticcall(abi.encodeWithSignature("provenBlock()"));
+            return !proven && LivePoolPrice(f).maxAge() == type(uint64).max && address(LivePoolPrice(f).manager()) == n.source
+                && PoolId.unwrap(LivePoolPrice(f).poolId()) == n.poolId && LivePoolPrice(f).baseIsToken0() == n.passOneE18;
         }
         if (n.kind == DeployTypes.PROVEN_POOL) {
             return ProvenPoolPrice(f).manager() == n.source && PoolId.unwrap(ProvenPoolPrice(f).poolId()) == n.poolId
-                && ProvenPoolPrice(f).baseIsToken0() == n.passOneE18 && ProvenPoolPrice(f).maxAge() == n.maxAge;
+                && ProvenPoolPrice(f).baseIsToken0() == n.passOneE18 && ProvenPoolPrice(f).maxAge() == n.maxAge
+                && FeedTraits.proven(IFeed(f)); // price design C: the trait the Pricer's twin rule reads
         }
         // Every swarm leaf: its lifetime and cap, its question and its signer (a resume used to adopt on code alone).
         bytes memory q = _swarmQuestion(n.kind);
         if (q.length == 0) return false;
         return SwarmFeed(f).maxAge() == n.maxAge && SwarmFeed(f).maxDeviationBps() == n.cap
             && SwarmFeed(f).attester() == SwarmQuestions.ATTESTER && SwarmFeed(f).relayer() == address(0)
-            && SwarmFeed(f).MAX_ALLOWANCE_BPS() <= STALE_ALLOWANCE_CEILING
+            && SwarmFeed(f).MAX_ALLOWANCE_BPS() <= STALE_ALLOWANCE_CEILING && _clampLeaf(f)
             && SwarmFeed(f).expectedQuestionHash(1, 2) == keccak256(abi.encodePacked(q, "1", ',"toBlock":', "2", "}}"));
+    }
+
+    /// @dev Price design C: a leaf built with the clamp rule answers `followOf`; a leaf built before it (the epoch rejection
+    /// rule and its way back) does not, so a resume never adopts one.
+    function _clampLeaf(address f) internal view returns (bool) {
+        (bool ok, bytes memory ret) = f.staticcall(abi.encodeWithSignature("followOf(uint256)", uint256(1)));
+        return ok && ret.length == 32;
+    }
+
+    /// @notice True when node `i` is a proven pool price or priced through one (the Pricer's twin trait, design C). The deployed
+    /// feed must report the same through `FeedTraits.proven` (LaunchBase._checkFeeds).
+    function _provenAtDeploy(DeployTypes.FeedNode[] memory nodes, uint256 i) internal pure returns (bool) {
+        DeployTypes.FeedNode memory n = nodes[i];
+        if (n.kind == DeployTypes.PROVEN_POOL) return true;
+        if (n.kind == DeployTypes.PRODUCT) return _provenAtDeploy(nodes, n.a) || _provenAtDeploy(nodes, n.b);
+        if (n.kind == DeployTypes.RATE) return _provenAtDeploy(nodes, n.a);
+        return false;
     }
 
     function _swarmQuestion(uint8 kind) internal pure returns (bytes memory) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {System} from "../utils/System.sol";
 import {MockERC20, MockFeed} from "../utils/Mocks.sol";
@@ -302,7 +303,7 @@ contract SavingsTest is System {
     }
 
     function test_genesisSavingsChecks() public {
-        Parameters p = new Parameters(governor, address(this));
+        Parameters p = Modules.newParameters(governor, address(this));
         // Not wired to a token yet.
         vm.expectRevert(ParametersBase.BadConfig.selector);
         p.setGenesisSavings(address(savings), 0.5e18);

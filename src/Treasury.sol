@@ -37,8 +37,8 @@ interface INoteBook {
 
 /// @notice Receives interest (imdUSD), liquidation cuts and harvested yield shares. Scope:
 /// hold, cover bad debt, and pay out only through the 48h timelock.
-/// @dev `coverBadDebt` and `retireReserve` are permissionless because both only burn the Treasury's own
-/// imdUSD against liabilities, which can never make the system less solvent. Investing reserves (the
+/// @dev `coverBadDebt` is permissionless because it only burns the Treasury's own imdUSD against liabilities, which can never
+/// make the system less solvent; `retireReserve` is the governor's (audit wave 2). Investing reserves (the
 /// burn path's swap, peg keeper) is a Safe act through the timelock payout.
 ///
 /// REVENUE METER (fee notes). The Ledger reports every imdUSD it mints here as interest

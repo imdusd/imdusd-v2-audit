@@ -82,7 +82,7 @@ abstract contract GovernedByKind {
         if (block.timestamp < eta) revert TooEarly(eta);
         if (block.timestamp > eta + PROPOSAL_EXPIRY) revert Expired(eta);
         bytes memory payload = _take(kind).payload;
-        _validate(payload);
+        _validateAtApply(payload);
         _apply(payload);
         emit Applied(payload);
     }
@@ -142,6 +142,11 @@ abstract contract GovernedByKind {
     }
 
     function _validate(bytes memory payload) internal virtual;
+
+    /// @dev The check `applyPending` runs before applying: `_validate` unless a kind's apply checks itself.
+    function _validateAtApply(bytes memory payload) internal virtual {
+        _validate(payload);
+    }
 
     function _apply(bytes memory payload) internal virtual;
 }

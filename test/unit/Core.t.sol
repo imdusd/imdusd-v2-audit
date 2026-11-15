@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
 import {System} from "../utils/System.sol";
@@ -733,7 +734,7 @@ contract CoreTest is System {
     }
 
     function test_genesisMaxLull() public {
-        Parameters p = new Parameters(governor, address(this));
+        Parameters p = Modules.newParameters(governor, address(this));
         vm.prank(alice);
         vm.expectRevert(ParametersBase.Unauthorized.selector);
         p.setGenesisMaxLull(0);

@@ -192,22 +192,34 @@ contract SwarmFeedTest is Test {
         f.submitAttestation(a, sig);
     }
 
-    function test_epochBoundStillHolds() public {
+    /// @notice The epoch bound, under design C (clamp, do not reject): a +23% target inside the epoch is TAKEN and the
+    /// stored value stops at the cap (+20%); the leaf reports the target and that it has not converged on it.
+    function test_epochBoundClampsTheTarget() public {
         TestPriceFeed f = new TestPriceFeed(attester, 1 hours);
         _submit(f, _att(f, 25_999_990, 3e15));
         vm.warp(vm.getBlockTimestamp() + 5 minutes);
         vm.roll(26_000_025);
-        SwarmFeed.OracleAttestation memory a = _att(f, 26_000_020, 3.7e15); // +23% inside the epoch
-        bytes memory sig = _sign(f, a, KEY);
-        vm.expectRevert(SwarmFeed.ExcessDeviation.selector);
-        f.submitAttestation(a, sig);
+        assertEq(f.followOf(3.7e15), 3.6e15, "followOf reports the clamp before paying");
+        _submit(f, _att(f, 26_000_020, 3.7e15)); // +23% inside the epoch
+        (uint256 v,) = f.latestValue();
+        assertEq(v, 3.6e15, "stored at the cap around the anchor");
+        assertEq(f.attested(), 3.7e15);
+        assertFalse(f.converged());
+        // An honest value inside the band converges it again.
+        vm.warp(vm.getBlockTimestamp() + 5 minutes);
+        vm.roll(26_000_050);
+        _submit(f, _att(f, 26_000_045, 3.3e15));
+        (v,) = f.latestValue();
+        assertEq(v, 3.3e15);
+        assertTrue(f.converged());
     }
 
     // ------------------------------------------------------------ stale allowance cap
 
     /// @notice F2 (medium): after a silence the allowance is 2x the cap and never wider. It used to grow an eighth of the
     /// cap per further hour: 60% after the 10-hour plane outage of 2026-10-23, 100% after 26 hours, and whoever relayed
-    /// first re-anchored the feed by that much. FAILED before the fix (the +45% value was accepted; the 26-hour allowance read 100%).
+    /// first re-anchored the feed by that much. FAILED on dd776c7. Under design C a +45% target after ten hours is taken and
+    /// stored at +40% (2x the cap), never at +45%.
     function test_staleAllowanceCapsAtTwiceTheCap() public {
         TestPriceFeed f = new TestPriceFeed(attester, 1 hours);
         _submit(f, _att(f, 25_999_990, 3e15));
@@ -216,22 +228,17 @@ contract SwarmFeedTest is Test {
         vm.roll(26_003_000);
         (,, uint256 allowance) = f.epoch();
         assertEq(allowance, 2 * f.maxDeviationBps(), "2x the cap after any silence, not 60%");
-        assertFalse(f.accepts(3e15 * 141 / 100));
-        SwarmFeed.OracleAttestation memory a = _att(f, 26_002_995, 3e15 * 145 / 100); // +45%: inside the OLD 60%
-        bytes memory sig = _sign(f, a, KEY);
-        vm.expectRevert(SwarmFeed.ExcessDeviation.selector);
-        f.submitAttestation(a, sig);
-        // +39% is within 2x the cap: accepted, and it anchors the epoch.
-        _submit(f, _att(f, 26_002_996, 3e15 * 139 / 100));
+        _submit(f, _att(f, 26_002_995, 3e15 * 145 / 100)); // +45%: inside the OLD 60%
         (uint256 v,) = f.latestValue();
-        assertEq(v, 3e15 * 139 / 100);
+        assertEq(v, 3e15 * 140 / 100, "stored at 2x the cap, not at the target");
+        assertFalse(f.converged());
         // A day of silence later: still 2x the cap (it used to be 100%: any value).
         vm.warp(vm.getBlockTimestamp() + 26 hours);
         vm.roll(26_003_000 + 7_800);
         (,, allowance) = f.epoch();
         assertEq(allowance, 2 * f.maxDeviationBps());
-        assertFalse(f.accepts(2 * v), "a 2x value is refused however long the silence");
-        assertTrue(f.accepts(v * 139 / 100), "a value inside 2x the cap is not");
+        assertEq(f.followOf(2 * v), v * 140 / 100, "a 2x target moves the value 2x the cap however long the silence");
+        assertEq(f.followOf(v * 139 / 100), v * 139 / 100, "a target inside 2x the cap is stored as attested");
     }
 
     /// @notice F6 (low): two attestations signed in the same second can only be relayed in WINDOW order: the later

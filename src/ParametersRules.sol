@@ -4,7 +4,8 @@ pragma solidity 0.8.26;
 import "./ParametersBase.sol";
 
 /// @notice Parameters' per-kind validation and application (EIP-170 split; the LedgerSettlement pattern). Deployed
-/// by Parameters' constructor and run ONLY by delegatecall from it, on Parameters' storage; a direct call is refused.
+/// on its own before Parameters (audit wave 3), which takes its address; run ONLY by delegatecall, on the caller's storage; a
+/// direct call is refused.
 /// @dev Parameters' own BATCH dry run (audit wave 2), reached by a self-call: this module runs in Parameters' context.
 interface IBatchCheck {
     function checkBatch(bytes[] calldata items) external;
@@ -231,7 +232,7 @@ contract ParametersRules is ParametersBase {
     /// @dev A SeatAccount forwards any calldata after an allowlisted (target, selector), so a claim rule may never
     /// name a selector that moves or approves the account's tokens (ERC-20 / 721 / 1155 / 777 / 1363 transfers, approvals,
     /// permits, ERC-4626 redeem/withdraw, burns, and multicall, which reaches any of them): allowlisting one would let anyone move every account's unpaid rewards. Removing a rule (rule 0) is always allowed.
-    /// @dev The selectors refused, packed 4 bytes each (a scan is smaller than 28 comparisons; ParametersRules is at the
+    /// @dev The selectors refused, packed 4 bytes each (a scan is smaller than 41 comparisons; ParametersRules is at the
     /// size limit), in this order:
     ///   0x095ea7b3 approve(address,uint256)
     ///   0xa9059cbb transfer(address,uint256)
@@ -261,7 +262,23 @@ contract ParametersRules is ParametersBase {
     ///   0x79cc6790 burnFrom(address,uint256)
     ///   0xac9650d8 multicall(bytes[])
     ///   0x5ae401dc multicall(uint256,bytes[])
-    bytes private constant MOVES_TOKENS = hex"095ea7b3a9059cbb23b872ddd505accf8fcbaf0c39509351d73dd62387517c45a22cb46542842e0eb88d4fdef242432a2eb2c2d61296ee624000aea0d8fbe994c1d34b893177029fcae9ca519bd9bbc662ad1b83959b8c3fba087652b460af9442966c6879cc6790ac9650d85ae401dc";
+    /// Audit wave 3 (low), 13 more:
+    ///   0xb753a98c push(address,uint256) (DSToken: DAI, MKR)
+    ///   0xbb35783b move(address,address,uint256) (DSToken)
+    ///   0xfe9d9303 burn(uint256,bytes) (ERC-777)
+    ///   0xfc673c4f operatorBurn(address,uint256,bytes,bytes) (ERC-777: a holder is its own operator)
+    ///   0x9dc29fac burn(address,uint256)
+    ///   0x095bcdb6 transfer(address,uint256,uint256) (ERC-6909: v4 PoolManager claims)
+    ///   0xfe99049a transferFrom(address,address,uint256,uint256) (ERC-6909)
+    ///   0x426a8493 approve(address,uint256,uint256) (ERC-6909)
+    ///   0x558a7297 setOperator(address,bool) (ERC-6909)
+    ///   0x1f0464d1 multicall(bytes32,bytes[]) (Uniswap IMulticallExtended)
+    ///   0x69328dec withdraw(address,uint256,address) (Aave pool: burns aTokens to any recipient)
+    ///   0xdb006a75 redeem(uint256) and 0x852a12e3 redeemUnderlying(uint256) (Compound: converts the credited cTokens in place,
+    ///   so their holders' credits become unpayable and the underlying is reported to whoever holds the seat then)
+    /// A DENYLIST CANNOT BE COMPLETE: what a selector does is the target's code, so any SET_SEAT_CLAIM proposal must be
+    /// reviewed against the target's ABI and code; this list only refuses the standard token-moving forms.
+    bytes private constant MOVES_TOKENS = hex"095ea7b3a9059cbb23b872ddd505accf8fcbaf0c39509351d73dd62387517c45a22cb46542842e0eb88d4fdef242432a2eb2c2d61296ee624000aea0d8fbe994c1d34b893177029fcae9ca519bd9bbc662ad1b83959b8c3fba087652b460af9442966c6879cc6790ac9650d85ae401dcb753a98cbb35783bfe9d9303fc673c4f9dc29fac095bcdb6fe99049a426a8493558a72971f0464d169328decdb006a75852a12e3";
 
     function _movesTokens(bytes4 s) private pure returns (bool hit) {
         bytes memory m = MOVES_TOKENS;

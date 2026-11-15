@@ -18,54 +18,51 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// us test a protocol we were never going to deploy.
 ///
 /// There is no admin or setter. Values are scaled by 1e18; consumers enforce any application bounds.
-/// Zero is rejected: it is never a valid scaled figure and would pin the relative bound at zero. The deviation bound is PER UNIT OF TIME, not per attestation: every value accepted within one
-/// maxAge of an epoch's start must lie within the epoch's allowance of the ANCHOR, the value the feed held
-/// when the epoch began. The allowance is maxDeviationBps when that value was fresh, and still
-/// maxDeviationBps for the first STALE_GROWTH_PERIOD (an hour) it is stale; after a whole hour of
-/// staleness, STALE_DEVIATION_MULTIPLE times the cap, and NO WIDER however long the silence lasts
-/// (`_allowanceNow`, below). The stale base is earned by silence, never by timing: measured from one second
-/// past the lifetime, a buyer relaying one step an hour and a second after the last opened every epoch on
-/// the stale base and compounded at it (v1 second-half review, medium);
-/// now a feed anyone keeps alive moves at most the cap per EPOCH however it is driven (two steps can
-/// straddle an epoch boundary a block apart, so over a sliding hour the move can reach (1 + cap)^2 - 1
-/// once; the sustained rate is the cap per lifetime). An epoch opened
-/// wider than the cap closes behind its first value: every later value in it must also lie within the
-/// cap of that first one (`_epochFirst`), so an honest refresh of a long-silent feed leaves an attacker
-/// the cap around the market, not the stale allowance. It never lifts outright, but it does not stay shut either: the final
-/// pre-launch review (v1, high) showed that a bound which never widens
-/// cannot follow a single-step market move larger than itself — the pinned recipes read the pool, and a
-/// step has no intermediate medians — so the feed, and every vault pinned to it, would halt for good
-/// after one such gap. Widening with staleness turns a gap into a delay of hours and makes a far
-/// re-anchor cost an attacker those same hours of silence, during which anyone can refresh the feed.
-/// THE WIDENING IS CAPPED AT TWICE THE CAP (medium): it used to grow by an
-/// eighth of the cap per further hour of silence to 100x, so after the plane's 10-hour outage of 2026-10-23
-/// the first relayer could have re-anchored a 20%-cap feed by 60%, and after 26 hours by 100%: at that
-/// point whoever lands the first attestation (the attacker's pre-bought one as easily as the keeper's)
-/// sets the price for every position. Now the first value after any silence moves at most 2x the cap
-/// (40% on the price feeds), and the feed then follows a larger gap at the cap per epoch from there
-/// (every later epoch opens on a fresh value). The trade this buys back: a SINGLE-STEP market move larger
-/// than 2x the cap that no attestation caught on the way (a gap, not a trend) cannot be followed by an
-/// honest attestation, since the pinned recipes read the pool and have no intermediate value to offer;
-/// such a feed is halted until the market returns within 2x the cap of the anchor, and a type whose feeds
-/// cannot be re-pointed is then wound down (line 0). Judged acceptable: a 40%+ gap inside one lifetime with
-/// no refresh is the outage-plus-crash case, and in it the halt (no borrowing, no liquidation at a wrong
-/// price) is the safer failure. A value
-/// relayed at the end of a live epoch needs no silence to anchor the next one, so once an epoch has expired a
-/// value within the cap of the level it held is also accepted (`_returnAnchor`): the honest level is never
-/// locked out by a late push (final sweep panel 4 2026-10-09, medium).
+/// Zero is rejected: it is never a valid scaled figure.
 ///
-/// Two revisions from the internal audit of 2026-10-06, the high finding. The bound used to lift entirely
-/// once stale. Price feeds live one hour and are bought on demand, so being stale is their normal state,
-/// and the first attestation after any quiet hour could set any value. The question binding pins the text
-/// but the buyer chooses the window, and the recipe samples fixed blocks inside it, so a buyer who pushes
-/// the pool at those blocks has a manipulated value attested honestly. Bounding the stale step alone was
-/// then shown insufficient: measured against the LAST value, six attestations relayed in one block walked a
-/// 20% cap from 1.0 to 3.48 (measured in v1's suite, `test_chainedAttestationsCannotWalkPastTheEpochBound`).
-/// Measured against the anchor, an hour moves the price by at most the allowance however many attestations
-/// are bought; with the stale base earned only by a whole hour of silence past the lifetime, a run of
-/// steps compounds at no more than the cap per hour after the first: from a fresh feed 2x is four steps
-/// (three hours of sustained, visible manipulation of the pool) and 3.48x seven (six hours); from a feed
-/// two hours silent, whose first step is the stale 40%, 3.48x is six steps, five hours.
+/// HOW A VALUE IS BOUNDED: CLAMP, DO NOT REJECT (price design C, 2026-11-14; replaces the epoch REJECTION rule and its
+/// "way back", whose memory three public audit waves each found a new lock-out or laundering hole in). For a feed whose
+/// values have magnitude (`_hasMagnitude`, every shipped leaf), every attestation that passes the checks of
+/// `submitAttestation` (signature, question binding, panel floors, window rules, freshness, replay) is ACCEPTED, as a
+/// TARGET. The stored value moves toward the target by at most the current epoch's allowance around the epoch's ANCHOR:
+///   - an epoch opens at the first acceptance after the previous one has run maxAge, and is anchored at the STORED value
+///     then (never at a remembered or attested one); it lasts maxAge;
+///   - its allowance is maxDeviationBps, or STALE_DEVIATION_MULTIPLE (2) x that when the stored value has been silent for
+///     maxAge plus a whole STALE_GROWTH_PERIOD (an hour) when the epoch opens (`_allowanceNow`); never wider;
+///   - stored = clamp(target, anchor x (1 - allowance), anchor x (1 + allowance)). `attested()` is the last target and
+///     `converged()` says whether the stored value is it. `latestValue()` returns the stored value, dated by the
+///     attestation that moved it (consumers that must not act at a value nobody attested read `converged()`: the Pricer
+///     does, so a clamped leg prices but does not agree, and lends nothing).
+/// The feed remembers nothing beyond the live epoch's anchor and the last target, so what it does next depends only on
+/// the stored value, the clock and the next attestation. What that guarantees (test/unit/SwarmFeedProperties.t.sol):
+///   P1 STEP BOUND. Within one epoch the stored value stays within the epoch's allowance of its anchor, whoever relays
+///      what in whatever order: the stored value moves at most one allowance per epoch (two moves can straddle a
+///      boundary a block apart, so over a sliding maxAge it can reach (1 + allowance)^2 - 1 once).
+///   P2 LIVENESS. Every accepted attestation leaves the stored value as close to its target as the epoch allows (the
+///      closest point of the band), and each new epoch moves it a full allowance toward the target or onto it. So once
+///      honest attestations of a level H are the only ones relayed, at least one per epoch, the stored value reaches H
+///      within ceil(ln(max(S, H) / min(S, H)) / ln(1 + cap)) epochs from any stored value S, sooner after a silence
+///      (the 2x allowance). There is no lock-out: no sequence of earlier attestations can make a later one refused or
+///      make it move the value away from its target.
+///   P3 NO LAUNDERING. A level the feed held only because of a push is never a reference for refusing anything: the only
+///      reference is the live anchor, and it bounds the step, it refuses nothing.
+/// THE RESIDUAL, stated plainly: an attack lasting k epochs (a compromised attester, a wrong majority, pushed pool reads
+/// attested honestly) moves the value at most one allowance per epoch and takes about k epochs of honest attestations to
+/// undo (the way back undid it in one step; that speed is what needed memory, and the memory is what broke). A relayer
+/// that always lands LAST in an epoch decides where the stored value ends that epoch, within the allowance, for as long
+/// as it keeps doing so. The response to a suspected attester compromise is `Parameters.lowerLine(ilk, 0)` (instant: no
+/// new debt on the type, liquidations continue) and a re-point (an operator procedure). The first value ever has no bound on chain:
+/// whoever relays first sets it (the relay is permissionless), so the operator relays it first and checks it. A
+/// single-step market gap larger than the allowance is followed at the allowance per epoch (a gap is a delay, never a
+/// halt). A feed whose values have no magnitude (a Merkle root) keeps no epoch and takes every nonzero attested value.
+///
+/// HISTORY, briefly (full record in git and the audit folders): v1 bounded the move from the LAST value (six attestations
+/// in one block walked a 20% cap 1.0 -> 3.48); then from the epoch anchor with rejection; the stale widening was capped at
+/// 2x (it grew to 100x after a long outage); the "way back" (`_returnAnchor`, two epochs deep) was
+/// added so a late push could not lock the honest level out, and audit waves 1-3 found that any depth of it either
+/// locks out (N+1 timed pushes) or launders a pushed level as a reference. Clamping removes the rejection that made a
+/// way back necessary. Silence is measured from the later of the signature and the relay (a held attestation relayed
+/// late does not earn the stale base early: final panel audit, oracle, medium).
 ///
 /// ---------------------------------------------------------------------------------------------------------------
 /// imdUSD v2 PORT. Copied from the imdUSD v1 source (`src/SwarmFeed.sol`) at tag `mainnet-freeze-2026-10-11`
@@ -106,7 +103,6 @@ abstract contract SwarmFeed is IFeed {
 
     error InvalidConfiguration();
     error ZeroValue();
-    error ExcessDeviation();
     error InvalidSignature();
     error UnauthorizedRelayer();
     error WrongQuestion(bytes32 expected, bytes32 given);
@@ -116,6 +112,8 @@ abstract contract SwarmFeed is IFeed {
     error WindowInFuture(uint64 toBlock, uint256 head);
     error WindowTooOld(uint64 toBlock, uint256 head);
     error WindowBehindClock(uint64 toBlock, uint256 projected);
+    /// @notice The first value of a remote feed with no block clock is the deployment's to relay (audit wave 3).
+    error FirstValueNotDeployer();
     error UnboundQuestionNeedsRelayer();
     error QuestionNeedsWindowBounds();
     error InvalidAttestationChain();
@@ -176,37 +174,29 @@ abstract contract SwarmFeed is IFeed {
     uint256 public immutable maxDeviationBps;
 
     mapping(bytes32 requestId => bool consumed) public usedRequests;
+    /// @dev The STORED value: the last target moved toward it within the epoch's allowance (`_follow`).
     uint256 private _value;
     uint64 private _updatedAt;
     bool private _hasValue;
-    /// @dev The bounding epoch: when it opened and the move it allows (bps), packed into the slot above
-    /// so that opening one costs a single new storage write (the anchor value below) and the Intake's
-    /// 200,000-gas callback stipend still fits a first delivery (measured in v1, OracleAskerBoundGas). An
-    /// epoch lasts maxAge from its first acceptance; the next acceptance after that opens a new one
-    /// from the value then current. See `_epoch`.
+    /// @dev The bounding epoch: when it opened and its allowance in bps (at most MAX_ALLOWANCE_BPS, so 24 bits are exact).
+    /// An epoch lasts maxAge from its first acceptance; the next acceptance after that opens one at the stored value.
     uint40 private _anchorAt;
-    /// @dev At most MAX_ALLOWANCE_BPS (20,000), so 24 bits are exact.
     uint24 private _anchorBound;
-    /// @dev The block time the current value was RELAYED (accepted), as opposed to `_updatedAt`, the time
-    /// its attestation was signed. Silence is measured from here: a relayer may hold a signed attestation
-    /// for up to maxAge before relaying it, and measured from the signature a held value arrived already
-    /// an hour old, so the next step earned the stale base an hour early (final panel audit, oracle,
-    /// medium: 1.4 per ~65 minutes instead of the cap per hour). Freshness for consumers still runs from
-    /// the signature (`isStale`), which is the stricter reading for them.
+    /// @dev The block time the stored value was RELAYED (accepted), as opposed to `_updatedAt`, the time its attestation
+    /// was signed. Silence is measured from the later of the two: a relayer may hold a signed attestation for up to
+    /// maxAge, and measured from the signature a held value arrived already old, so the next epoch earned the stale base
+    /// early (final panel audit, oracle, medium). Freshness for consumers still runs from the signature (`isStale`).
     uint40 private _acceptedAt;
-    /// @dev The first value accepted in the current epoch if that epoch opened wider than the cap (on a
-    /// stale value), else zero; see `_checkValue`. Packed into the same slot as `_updatedAt` and the epoch,
-    /// which every acceptance writes anyway, so it adds no storage write to a delivery inside the Intake's
-    /// stipend. A value too large for 80 bits (above 1.2e24, far beyond any figure the shipped feeds
-    /// carry: NHI is at most 1e18, the price feeds about 4e15) is not recorded, and that epoch is then
-    /// bounded from its anchor alone.
-    uint80 private _epochFirst;
-    uint256 private _anchorValue;
-    /// @dev The anchor of the epoch before the stored one (`_returnAnchor`); 0 until a second epoch opens.
-    uint256 private _prevAnchorValue;
+    /// @dev The live epoch's anchor (the stored value when it opened) and the last attested target, one slot. A feed with
+    /// magnitude refuses a target above 2^128 (`InvalidAnswer`; the shipped figures are below 1e24), so both fit, and the
+    /// stored value, always between an anchor and a target, does too. Unused by a feed without magnitude.
+    uint128 private _anchorValue;
+    uint128 private _attested;
 
     /// @notice A data chain on which `block.number` here reports its blocks (see the port note), 0 if none.
     uint256 public immutable blockClockChainId;
+    /// @notice Who deployed the feed: the only relayer of a remote feed's FIRST value where no block clock can date it.
+    address public immutable deployer;
     /// @notice Blocks of the data chain the block clock may lag behind (port note, rule 1).
     uint256 public constant PARENT_SLACK = 300;
     /// @notice The slow projection gives up 1/32 (~3%) of slots to missed blocks (port note, rule 2).
@@ -225,10 +215,9 @@ abstract contract SwarmFeed is IFeed {
     /// @param attestationChainId_ Required data chain in the signed payload, independent of the consumer chain.
     /// @param attestationAnswerType_ Required answer type in the signed payload.
     /// @param maxAge_ Maximum accepted age in seconds, strictly positive.
-    /// @param maxDeviationBps_ The per-epoch deviation cap in bps, 0 to 10,000: every value accepted within
-    /// one lifetime of an epoch's start lies within this much of the epoch's ANCHOR when the epoch opens on
-    /// a fresh value, wider when it opens after a silence (`_checkValue`, `_allowanceNow`). Not a bound on
-    /// the change from the last accepted value.
+    /// @param maxDeviationBps_ The per-epoch cap in bps, 0 to 10,000: the stored value stays within this much of the
+    /// epoch's ANCHOR for one lifetime from the epoch's start when the epoch opens on a fresh value, 2x when it opens
+    /// after a silence (`_follow`, `_allowanceNow`). A target outside that band is taken and clamped to its edge.
     constructor(
         address attester_,
         address relayer_,
@@ -279,6 +268,7 @@ abstract contract SwarmFeed is IFeed {
         maxAge = maxAge_;
         maxDeviationBps = maxDeviationBps_;
         blockClockChainId = block.chainid == ROBINHOOD_CHAIN ? ETHEREUM : block.chainid;
+        deployer = msg.sender;
     }
 
     function latestValue() external view override returns (uint256 value, uint64 updatedAt) {
@@ -307,9 +297,9 @@ abstract contract SwarmFeed is IFeed {
     /// replay nonce. The immutable consumer domain binds the deployment chain and this feed, stopping
     /// cross-feed replay without identifying the question. questionHash binds a changing pinned block
     /// window, so this contract cannot verify WHICH question an attestation answers FROM THE HASH ALONE.
-    /// The deviation guard bounds every value after the first against the current epoch's anchor, fresh
-    /// or stale (`_checkValue`); a feed that pins its question document (questionPolicy, every shipped
-    /// feed) verifies the question directly. The relayer is not a trust boundary on the shipped feeds:
+    /// Every value after the first is a TARGET the stored value follows within the current epoch's allowance
+    /// (`_follow`); a feed that pins its question document (questionPolicy, every shipped feed) verifies the
+    /// question directly. The relayer is not a trust boundary on the shipped feeds:
     /// they are built with relayer zero, so anyone relays. Nothing on chain bounds the FIRST value: the
     /// shipped feeds are deployed empty and whoever relays first sets it, so the operator's procedure, not
     /// this code, must win (or check) the first relay of every leaf.
@@ -449,9 +439,18 @@ abstract contract SwarmFeed is IFeed {
             uint256 most = uint256(originBlock) + (issuedAt > originAt ? issuedAt - originAt : 0) / 12 + PARENT_SLACK;
             if (toBlock > most) revert WindowInFuture(toBlock, most);
         } else {
+            // The origin bounds every later window, and nothing here can date the first one (audit wave 3, low: an old first
+            // window, signed fresh and relayed by anyone, put the bound behind the honest head for good). Where a block clock
+            // exists it has already refused an old window; elsewhere only the deployment relays the first value.
+            if (attestationChainId != blockClockChainId && msg.sender != deployer) revert FirstValueNotDeployer();
             (originBlock, originAt) = (toBlock, issuedAt);
         }
         uint256 next = toBlock > projected ? toBlock : projected;
+        // One window moves the clock at most PARENT_SLACK past the slow projection (audit wave 3, low: one window dated at the
+        // origin bound, which runs ~1% of the slots since the origin ahead of the honest head, moved the clock there and
+        // honest windows were refused as behind for ~0.47 x the feed's age). Honest windows still pull a lagging clock up by
+        // up to PARENT_SLACK each (an outage loses ~3% of its slots to the projection: one window closes a day's).
+        if (clockAt != 0 && next > projected + PARENT_SLACK) next = projected + PARENT_SLACK;
         clockBlock = uint64(next);
         if (issuedAt > clockAt) clockAt = issuedAt;
     }
@@ -493,130 +492,82 @@ abstract contract SwarmFeed is IFeed {
         signer = ecrecover(digest, v, r, s);
     }
 
-    /// @notice Refuse a value this feed should not accept. Zero always; a value further from the current
-    /// epoch's anchor than its allowance: `maxDeviationBps` for an epoch opened on a fresh value,
-    /// STALE_DEVIATION_MULTIPLE times that for one opened on a stale value (`_allowanceNow`; no wider
-    /// however long the silence). The first value ever has no bound on chain, and whoever relays first
-    /// sets it (the relay is permissionless): no check in this repository compares it with the market,
-    /// so the operator relays it first and checks it. It anchors the
-    /// first epoch.
-    /// @dev VIRTUAL, and the reason is that the bound assumes the value is a PRICE. It is the right
-    /// guard for one: a price moves continuously, so a large jump is evidence of a bad figure rather
-    /// than of a fast market. It is the wrong guard for a value with no magnitude — a Merkle root is a
-    /// uniformly random 256-bit number, so two consecutive honest roots differ wildly and this would
-    /// reject almost all of them.
-    ///
-    /// A subclass that carries such a value overrides this and keeps the zero check. What it gives up
-    /// is real and must be stated where it is given up: the deviation bound is one of the things
-    /// standing between a wrong figure and the consumers of this feed. What remains is question
-    /// binding, the attester signature and the panel floors — which, per the HIGH finding of audit
-    /// c71449d1, are what actually guard a feed, the deviation bound having been the fallback for a
-    /// feed that pinned no question.
+    /// @notice Refuse a value this feed cannot take as a target: zero, and (a feed with magnitude) one above 2^128, which no
+    /// shipped figure comes near (prices ~4e15, NHI <= 1e18, seat prices ~1e18 wei, depth ~1e22 wei). Nothing else is
+    /// refused: a value far from the stored one is a TARGET the stored value moves toward (`_follow`). The first value
+    /// ever has no bound on chain and whoever relays first sets it (the relay is permissionless): no check in this
+    /// repository compares it with the market, so the operator relays it first and checks it (final panel audit, oracle,
+    /// low). It anchors the first epoch.
+    /// @dev VIRTUAL: a feed whose value has no magnitude (a Merkle root, `_hasMagnitude` false) overrides it and keeps the
+    /// zero check; such a feed keeps no epoch and stores every attested value as it is. What it gives up is real: the step
+    /// bound is one of the things standing between a wrong figure and the feed's consumers. What remains is question
+    /// binding, the attester signature and the panel floors, which (audit c71449d1, high) are what actually guard a feed.
     function _checkValue(uint256 value) internal view virtual {
         if (value == 0) revert ZeroValue();
-        if (_hasValue && !_fitsEpoch(value) && _returnAnchor(value) == 0) revert ExcessDeviation();
+        if (_hasMagnitude() && value > type(uint128).max) revert InvalidAnswer();
     }
 
-    /// @dev Whether `value` lies within the current epoch's allowance of its anchor (`_epoch`), and, inside a
-    /// wide epoch whose first value has landed, within the cap of that first value. Whoever lands first after a
-    /// silence gets the stale allowance; an honest refresh therefore closes it for everyone after (review of
-    /// cc4103f, 2026-10-07: a +55% value was accepted an hour after the Treasury's honest refresh).
-    function _fitsEpoch(uint256 value) private view returns (bool) {
-        (uint256 anchor, uint256 bound) = _epoch();
-        uint256 change = value > anchor ? value - anchor : anchor - value;
-        if (change > Math.mulDiv(anchor, bound, 10_000)) return false;
-        uint256 first = _epochFirst;
-        if (first != 0 && block.timestamp - uint256(_anchorAt) < maxAge) {
-            uint256 drift = value > first ? value - first : first - value;
-            if (drift > Math.mulDiv(first, maxDeviationBps, 10_000)) return false;
-        }
-        return true;
-    }
-
-    /// @dev THE WAY BACK. Once the stored epoch has expired, a value within the cap of the level that epoch held
-    /// its values to (its first value if it opened wide, else its anchor) is accepted, and opens the next epoch
-    /// anchored there. Without it a value relayed in the last minute of an epoch anchored the next epoch, and
-    /// the honest level it had moved away from was refused until the pushed value had been silent long enough
-    /// to widen the allowance: for a spot feed, one block of a pushed pool attested honestly refused the honest
-    /// spot for two hours, and the vault refused every priced action for disagreement, then staleness, long
-    /// enough to expire a liquidation mark (final sweep panel 4 2026-10-09, medium). It applies only to a value
-    /// the epoch rule refuses (`_fitsEpoch`), so every value accepted before is accepted and anchored as before.
-    /// Zero when no way back applies.
-    /// TWO EPOCHS DEEP, NO STEP BOUND (audit wave 2, high). The way back reaches the cap around any of three held levels:
-    /// the expired epoch's level, its anchor (they differ in a wide epoch) and the anchor of the epoch before it
-    /// (`_prevAnchorValue`), with no horizon. Remembering one epoch was not enough: a new epoch anchors at the LAST value of
-    /// the old one, so a relayer who lands the last value of one epoch and the first of the next moves the anchor two caps
-    /// in a minute (A, 1.2A at minute 59, 1.44A at minute 60, 1.72A an hour later; or 1.4A and 1.67A after a two-hour
-    /// silence), and from there no rule admitted the honest A again while the market stayed there: a halt bought for three
-    /// attestations. Wave 1's bound of 2x the cap from the last value (it stopped a +50% one-step return past the level,
-    /// low) is what made that halt permanent (1.72A back to A is 42%) and is dropped: a return may move one step as far as
-    /// the cap around a level held in the last two epochs, and no further. A lock-out now needs four boundary-timed pushes
-    /// in a row (README known issues).
-    function _returnAnchor(uint256 value) private view returns (uint256 level) {
-        if (block.timestamp - uint256(_anchorAt) < maxAge) return 0;
-        uint256 anchor = _anchorValue == 0 ? _value : _anchorValue;
-        level = _epochFirst != 0 ? uint256(_epochFirst) : anchor;
-        if (_withinCap(value, level)) return level;
-        if (_withinCap(value, anchor)) return anchor;
-        level = _prevAnchorValue;
-        if (level != 0 && _withinCap(value, level)) return level;
-        return 0;
-    }
-
-    function _withinCap(uint256 value, uint256 level) private view returns (bool) {
-        uint256 change = value > level ? value - level : level - value;
-        return change <= Math.mulDiv(level, maxDeviationBps, 10_000);
+    /// @dev `target` clamped into [anchor x (1 - bps), anchor x (1 + bps)]. The lower edge saturates at zero (a 5,000 bps
+    /// cap is 10,000 bps after a silence), and a nonzero target never clamps to zero: below a zero edge it is inside.
+    function _clamp(uint256 target, uint256 anchor, uint256 bps) private pure returns (uint256) {
+        uint256 d = Math.mulDiv(anchor, bps, 10_000);
+        uint256 hi = anchor + d;
+        if (target > hi) return hi;
+        uint256 lo = d >= anchor ? 0 : anchor - d;
+        return target < lo ? lo : target;
     }
 
     /// @notice The anchor the next value is measured against and the move it may make from it, in bps.
-    /// @dev The stored epoch while it lasts; otherwise the epoch the next acceptance will open: anchored at
-    /// the current value, with the stale allowance if that value has aged past maxAge. Read publicly through
-    /// `epoch()`, so a buyer can see, before paying, how far the feed will follow.
+    /// @dev The live epoch while it lasts; otherwise the epoch the next acceptance will open: anchored at the stored value,
+    /// with the stale allowance if that value has been silent long enough. Read publicly through `epoch()`.
     function _epoch() private view returns (uint256 anchor, uint256 bound) {
-        if (block.timestamp - uint256(_anchorAt) < maxAge) {
-            // An empty anchor slot means the first epoch has seen only its first value, which is `_value`.
-            return (_anchorValue == 0 ? _value : _anchorValue, _anchorBound);
-        }
+        if (block.timestamp - uint256(_anchorAt) < maxAge) return (_anchorValue, _anchorBound);
         return (_value, _allowanceNow());
     }
 
-    /// @dev The allowance an epoch opened now would carry: the cap on a fresh value, and on one stale for
-    /// less than a whole STALE_GROWTH_PERIOD (an hour); after that, STALE_DEVIATION_MULTIPLE times the cap,
-    /// however long the silence lasts. At a 2,000 bps cap and a one-hour lifetime: 20% through the first hour
-    /// stale, 40% after two hours of silence, still 40% after a day. A one-day feed: 40% at 25 hours of silence.
-    /// So a genuine gap up to the stale allowance is followed once the feed has been stale long enough, and a
-    /// larger one at the cap per epoch after that first step (a trend is followed; a single-step gap beyond 2x
-    /// the cap is not, see the header), while a re-anchor far from the market costs an attacker that same hour
-    /// of silence, during which anyone can refresh the feed honestly for one request (v2 has no on-chain buyer:
-    /// the keeper does), and can never exceed 2x the cap. A push
-    /// relayed at the end of a live epoch needs no silence; the way back (`_returnAnchor`) is what keeps it
-    /// from locking the honest level out.
+    /// @dev The allowance an epoch opened now would carry: the cap on a fresh value, and on one stale for less than a whole
+    /// STALE_GROWTH_PERIOD (an hour); after that, STALE_DEVIATION_MULTIPLE times the cap, however long the silence lasts.
+    /// At a 2,000 bps cap and a one-hour lifetime: 20% through the first hour stale, 40% after two hours of silence, still
+    /// 40% after a day. A one-day feed: 40% at 25 hours of silence. The stale base is earned by silence, never by timing:
+    /// measured from one second past the lifetime, a relayer stepping once an hour and a second opened every epoch on it
+    /// (second-half review 2026-10-07, medium). It never grows past 2x (it once grew to 100x).
     function _allowanceNow() private view returns (uint256) {
         if (!_tooOld(_updatedAt)) return maxDeviationBps;
-        // Whole periods of silence beyond the lifetime. None yet: still the cap. The stale base and its
-        // growth are earned by silence, a whole period of it at least, so a value relayed an hour and a
-        // second after the last cannot open an epoch on the stale base (second-half review 2026-10-07,
-        // medium). Silence runs from the later of the signature and the relay: a held attestation is
-        // relayed late, and counting from its signature handed the next step that hour back (final panel
+        // Silence runs from the later of the signature and the relay (a held attestation is relayed late; final panel
         // audit, oracle, medium). Before the first value there is no relay time and the signature rules.
         uint256 since = _acceptedAt > _updatedAt ? _acceptedAt : _updatedAt;
         if (block.timestamp < since + maxAge + STALE_GROWTH_PERIOD) return maxDeviationBps;
-        // At least one whole period of silence past the lifetime: the stale base, and never more.
         return maxDeviationBps * STALE_DEVIATION_MULTIPLE;
     }
 
-    /// @notice Whether this feed would accept `value` now, by the same rule a delivery is checked against: the
-    /// current epoch's allowance or, once it has expired, the way back to the level it held (`_returnAnchor`).
-    /// `epoch()` reports only the first, so a buyer deciding whether an update would be refused asks this (an
-    /// honest value returning after a late push fits only the second). A feed whose values have no magnitude
-    /// (`_hasMagnitude` false: the work oracle's roots) keeps no epoch, so for it this is only the zero check.
-    function accepts(uint256 value) external view returns (bool) {
-        return value != 0 && (!_hasValue || !_hasMagnitude() || _fitsEpoch(value) || _returnAnchor(value) != 0);
+    /// @notice Whether this feed takes `value` as a target now: any nonzero value (and, with magnitude, one below 2^128).
+    /// Taking it is not storing it: `followOf` says what would be stored. Kept so a buyer's existing check keeps working.
+    function accepts(uint256 value) external pure returns (bool) {
+        return value != 0 && (!_hasMagnitude() || value <= type(uint128).max);
     }
 
-    /// @notice The current bounding epoch: its anchor value, when it opened, and the allowance in bps that
-    /// every value accepted until maxAge after that must stay within. A fresh epoch is reported as the one
-    /// the next acceptance would open, so the figures are always the ones the next check uses.
+    /// @notice The value a delivery of `target` would STORE if relayed now: the target clamped into the band of the epoch
+    /// it would land in (`epoch()`). For a feed without magnitude, or before the first value, the target itself.
+    function followOf(uint256 target) external view returns (uint256) {
+        if (!_hasMagnitude() || !_hasValue) return target;
+        (uint256 anchor, uint256 bound) = _epoch();
+        return _clamp(target, anchor, bound);
+    }
+
+    /// @notice The last attested value taken as a target (the signed answer), as opposed to `latestValue`, the stored one.
+    function attested() external view returns (uint256) {
+        return _hasMagnitude() ? _attested : _value;
+    }
+
+    /// @notice True when the stored value IS the last attested one: no clamp is holding it short of its target. A consumer
+    /// that must not act at a value nobody attested (the Pricer: no new debt) reads this. Always true without magnitude.
+    function converged() external view returns (bool) {
+        return !_hasMagnitude() || _value == _attested;
+    }
+
+    /// @notice The current bounding epoch: its anchor value, when it opened, and the allowance in bps that the stored value
+    /// stays within until maxAge after that. An expired epoch is reported as the one the next acceptance would open, so
+    /// the figures are always the ones the next delivery is clamped by.
     function epoch() external view returns (uint256 anchor, uint64 openedAt, uint256 allowanceBps) {
         (anchor, allowanceBps) = _epoch();
         openedAt = block.timestamp - uint256(_anchorAt) < maxAge ? uint64(_anchorAt) : uint64(block.timestamp);
@@ -635,11 +586,10 @@ abstract contract SwarmFeed is IFeed {
     /// authority held by a KEY on a DEPLOYED contract, reachable by whoever held it. This is reachable
     /// only by writing a new subclass and deploying it, which is a code review rather than a
     /// transaction. Any new subclass under src/ must be read with that in mind.
-    function _accept(uint256 value, uint64 updatedAt) internal {
-        _checkValue(value);
-        // A value with no magnitude keeps no epoch: there is nothing to anchor, and the epoch rule's
-        // `mulDiv(anchor, allowance, 10_000)` overflows on a root above 2^256 / (allowance / 10_000).
-        if (_hasMagnitude()) _openEpoch(value);
+    /// `target` is the attested value; what is stored is `_follow(target)` for a feed with magnitude.
+    function _accept(uint256 target, uint64 updatedAt) internal {
+        _checkValue(target);
+        uint256 value = _hasMagnitude() ? _follow(target) : target;
         _value = value;
         _updatedAt = updatedAt;
         _acceptedAt = uint40(block.timestamp);
@@ -649,34 +599,43 @@ abstract contract SwarmFeed is IFeed {
 
     /// @dev Whether this feed's values are quantities the epoch rule can bound. True for every price;
     /// a feed whose value is an identifier (a Merkle root) overrides it to false, and with it overrides
-    /// `_checkValue`. Without this a root feed silent for a lifetime and one STALE_GROWTH_PERIOD widened
-    /// its allowance past 100%, and from then `_accept` reverted on almost every root, for good: silence
-    /// only widens it further (found 2026-10-10 on v1's work oracle; no v2 leaf overrides this).
+    /// `_checkValue`. No v2 leaf overrides it.
     function _hasMagnitude() internal pure virtual returns (bool) {
         return true;
     }
 
-    /// @dev The epoch bookkeeping `_accept` does for a value with magnitude, before `_value` moves.
-    function _openEpoch(uint256 value) private {
-        // Open a new epoch from the value being replaced once the old one has run its maxAge. Written
-        // before `_value` moves, so the anchor is where the feed stood, never where the new value puts it.
-        // Bounds are at most MAX_ALLOWANCE_BPS, so uint24 is exact; uint40 holds a timestamp to year 36812.
+    /// @dev The epoch bookkeeping and the clamp, before `_value` moves: opens a new epoch at the STORED value once the live
+    /// one has run maxAge, records the target, and returns what to store. The first value is stored as attested and
+    /// anchors the first epoch at the cap. Bounds are at most MAX_ALLOWANCE_BPS, so uint24 is exact; uint40 holds a
+    /// timestamp to year 36812; anchor and target are below 2^128 (`_checkValue`, and the stored value never leaves the
+    /// span between an anchor and a target).
+    function _follow(uint256 target) private returns (uint256) {
         if (!_hasValue) {
-            // The first value anchors the first epoch and is `_value` itself, so the anchor slot stays
-            // empty until a second value arrives: the first delivery pays no extra storage write, which is
-            // what keeps it inside the Intake's callback stipend (measured in v1, OracleAskerBoundGas).
-            (_anchorBound, _anchorAt) = (uint24(maxDeviationBps), uint40(block.timestamp));
-        } else if (block.timestamp - uint256(_anchorAt) >= maxAge) {
-            uint256 back = _fitsEpoch(value) ? 0 : _returnAnchor(value);
-            (uint256 anchor, uint256 bound) = back != 0 ? (back, maxDeviationBps) : _epoch();
-            _prevAnchorValue = _anchorValue == 0 ? _value : _anchorValue; // the expired epoch's anchor: the way back's third level
-            (_anchorValue, _anchorBound, _anchorAt) = (anchor, uint24(bound), uint40(block.timestamp));
-            // A wide epoch remembers its first value (`_checkValue` holds the rest to the cap around it);
-            // a fresh-opened one clears any left from an earlier wide epoch, and otherwise writes nothing.
-            _epochFirst = bound > maxDeviationBps && value <= type(uint80).max ? uint80(value) : 0;
-        } else if (_anchorValue == 0) {
-            _anchorValue = _value; // the first epoch's anchor, materialised before the value moves
+            (_anchorValue, _attested, _anchorAt, _anchorBound) =
+                (uint128(target), uint128(target), uint40(block.timestamp), uint24(maxDeviationBps));
+            return target;
         }
+        uint256 anchor;
+        uint256 bound;
+        if (block.timestamp - uint256(_anchorAt) >= maxAge) {
+            (anchor, bound) = (_value, _allowanceNow());
+            if (bound > maxDeviationBps) {
+                // THE WIDE BAND IS ONE STEP. After a silence the first delivery may move the stored value up to the stale
+                // allowance; the epoch then re-anchors at what it stored, at the cap, so every later delivery this epoch
+                // stays within the cap of it. An honest refresh after a silence closes the wide band for everyone after
+                // it (review of cc4103f, 2026-10-07: a +55% value was taken an hour after the Treasury's honest refresh).
+                // Remembered only for this epoch: the next one anchors at the stored value as always (price design C).
+                uint256 first = _clamp(target, anchor, bound);
+                (_anchorValue, _attested, _anchorAt, _anchorBound) =
+                    (uint128(first), uint128(target), uint40(block.timestamp), uint24(maxDeviationBps));
+                return first;
+            }
+            (_anchorAt, _anchorBound) = (uint40(block.timestamp), uint24(bound));
+        } else {
+            (anchor, bound) = (_anchorValue, _anchorBound);
+        }
+        (_anchorValue, _attested) = (uint128(anchor), uint128(target));
+        return _clamp(target, anchor, bound);
     }
 
     function _tooOld(uint64 timestamp) private view returns (bool) {

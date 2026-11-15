@@ -19,9 +19,10 @@ import {SortedPositions} from "./SortedPositions.sol";
 /// The fee's collateral leaves the redeemed position for the Treasury (-10-30): were it left in the
 /// position, a borrower who is the type's first position could redeem their own debt for free and pin the type's fee
 /// at the cap. The borrower stays whole on the principal (debt and $1 of collateral per imdUSD leave together).
-/// FEE BASE: the ramp and the base-rate rise divide by `ImdUSD.circulating()` (the supply before the transaction's first
-/// mint or burn), not `totalSupply()`, so neither a flash mint nor debt borrowed and repaid in the same transaction
-/// dilutes them (review T1; audit wave 2).
+/// FEE BASE: the ramp and the base-rate rise divide by `ImdUSD.feeBase()`: min(the supply before the transaction's first
+/// mint or burn, the lowest supply of the last 1-2 hours), not `totalSupply()`, so neither a flash mint, nor debt borrowed
+/// and repaid in the same transaction (review T1; audit wave 2), nor in the same block or consecutive blocks (audit wave
+/// 3) dilutes them.
 /// Payout is at the quote's `payout`: max(median, spot, live pool) on a type with a live leg.
 /// WINDOW CAP: a type with `redeemCap != 0` admits at most that much imdUSD per rolling window, counted
 /// in BUCKET-second buckets over WINDOW + BUCKET, so every 2h window, however aligned, sees at most the cap
@@ -147,9 +148,9 @@ contract Redeemer is TransientReentrancyGuard {
         }
         if (redeemed == 0) revert NothingRedeemed();
         if (collateral < minCollateralOut) revert CollateralTooLow(collateral);
-        // The type's base rate rises by the redeemed share of the circulating supply BEFORE this burn, as in v1 (read
-        // before it; `circulating()` is the supply before the transaction's first mint or burn).
-        uint256 supplyBefore = ImdUSD(address(token)).circulating();
+        // The type's base rate rises by the redeemed share of the supply BEFORE this burn, as in v1 (read before it; the fee
+        // base, `ImdUSD.feeBase()`).
+        uint256 supplyBefore = ImdUSD(address(token)).feeBase();
         ledger.burnFrom(msg.sender, redeemed);
         if (r.redeemCap != 0) redeemedIn[ilk][block.timestamp / BUCKET] += redeemed;
 
@@ -159,7 +160,7 @@ contract Redeemer is TransientReentrancyGuard {
     }
 
     function _fee(bytes32 ilk, uint256 amount, ParametersBase.Risk memory r) private view returns (uint256) {
-        uint256 supply = ImdUSD(address(token)).circulating();
+        uint256 supply = ImdUSD(address(token)).feeBase();
         uint256 increase = supply == 0 ? FEE_CAP : Math.mulDiv(amount, 1e18, supply) / r.redeemDivisor;
         return Math.min(r.redeemFloor + decayedBaseRate(ilk) + increase, FEE_CAP);
     }

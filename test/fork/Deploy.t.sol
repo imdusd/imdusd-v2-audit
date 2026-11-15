@@ -92,7 +92,7 @@ contract DeployForkTest is Test {
         assertEq(cfg.governor, Mainnet.GOVERNANCE_SAFE);
         assertEq(cfg.v1, Mainnet.V1_IMDUSD);
         assertEq(cfg.ilks.length, 9);
-        assertEq(cfg.feeds.length, 25); // + wstETH's second leg (ETH/USD x stEthPerToken), + sIMD's median nodes, + the depth samplers' proven IMD reference (audit wave 2)
+        assertEq(cfg.feeds.length, 23); // + wstETH's second leg (ETH/USD x stEthPerToken), + sIMD's median nodes, + the depth samplers' proven IMD reference (audit wave 2); price design C: the swarm spot leaf and its product are gone (sIMD's spot = the proven nodes)
         assertEq(cfg.ilks[1].spot, MainnetConfig.F_WSTETH_ETH, "wstETH spot = ETH/USD x stEthPerToken");
         assertEq(cfg.ilks[2].spot, MainnetConfig.F_BTC, "cbBTC spot = BTC/USD");
         assertEq(cfg.ilks[3].spot, MainnetConfig.F_BTC, "WBTC spot = BTC/USD");
@@ -100,6 +100,10 @@ contract DeployForkTest is Test {
         assertEq(cfg.ilks[0].token, Mainnet.WETH);
         assertEq(cfg.ilks[6].token, Mainnet.SIMD);
         assertEq(cfg.feeds[MainnetConfig.F_NHI].kind, DeployTypes.SWARM_NHI); // v2 leaf, not v1's feed
+        // Price design C: sIMD's spot leg is the proven pool price x ETH/USD x the share rate, and it is the only proven leg.
+        assertEq(cfg.feeds[MainnetConfig.F_IMD_PROVEN].kind, DeployTypes.PROVEN_POOL);
+        assertEq(cfg.feeds[MainnetConfig.F_SIMD_SPOT].a, MainnetConfig.F_IMD_USD_PROVEN);
+        assertEq(cfg.ilks[6].spot, MainnetConfig.F_SIMD_SPOT);
     }
 
     function _expectedLine() internal view returns (uint256) {
@@ -512,8 +516,7 @@ contract DeployForkTest is Test {
             }
             // Every feed answers something on mainnet (staleness aside), but the swarm leaves and what is priced through
             // them: deployed empty, unpriced until the first relay.
-            bool empty = i == MainnetConfig.F_IMD_MEDIAN || i == MainnetConfig.F_IMD_SPOT || i == MainnetConfig.F_IMD_USD_SPOT
-                || i == MainnetConfig.F_SIMD_SPOT || i == MainnetConfig.F_NHI || i == MainnetConfig.F_IMD_USD_MEDIAN
+            bool empty = i == MainnetConfig.F_IMD_MEDIAN || i == MainnetConfig.F_SIMD_SPOT || i == MainnetConfig.F_NHI || i == MainnetConfig.F_IMD_USD_MEDIAN
                 || i == MainnetConfig.F_SIMD_MEDIAN || i == MainnetConfig.F_IMD_PROVEN || i == MainnetConfig.F_IMD_USD_PROVEN;
             (uint256 v,) = IFeed(f).latestValue();
             if (empty) assertEq(v, 0, "empty until the first relay");

@@ -50,9 +50,16 @@ contract Ledger is LedgerBase {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
 
-    /// @notice The settlement module this Ledger delegate-calls (deployed by this constructor; fixed).
+    /// @notice The settlement module this Ledger delegate-calls (fixed).
     address public immutable settlement;
 
+    error BadSettlement();
+
+    /// @param settlement_ The LedgerSettlement module, deployed beforehand by the deployer for this Ledger's address and its
+    /// SortedPositions' (audit wave 3: deployed here it put its whole creation code in this contract's init code). Its
+    /// immutables must be this Ledger's: the ones fixed by arguments are checked here; `ledger` and `sorted` depend on this
+    /// contract's address, so the deployment checks them (DeployBase), and a module made for another Ledger refuses every
+    /// call (`onlyLedger`: DirectCall) and another list refuses its writes (SortedPositions is this Ledger's only).
     constructor(
         ImdUSD token_,
         Parameters params_,
@@ -60,7 +67,8 @@ contract Ledger is LedgerBase {
         address treasury_,
         address wirer_,
         IPulse pulse_,
-        PositionNFT nft_
+        PositionNFT nft_,
+        LedgerSettlement settlement_
     )
         LedgerBase(
             token_,
@@ -73,7 +81,12 @@ contract Ledger is LedgerBase {
             nft_
         )
     {
-        settlement = address(new LedgerSettlement(token_, params_, pricer_, treasury_, wirer_, pulse_, sorted, nft));
+        LedgerSettlement m = settlement_;
+        if (
+            address(m).code.length == 0 || m.token() != token_ || m.params() != params_ || m.pricer() != pricer_
+                || m.treasury() != treasury_ || m.wirer() != wirer_ || m.pulse() != pulse_ || m.nft() != nft_
+        ) revert BadSettlement();
+        settlement = address(m);
     }
 
     function wire(address redeemer_, address liquidator_) external {

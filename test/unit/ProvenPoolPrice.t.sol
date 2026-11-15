@@ -54,10 +54,16 @@ contract ProvenPoolPriceTest is Test {
         assertTrue(feed.isStale(), "stale after maxAge from the block's timestamp");
     }
 
-    function test_sameOrOlderBlockRefused() public {
-        _prove();
-        vm.expectRevert(abi.encodeWithSelector(ProvenPoolPrice.NotNewer.selector, F.BLOCK, F.BLOCK));
-        _prove();
+    /// Audit wave 3 (info): a same or older block is a no-op returning the held value, not a NotNewer revert (an atomic
+    /// [prove, sample] bundle beaten to the same block by anyone kept failing). AuditW3ProvenNoOp.t.sol has the property.
+    function test_sameBlockIsANoOp() public {
+        uint256 v = _prove();
+        uint256 again = _prove();
+        assertEq(again, v, "returns the held value");
+        assertEq(feed.provenBlock(), F.BLOCK);
+        (uint256 value, uint64 at) = feed.latestValue();
+        assertEq(value, v);
+        assertEq(at, F.TIMESTAMP);
     }
 
     function test_blockHashMismatchRefused() public {

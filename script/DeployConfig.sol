@@ -336,8 +336,13 @@ library MainnetConfig {
     /// @dev The sIMD legs and NHI are v2's own SwarmFeed leaves (2x stale cap, question binding), answering the
     /// same swarm questions as v1's feeds, not v1's deployed feeds. Wei of ETH per 1e18 IMD.
     uint8 internal constant F_IMD_MEDIAN = 12;
-    uint8 internal constant F_IMD_SPOT = 13;
-    uint8 internal constant F_IMD_USD_SPOT = 14;
+    /// @dev Pool 0xb07d's END-OF-BLOCK price, proven from Ethereum state (ProvenPoolPrice), and x ETH/USD. Two readers: the
+    /// depth samplers' reference (audit wave 2), and since price design C (2026-11-14) sIMD's SPOT leg, in place of the
+    /// swarm spot leaf (same pool, one block, no attester: a compromised key or a wrong majority can no longer move it).
+    uint8 internal constant F_IMD_PROVEN = 13;
+    uint8 internal constant F_IMD_USD_PROVEN = 14;
+    /// @dev sIMD's spot leg: the proven product x sIMD's share rate. ProvenPoolPrice reports `proven()`, so the Pricer
+    /// gives sIMD the twin rule (low = max(median, spot) while the legs disagree).
     uint8 internal constant F_SIMD_SPOT = 15;
     uint8 internal constant F_NHI = 16;
     uint8 internal constant F_IMD_LIVE = 17; // wei ETH per 1e18 IMD, this block
@@ -348,12 +353,11 @@ library MainnetConfig {
     /// @dev The sIMD median: IMD/ETH median x ETH/USD x sIMD's share rate (what v1's SharePriceFeed computed from v1's legs).
     uint8 internal constant F_IMD_USD_MEDIAN = 21;
     uint8 internal constant F_SIMD_MEDIAN = 22;
-    /// @dev The depth samplers' reference (audit wave 2): pool 0xb07d's END-OF-BLOCK price, proven from state, x ETH/USD.
-    uint8 internal constant F_IMD_PROVEN = 23;
-    uint8 internal constant F_IMD_USD_PROVEN = 24;
     /// @dev A proven price is fresh for 6 hours after its block (gas review; a proof is ~887k gas). A push cannot move a proven
     /// reference whatever its age; age matters only when the market really moved, and each sampler still refuses a live tick more
     /// than 400 ticks (~4%) from it. The keeper re-proves when the pool drifts > 1.5% from it, a sample refuses it, or it nears 6 h.
+    /// As sIMD's spot leg (design C) the same 6 h applies: a stale spot stops borrowing (no agreement) and leaves liquidation
+    /// on the median; the keeper proves on drift, so in a moving market the spot is never more than ~1.5% from the pool.
     uint256 internal constant PROVEN_MAX_AGE = 6 hours;
     /// @dev v1's lifetimes and caps (1 h and 20% on the prices, 1 day and 20% on NHI).
     uint256 internal constant IMD_LEG_MAX_AGE = 1 hours;
@@ -443,7 +447,7 @@ library MainnetConfig {
         // E2: Robinhood's IMD type sells into the same IMD market: its line counts against this rule.
         (c.otherImdLines, c.otherImdChop) = (RobinhoodConfig.IMD_LINE, RobinhoodConfig.IMD_CHOP);
 
-        c.feeds = new DeployTypes.FeedNode[](25);
+        c.feeds = new DeployTypes.FeedNode[](23);
         c.feeds[F_ETH] = _cl(CL_ETH_USD, 18, 1 hours + 10 minutes);
         c.feeds[F_STETH] = _cl(CL_STETH_USD, 18, 1 hours + 10 minutes);
         c.feeds[F_WSTETH] = _rate(WSTETH, bytes4(keccak256("stEthPerToken()")), false, F_STETH);
@@ -459,9 +463,9 @@ library MainnetConfig {
         c.feeds[F_SUSDC] = _rate(METAMORPHO_STEAKHOUSE_USDC, CONVERT, true, F_USDC);
         c.feeds[F_USDT] = _cl(CL_USDT_USD, 6, 1 days + 1 hours);
         c.feeds[F_IMD_MEDIAN] = _swarm(DeployTypes.SWARM_PRICE, IMD_LEG_MAX_AGE);
-        c.feeds[F_IMD_SPOT] = _swarm(DeployTypes.SWARM_SPOT, IMD_LEG_MAX_AGE);
-        c.feeds[F_IMD_USD_SPOT] = _product(F_IMD_SPOT, F_ETH);
-        c.feeds[F_SIMD_SPOT] = _rate(SIMD, CONVERT, true, F_IMD_USD_SPOT);
+        c.feeds[F_IMD_PROVEN] = _proven(UNIV4_POOL_MANAGER, IMD_ETH_POOL_ID, false, PROVEN_MAX_AGE);
+        c.feeds[F_IMD_USD_PROVEN] = _product(F_IMD_PROVEN, F_ETH);
+        c.feeds[F_SIMD_SPOT] = _rate(SIMD, CONVERT, true, F_IMD_USD_PROVEN);
         c.feeds[F_NHI] = _swarm(DeployTypes.SWARM_NHI, NHI_MAX_AGE);
         c.feeds[F_IMD_LIVE] = _live(UNIV4_POOL_MANAGER, IMD_ETH_POOL_ID, false);
         c.feeds[F_IMD_USD_LIVE] = _product(F_IMD_LIVE, F_ETH);
@@ -471,8 +475,6 @@ library MainnetConfig {
         c.feeds[F_WSTETH_ETH] = _rate(WSTETH, bytes4(keccak256("stEthPerToken()")), false, F_ETH);
         c.feeds[F_IMD_USD_MEDIAN] = _product(F_IMD_MEDIAN, F_ETH);
         c.feeds[F_SIMD_MEDIAN] = _rate(SIMD, CONVERT, true, F_IMD_USD_MEDIAN);
-        c.feeds[F_IMD_PROVEN] = _proven(UNIV4_POOL_MANAGER, IMD_ETH_POOL_ID, false, PROVEN_MAX_AGE);
-        c.feeds[F_IMD_USD_PROVEN] = _product(F_IMD_PROVEN, F_ETH);
 
         uint8 N = DeployTypes.NONE;
         c.ilks = new DeployTypes.IlkSpec[](9);
@@ -739,8 +741,8 @@ library BetaConfig {
         _seats(c);
     }
 
-    uint8 internal constant F_SEAT_MEDIAN = 25; // appended after MainnetConfig's 25 nodes
-    uint8 internal constant F_SEAT_SPOT = 26;
+    uint8 internal constant F_SEAT_MEDIAN = 23; // appended after MainnetConfig's 23 nodes
+    uint8 internal constant F_SEAT_SPOT = 24;
     /// @dev Both legs are refreshed about daily (2 x 0.5 IMD); a day and two hours of life covers one missed slot.
     uint256 internal constant SEAT_MAX_AGE = 26 hours;
     /// @dev Per-epoch move caps of the leaves (SwarmFeed). The median also has SeatFeed's 20%-per-update fall cap.

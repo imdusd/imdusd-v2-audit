@@ -16,7 +16,8 @@ What this core adds over a plain CDP:
   with no gas own and borrow; `bumpNonce(n)` cancels a whole pre-signed queue.
 - **Size splits.** `Ledger` runs redemption, liquidation and write-off in `LedgerSettlement` by `delegatecall` on its own
   storage (shared layout in `LedgerBase`); `Parameters` runs per-kind validation and application in `ParametersRules` by
-  `delegatecall` (shared layout in `ParametersBase`). Both splits keep the contracts under EIP-170/EIP-3860.
+  `delegatecall` (shared layout in `ParametersBase`). Both splits keep the contracts under EIP-170/EIP-3860. Each module
+  is deployed on its own before its parent, which takes its address and refuses a module that does not serve it.
 - **Versioned liquidation risk.** A type's `mat` and `chop` are kept per version. A position stays on the version it last
   took risk under until a newer version reaches its `bindAt`: a change that only lowers mat and chop binds at once, any
   other change binds `RISK_GRACE` (7 days) later. NHI-linked types keep a live `mat` and version only `chop`.
@@ -57,6 +58,15 @@ What this core adds over a plain CDP:
   Ethereum state (`ProvenPoolPrice`: the block header against `blockhash`, then the PoolManager's account proof and the
   pool's `slot0` storage proof, verified with Optimism's MerkleTrie/RLPReader, vendored in `src/vendor/optimism`), x
   Chainlink ETH/USD; a proven price lives 6 hours and anyone may prove a newer block.
+- **Swarm legs follow, they do not reject (price design C).** A swarm-priced leaf accepts every valid attestation as a
+  TARGET and moves its stored value toward it by at most the epoch's allowance (the cap, or 2x the cap for the one step
+  that opens an epoch after a silence); the epoch anchors at the stored value. `attested()` is the last target and
+  `converged()` says whether the stored value is it; composites (`ProductFeed`, `RateFeed`, `SeatFeed`, `SeatSpotLeg`)
+  pass both traits through `FeedTraits`. The Pricer treats a leg that has not converged as not agreeing, so a clamped
+  leg prices (and liquidates) but lends nothing. sIMD's SPOT leg is the proven pool price (`ProvenPoolPrice` x ETH/USD x
+  the share rate), and for a type whose spot is proven the Pricer's liquidation price is `low = agree ? min(median,
+  spot) : max(median, spot)`: a wrong median cannot liquidate below the proven price, and a pushed proven price cannot
+  lower `low` below the median.
 - **RateManager.** Optional, outside the core: owners grant it SET_RATE only; a manager key re-rates members within fixed
   bounds, each member's own floor and ceiling, and only outside their 7-day rate cooldown.
 
@@ -68,7 +78,8 @@ of borrower interest to savers; identity.md NFT seats as auction-liquidated coll
 All governance goes through `Parameters` (a 2-of-3 Safe as governor). The repository also contains modules that are NOT
 part of the first deployment: a LayerZero V2 bridge (`ImdBridge`, `Pulse`), a leveraged loop vault (`LoopVault`), an AMM
 of two ERC-4626 tokens (`src/dex/`), `RateManager`, and stock-token collateral for Robinhood Chain (`src/stocks/`,
-`MarketCalendar`, `MarketHoursFeed`). `script/` holds only the deploy scripts the tests import.
+`MarketCalendar`, `MarketHoursFeed`). The bridge and the stock tokens ship after the beta, with Robinhood Chain, and are
+in scope this round (see Audit scope). `script/` holds only the deploy scripts the tests import.
 
 ## Build and test
 
@@ -77,7 +88,7 @@ network is needed for the offline suites.
 
 ```bash
 forge build                                                    # solc via_ir: a clean build takes a long time
-forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,297 tests)
+forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,350 tests)
 forge build --use solar && forge test --use solar --no-match-path 'test/fork/*'   # fast dev loop (see below)
 
 # Fork suites: one file at a time, single-threaded (in parallel, set-up calls hit RPC rate limits)
@@ -98,7 +109,7 @@ with a small script (the same rule as `cloc`'s code lines; pragma and import lin
 higher figures than the previous snapshot's table (for example 1,049 against 1,014 for the same old core files), so
 compare areas within this table, not across snapshots.
 
-**Round 1: what the beta deploys (7,728 nSLOC, plus 349 vendored)**
+**Round 1: what the beta deploys (7,865 nSLOC, plus 349 vendored)**
 
 The beta is `script/DeployBeta.s.sol`, which runs `script/Deploy.s.sol` with `BetaConfig` (`script/DeployConfig.sol`):
 the full mainnet config with lower lines, a 300k chain-wide debt cap, seats on, and LoopVault and the DEX off. It
@@ -106,26 +117,34 @@ deploys every contract below.
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,604 |
-| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 554 |
-| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min`, `ProvenPoolPrice` | 711 |
+| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,645 |
+| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 562 |
+| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min`, `ProvenPoolPrice`, `FeedTraits` | 755 |
 | D. Peg | `PegHook`, `FeeNotes` | 596 |
-| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,129 |
-| F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 853 |
+| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,155 |
+| F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 871 |
 | G. Peg LP vault and PEG positions | `PegLPVault`, `PegCollateral`, `PegShareFeed`, `PegPositionZap` | 599 |
 | H. Backstop and Allocator | `Backstop`, `IBackstop`, `PricerOracle`, `Allocator` | 1,252 |
 | I. Measured depth | `DepthSampler`, `ImdDepth` | 430 |
 | Vendored (in scope as used) | `src/vendor/optimism`: `MerkleTrie`, `SecureMerkleTrie`, `RLPReader`, `RLPErrors`, `Bytes` (op-contracts/v9.0.0, imports made relative; PROVENANCE.md) | 349 |
 
-**Round 2: later modules (2,195 nSLOC)**
+**Round 2, audited early: what ships after the beta, with Robinhood Chain (662 nSLOC)**
+
+New in scope this round. These do not deploy in the beta; they ship with the Robinhood Chain core after it, and are
+audited now so that findings land before they deploy.
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| Rate manager | `RateManager` | 148 |
-| Bridge | `ImdBridge`, `Pulse` | 412 |
-| Loop vault | `LoopVault` | 510 |
-| DEX | `src/dex/` | 875 |
-| Stock tokens | `src/stocks/`, `MarketCalendar`, `MarketHoursFeed` | 250 |
+| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE`), `Pulse` (the sequencer grace on a chain with no uptime feed) | 412 |
+| Stock tokens | `src/stocks/StockVault.sol`, `src/stocks/StockJoin.sol`, `src/feeds/MarketHoursFeed.sol`, `src/feeds/MarketCalendar.sol` | 250 |
+
+**Other later modules**
+
+| Area | Contracts | nSLOC | This round |
+|---|---|---|---|
+| Rate manager | `RateManager` | 148 | as before |
+| Loop vault | `src/earn/LoopVault.sol` | 510 | out of scope |
+| DEX | `src/dex/` | 875 | out of scope |
 
 Out of scope: `test/`, `script/`, `lib/`, unless a finding in scope reaches through them. The deploy scripts are worth
 reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and sealed, and what is left to governance.
@@ -136,8 +155,8 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
    outstanding + bridge received − bridge sent` (see the `LedgerBase` header). Flash-minted amounts exist only inside a
    transaction (`circulating()` is the supply before the transaction's first mint or burn). The edge premium and interest are minted on both sides at once.
 2. **Solvency and health.** No action that adds debt or removes collateral leaves a position below its type's liquidation
-   ratio at the borrow price (`min(low, cap)`), and none is allowed unless the price is fresh and its two legs agree
-   within `skew`. Repayments and deposits
+   ratio at the borrow price (`min(low, cap)`), and none is allowed unless the price is fresh, its two legs agree
+   within `skew` and every swarm leg it reads has converged on its last attested value. Repayments and deposits
    need no price. Liquidation health uses the position's BOUND risk version.
 3. **Line.** For every type, `debt + badDebt <= line`; on a capped chain the chain-wide sum (and any group cap) holds too.
 4. **Edge capacity.** The SUM of every edge type's debt plus bad debt stays within the edge sleeve's `edgeCapacity`, less
@@ -167,10 +186,14 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
   can mint without limit and burn from any holder. The beta leaves the slot empty.
 - **Swarm attester:** swarm-priced feeds (sIMD legs, NHI, seat median and spot, the depth leg) accept an EIP-712
   attestation only from one pinned signer, for one pinned question (bound by hash), with absolute floors (panel of at
-  least 100, at least 51 agreeing); a value moves at most a fixed cap per epoch, widened at most 2x after an hour of
-  staleness, and once an epoch has expired may return in one step to within the cap of a level the feed held in the last
-  two epochs (Known issues). Relaying is permissionless. A compromised attester can move those feeds within the cap per epoch, and nothing
-  on chain checks the sIMD pair against the market (see Known issues).
+  least 100, at least 51 agreeing). Every valid attestation is a target: the stored value moves toward it by at most a
+  fixed cap per epoch, and the one step that opens an epoch after a silence (maxAge plus an hour) by at most 2x the cap;
+  nothing beyond the live epoch's anchor and the last target is remembered. Relaying is permissionless. A compromised
+  attester (or a wrong majority) moves a leg one allowance per epoch for as long as it lasts, and about as many epochs
+  of honest attestations undo it; the response is the governor's instant `Parameters.lowerLine(ilk, 0)` (no new debt on
+  the type, liquidations continue) and a re-point. sIMD's spot leg is the proven pool price, with no attester in it: a
+  wrong sIMD median cannot set the liquidation price below the proven price (less `skew`). NHI and seat legs have no
+  such twin. On a remote chain with no block clock only the deployment relays a feed's first value.
 - **Chainlink:** aggregators are trusted within staleness bounds; answers at the aggregator's min/max clamp or above a
   sanity cap read as unpriced.
 - **Allocator callers:** the rule-driven actions are open to anyone; a caller picks only the MOMENT. Every action draws on
@@ -184,7 +207,11 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
   Allocator action; only the governor unfreezes. An operator watches the Allocator's logs and alerts; it holds no key that
   can move or stop protocol funds. Permissionless chores (relaying attestations, sampling `DepthSampler`, poking
   `ImdDepth`, marking and liquidating, starting auctions) anyone may run.
-- **Issuers:** USDC/USDT can blacklist addresses; stock tokens (round 2) carry issuer pause, blocklist and `adminBurn`
+- **Seat claim rules:** `SET_SEAT_CLAIM` refuses a listed set of token-moving selectors (approve, transfer, permit,
+  burn, ERC-4626 and Compound-style redeem/withdraw, ERC-6909 operator forms and others). A denylist cannot be complete:
+  what a selector does is the target's code, so every claim-rule proposal must be reviewed against the target's ABI and
+  code before the Safe signs it.
+- **Issuers:** USDC/USDT can blacklist addresses; stock tokens (round 2, after the beta) carry issuer pause, blocklist and `adminBurn`
   keys that the protocol cannot prevent, only cap by debt lines.
 - **Relayers and samplers:** permissionless; liveness of swarm-priced types depends on someone buying and relaying
   attestations. Stale prices stop borrowing, not repayment.
@@ -213,7 +240,8 @@ Items below are known and do not need to be reported unless you find a materiall
   keeper trades revert.
 - `RateFeed`'s growth cap is measured from the last poke, so headroom accrues while nobody pokes.
 - The sIMD price legs bound ETH/USD staleness differently, which can briefly read unpriced.
-- Swarm feeds admit two attestations with equal `issuedAt` in either order (bounded by the cap).
+- Swarm feeds admit two attestations with equal `issuedAt` in either order (bounded by the cap; under clamping the later
+  relay is the target).
 - If Circle blacklists the Treasury, liquidations of USDC types with a non-zero Treasury cut revert (`treasury` is
   immutable).
 - `PegLPVault` has no deposit hold, so just-in-time deposits around known fee or donation arrivals are possible.
@@ -240,7 +268,11 @@ Items below are known and do not need to be reported unless you find a materiall
 Accepted after an internal adversarial review of this core. Dollar figures were measured on mainnet forks of the live
 pools in early November 2026 (IMD/ETH v4 pool, sIMD line 24,333 imdUSD unless stated) and move with depth and prices.
 
-**sIMD has no market check on its attested pair**
+**sIMD has no market check on its attested pair** (changed in wave 4: sIMD's spot leg is now the proven pool price, not
+an attested leg, and while the two legs disagree the liquidation price is `max(median, spot)`; a wrong or compromised
+median can no longer make a book that is healthy at the proven price liquidatable. What still holds below: a wrong NHI,
+the live-pool push against the standing bid, and borrowing needs both legs to agree, so a wrong median still stops it.
+The text is kept as written for the beta's earlier design.)
 
 sIMD is priced by two attested legs (`low`, `high`) with the live pool in its `liveSpot` slot. The live leg sets the
 redemption payout and `agree` only; `borrowable` and `low` do not read it.
@@ -341,14 +373,15 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
 - **Rate floor 0 + `borrowFor`.** `borrowFor` passes rate 0; on a type with `rateFloor` 0 a borrow on a position whose debt
   reached zero before inclusion would open at 0%. Unreachable in the beta (every floor >= 0.5%).
 - **First swarm-feed value.** Nothing on chain checks a leaf's first relayed value; seeding and checking it is the
-  operator's duty.
+  operator's duty. (Since wave 4, on a remote chain with no block clock only the deployment may relay it.)
 - **Edge bootstrap renewal.** The Safe can renew an edge type's 60-day bootstrap allowance by disabling it (instant) and
   re-listing it (48 h); while disabled, borrowing and the standing bid on it are off.
 - **Redemptions ignore the Pulse.** A redemption can run inside a sequencer grace that holds liquidations (Robinhood chain
   only; mainnet has no Pulse).
 - **Flash cap is per loan in flight, not per transaction.** Sequential flash loans in one transaction each get the full
   cap; `circulating()` stays correct.
-- **`circulating()` and flash loans (superseded in wave 2: now the supply before the transaction's first mint or burn).** Inside a native flash loan it reads at least the supply when the outermost loan
+- **`circulating()` and flash loans (superseded in wave 2: now the supply before the transaction's first mint or burn;
+  and since wave 4 the redemption fee divides by `feeBase()`, see below).** Inside a native flash loan it reads at least the supply when the outermost loan
   began, so real burns inside the loan (a redemption split in chunks) also read against that supply: second order. The
   fix covers imdUSD's own flash mint only: imdUSD borrowed elsewhere to repay one's own debt, redeem and re-borrow still
   deflates the supply for the redemption, bounded by outside imdUSD liquidity, the upfront fee and the 5% fee cap.
@@ -370,16 +403,18 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
 
 ### Known issues added after the second public audit (wave 2, 5de80a6)
 
-- **SwarmFeed way back (trade-off).** After an epoch expires, a value within the cap of the expired epoch's level, its
+- **SwarmFeed way back (trade-off). RESOLVED in wave 4:** price design C deleted the way back; see the wave-3 section.
+  As written for 5de80a6: After an epoch expires, a value within the cap of the expired epoch's level, its
   anchor or the previous epoch's anchor is accepted in one step, whatever the last value was: a pushed or compromised
   attestation can move the feed back to within the cap of where it stood one to two lifetimes ago in one step (wave 1
   had bounded any one step at 2x the cap). In exchange three boundary-timed pushes (or two after a silence) no longer lock
   the honest level out. A lock-out still needs FOUR boundary-timed pushes in a row with no honest value between them
   (`test_fourBoundaryPushesInARowStillLockOut`); recovery is the Safe re-pointing the leaf (48 h).
-- **BATCH proposals are dry-run at propose.** An item that fails only because of an earlier item in the same batch is
+- **BATCH proposals are dry-run at propose (changed in wave 4: one linear dry run that skips waiting items; see the
+  wave-3 section for the case it does not catch).** An item that fails only because of an earlier item in the same batch is
   refused at propose; an item that would fail on its own (waiting on state: a retire before its feed stops, a line raise
   before depth) is still accepted and fails at apply if the state never arrives, as a single proposal does.
-- **Seat auction clock needs both legs.** Priced time counts only seconds in which the median leaf and the ETH/USD leg
+- **Seat auction clock needs both legs (extended in wave 4: also stopped while `SeatFeed` reads 0).** Priced time counts only seconds in which the median leaf and the ETH/USD leg
   were both fresh. ETH/USD fresh at the last tick and fresh now counts as fresh throughout (its heartbeat keeps it so); an
   ETH/USD gap that opened and closed between two ticks is not seen (the operator ticks an auction when its type goes
   unpriced). The median's reconstruction runs slow, never fast.
@@ -389,6 +424,65 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
   `ilkOf(id)` a view over it; the first position ever opened on a type registers its index (one-time cost). Samplers
   measure only the side `depth()` reports (the other reads 0) and store readings in whole USD, rounded down.
 - **Sleeves hold up to 10 tokens** (was 6); the beta lists 6 on the blue sleeve.
+
+### Known issues added after the third public audit (wave 3, c64ecee)
+
+Residuals of the wave-3 fixes and of price design C. The design-C items are what the design panel of this round is
+asked to refute or bound more tightly.
+
+- **Last relayer of an epoch.** A relayer that always lands an attestation LAST in an epoch decides where the stored
+  value ends that epoch, within the allowance, for as long as it keeps doing so (one allowance per epoch). Bounded by P1
+  in `SwarmFeed`'s header; `testFuzz_residual_lastRelayerMovesOneAllowancePerEpoch`.
+- **An attack lasting k epochs takes about k epochs to undo.** A compromised attester, a wrong majority or pushed pool
+  reads attested honestly move a leg one allowance per epoch while they last; honest attestations then bring it back at
+  the same rate (`ceil(ln(ratio) / ln(1 + cap))` epochs). The way back undid it in one step; that speed needed memory,
+  and the memory is what each earlier wave broke. The response to a suspected compromise is `lowerLine(ilk, 0)`.
+- **Liquidation after a real fall waits for a proof.** For sIMD, after a genuine fall the median follows down at the
+  allowance while the proven spot keeps the old level until a newer block is proved; with the legs apart `low = max(median,
+  spot)` keeps an under-water loan healthy until then. Proving is permissionless (a liquidator proves, then bites), and
+  the operator proves at once when the legs are apart. A proven spot pushed DOWN within `skew` lowers `low` by up to
+  `skew` while that proof stands.
+- **The proven spot is a borrowing dependency.** A proven price lives 6 hours: if nobody proves a newer block, sIMD
+  borrowing stops (no agreement) and liquidation continues on the median.
+- **Redemption fee base window.** `ImdUSD.feeBase()` is the lower of `circulating()` and the lowest supply in the current
+  and the previous 1-hour bucket, so debt counts in a redemption's fee only once it has stood 1-2 hours. Debt held
+  through the window is indistinguishable from honest debt: a diluter who holds it 1-2 hours pays only the upfront fee
+  (7 days at the type's average rate) and the price exposure. Supply that FALLS counts at once: a repay and re-borrow
+  raises other redeemers' fees for up to 2 hours (a fee rise, never a loss of funds). Before any supply is recorded the
+  base is `circulating()` alone.
+- **The seat claim denylist is not an allowlist.** 13 more token-moving selectors are refused (41 in all), but no list
+  can be complete: every `SET_SEAT_CLAIM` proposal must be reviewed against its target (Trust model).
+- **Remote clock.** k validly signed, future-dated windows can still step a remote feed's clock k x `PARENT_SLACK`
+  (bounded by the slow projection's `most`); each needs the attester's signature. Not reachable in the beta (mainnet
+  feeds take the same-chain branch).
+- **Seat clock between ticks.** A stretch at a 0 figure that begins and ends between two ticks is counted as priced; the
+  clock loses up to the time since the last tick when the type falls to 0 (the operator ticks a running auction hourly).
+- **BATCH later item.** The propose dry run skips a waiting item, so a later item that only the waiting item (once it can
+  apply) would break is not caught at propose: the apply reverts as a whole and the Safe cancels.
+- **Wide band after a silence is one step.** The first attestation after a silence may move the value up to 2x the cap;
+  the epoch then re-anchors at the stored value at the cap, whoever lands first.
+- **A clamped depth leg.** The swarm depth leg is clamped too, so its stored value may be one nobody attested; it is only
+  ever min'd with the sampler sum, so it can lower depth, never raise it.
+
+### What changed since the third public audit (c64ecee)
+
+For the re-check: the fourth commit of this repository is the whole delta. Wave-3 fixes: the redemption fee base
+(`ImdUSD.feeBase()`, 1-hour buckets, used by the Redeemer's ramp and base-rate rise); the seat auction clock does not
+count while `SeatFeed` reads 0 (`zeroAtTick`); 13 more token-moving claim selectors refused; a remote feed with no block
+clock takes its first value from the deployment only, and one window moves its clock at most `PARENT_SLACK` past the
+slow projection; the BATCH propose dry run is one linear pass (it re-ran per item: 17M gas for 8 items, now about 6M);
+resume guards (Parameters is wired to one ImdDepth once; a recorded live-pool feed must not be a `ProvenPoolPrice`);
+`ProvenPoolPrice.prove` of a block no newer than the held one is a no-op returning the held value (was `NotNewer`);
+`Position.version` moved into slot 2 (an open creates 7 slots whatever the risk version); `ParametersRules` and
+`LedgerSettlement` deployed separately, before their parents, which check them. PRICE DESIGN C: `SwarmFeed` clamps toward
+each attestation instead of rejecting it; the way back (`_returnAnchor` and its memory) is removed; the wide band after
+a silence is one step; new views `attested()`, `converged()`, `followOf()`; `FeedTraits` carries `converged` and `proven`
+through the composites; in the Pricer a non-converged leg does not agree and, where the spot is proven, `low = agree ?
+min : max`; sIMD's spot is the proven pool price (the swarm spot leaf and its product are gone: 23 mainnet feed nodes).
+Each wave-3 fix has a test named `AuditW3*` (the auditors' proofs, adapted, plus a property test that fails on the
+earlier code); design C is tested in `test/unit/SwarmFeedProperties.t.sol` (P1-P3, P5 and the residual as fuzz and
+invariant runs), `test/unit/PricerTwin.t.sol` (P4) and the ported `AuditW1WayBack`, `AuditW2Ratchet` and `AuditW3WayBack`
+suites; `test/unit/SwarmFeedGas.t.sol` measures an accepted attestation.
 
 ### What changed since the second public audit (5de80a6)
 

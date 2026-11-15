@@ -97,8 +97,10 @@ abstract contract LedgerBase is TransientReentrancyGuard {
         uint40 lastRateChange;
         uint64 premiumRate; // the rate before the last rate change: debt added inside the cooldown pays 7 days of it
         uint16 ilkIndex; // 1 + the position's type's index in `_ilkList`; 0 = no such position (gas review)
-        uint192 yieldMark; // capped share rate at the last harvest (high-water mark)
+        // In slot 2 with the fields above, which every open writes (audit wave 3, info: in slot 3 beside `yieldMark`, an open on a
+        // non-yield type created an 8th slot once the type's riskVersion was non-zero).
         uint32 version; // liquidation-risk version bound at the last risk-increasing action
+        uint192 yieldMark; // capped share rate at the last harvest (high-water mark)
     }
 
     struct IlkState {

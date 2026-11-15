@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {IFeed} from "../interfaces/IFeed.sol";
+import {FeedTraits} from "./FeedTraits.sol";
 
 /// @notice Prices a yield-bearing share (ERC-4626, or wstETH) from its exchange rate and a feed for the
 /// underlying, with the exchange rate's GROWTH capped.
@@ -92,6 +93,16 @@ contract RateFeed is IFeed {
 
     function isStale() external view returns (bool) {
         return underlying.isStale() || rate() == 0;
+    }
+
+    /// @notice The underlying holds the value its source attested (the rate is read live, never clamped by an attester).
+    function converged() external view returns (bool) {
+        return FeedTraits.converged(underlying);
+    }
+
+    /// @notice The underlying is a proven pool price (or a product over one).
+    function proven() external view returns (bool) {
+        return FeedTraits.proven(underlying);
     }
 
     function maxAge() external view returns (uint256) {

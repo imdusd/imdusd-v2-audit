@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -146,11 +147,11 @@ contract AuditW1CirculatingTest is Test {
     function test_ledgerRepayInsideALoanDoesNotDeflateCirculating() public {
         vm.warp(1_800_000_000);
         ImdUSD u = new ImdUSD(address(this), 100_000e18);
-        Parameters params = new Parameters(makeAddr("gov"), address(this));
+        Parameters params = Modules.newParameters(makeAddr("gov"), address(this));
         Pricer pricer = new Pricer(params);
         Treasury treasury = new Treasury(makeAddr("gov"), IERC20(address(u)), address(this));
         PositionNFT nft = new PositionNFT(address(this));
-        Ledger ledger = new Ledger(u, params, pricer, address(treasury), address(this), IPulse(address(0)), nft);
+        Ledger ledger = Modules.newLedger(u, params, pricer, address(treasury), address(this), IPulse(address(0)), nft);
         nft.bind(address(ledger));
         ledger.wire(address(new Redeemer(ledger)), address(new Liquidator(ledger, pricer)));
         u.wire(address(ledger), address(new Migrator(IERC20(address(new CiTok())), u, params)), address(params));

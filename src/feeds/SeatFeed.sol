@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IFeed} from "../interfaces/IFeed.sol";
+import {FeedTraits} from "./FeedTraits.sol";
 
 /// @notice The median leaf's second signed number: the distinct seats sold in its window (SwarmSeatMedianFeed).
 interface ISeatFigure {
@@ -289,6 +290,11 @@ contract SeatFeed is IFeed {
         return median.isStale() || ethUsd.isStale();
     }
 
+    /// @notice The attested median leaf and ETH/USD hold the values their sources attested (price design C).
+    function converged() external view returns (bool) {
+        return FeedTraits.converged(median) && FeedTraits.converged(ethUsd);
+    }
+
     function maxAge() external view returns (uint256) {
         return Math.min(median.maxAge(), ethUsd.maxAge());
     }
@@ -313,6 +319,11 @@ contract SeatSpotLeg is IFeed {
 
     function isStale() external view returns (bool) {
         return feed.spot().isStale() || feed.ethUsd().isStale() || feed.median().isStale();
+    }
+
+    /// @notice The spot leaf, ETH/USD and the median leaf (its figure and trend set the factor) are all converged.
+    function converged() external view returns (bool) {
+        return FeedTraits.converged(feed.spot()) && FeedTraits.converged(feed.ethUsd()) && feed.converged();
     }
 
     function maxAge() external view returns (uint256) {

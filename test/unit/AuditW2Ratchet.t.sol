@@ -10,16 +10,12 @@ contract RatchetLeaf is SwarmSpotPolicy {
     constructor(address att) SwarmFeed(att, address(0), 1, 3, 1 hours, 2000) {}
 }
 
-/// @notice Three honestly-signed attestations of a pushed pool, each within the epoch rule, placed around two epoch
-/// boundaries (1.2A in the last minute of epoch 1; 1.44A as the first value of epoch 2; 1.728A as the first value of
-/// epoch 3), leave the honest level A outside every allowance the feed will ever offer again while the market stays at
-/// A: the live epoch's band is [1.152A, 1.728A], the way back reaches only the cap around 1.44A (the previous epoch's
-/// anchor), and once the way back expires the stale allowance is 2x the cap below 1.728A = 1.037A. The feed is halted
-/// for good against an honest relayer, with no attester compromise and no market gap: the halt the header accepts only
-/// for "the outage-plus-crash case" is bought here by a relayer for three attestations (1.5 IMD) and three pushes of
-/// the pool at the recipe's read block.
-/// Audit wave 2 (2-prices, high), adopted from the judge's proof: the way back now reaches the cap around the anchor of the
-/// epoch before the expired one too, with no step bound from the last value, so the honest level is taken back.
+/// @notice Audit wave 2 (2-prices, HIGH): three honestly-signed attestations of a pushed pool around two epoch boundaries
+/// (1.2A at minute 59, 1.44A at minute 60, 1.728A an hour later) locked the honest level A out for good under the
+/// rejection rule; the wave-2 fix (the way back two epochs deep) still locked out with four pushes, and with three after a
+/// silence (wave 3). Design C (2026-11-14) takes every attestation as a target and clamps it, so these tests now assert
+/// P2 on the same sequences: once only the honest level is relayed, once per epoch, the stored value reaches it within
+/// ceil(ln(stored / A) / ln(1 + cap)) epochs, every honest attestation is accepted, and none moves the value away from A.
 contract AuditW2RatchetTest is Test {
     uint256 constant KEY = 0xA11CE;
     uint256 nonce;
@@ -34,7 +30,7 @@ contract AuditW2RatchetTest is Test {
     }
 
     function _att(uint256 value) internal returns (SwarmFeed.OracleAttestation memory a) {
-        uint64 toBlock = uint64(block.number);
+        uint64 toBlock = uint64(vm.getBlockNumber());
         a.requestId = bytes32(++nonce);
         a.chainId = 1;
         a.answerType = 3;
@@ -45,8 +41,8 @@ contract AuditW2RatchetTest is Test {
         a.panelSize = 100;
         a.quorum = 67;
         a.agreed = 67;
-        a.issuedAt = uint64(block.timestamp);
-        a.expiresAt = uint64(block.timestamp + 1 days);
+        a.issuedAt = uint64(vm.getBlockTimestamp());
+        a.expiresAt = uint64(vm.getBlockTimestamp() + 1 days);
     }
 
     function _sign(SwarmFeed.OracleAttestation memory a) internal view returns (bytes memory) {
@@ -70,8 +66,8 @@ contract AuditW2RatchetTest is Test {
     }
 
     function _advance(uint256 secs) internal {
-        vm.warp(block.timestamp + secs);
-        vm.roll(block.number + secs / 12);
+        vm.warp(vm.getBlockTimestamp() + secs);
+        vm.roll(vm.getBlockNumber() + secs / 12);
     }
 
     function _submit(uint256 value) internal {
@@ -79,84 +75,80 @@ contract AuditW2RatchetTest is Test {
         f.submitAttestation(a, _sign(a));
     }
 
-    function _try(uint256 value) internal returns (bool ok) {
-        SwarmFeed.OracleAttestation memory a = _att(value);
-        bytes memory sig = _sign(a);
-        try f.submitAttestation(a, sig) {
-            ok = true;
-        } catch {
-            ok = false;
-        }
+    function _value() internal view returns (uint256 v) {
+        (v,) = f.latestValue();
     }
 
-    function test_threePushedAttestationsDoNotLockTheHonestLevelOut() public {
-        // t0: the honest level anchors epoch 1 at A.
-        _submit(A);
+    /// @dev Relay the honest A every `gap` seconds until the stored value is A; returns the epochs it took (each relay
+    /// opens a new epoch when gap >= maxAge). Asserts every relay is accepted and never moves the value away from A.
+    function _honestUntilBack(uint256 gap, uint256 maxRelays) internal returns (uint256 relays) {
+        while (_value() != A) {
+            uint256 before = _value();
+            _advance(gap);
+            _submit(A); // reverts the test if refused: P3 (no lock-out)
+            uint256 dBefore = before > A ? before - A : A - before;
+            uint256 dAfter = _value() > A ? _value() - A : A - _value();
+            assertLe(dAfter, dBefore, "an honest attestation never moves the value away from its target");
+            ++relays;
+            assertLe(relays, maxRelays, "P2 bound exceeded");
+        }
+        assertTrue(f.converged());
+    }
 
-        // t0 + 59 min: the relayer lands 1.2A (within the cap of A).
+    /// 1.728A back to A: ln(1.728) / ln(1 / 0.8) = 2.45, so at most 3 epochs (the bound with ln 1.2 is 3 too).
+    function test_W2_threePushedAttestationsDoNotLockTheHonestLevelOut() public {
+        _submit(A);
         _advance(59 minutes);
         _submit(A * 120 / 100);
-
-        // t0 + 60 min: epoch 1 has expired; the first value of epoch 2 is 1.44A (within the cap of the last value 1.2A).
         _advance(1 minutes);
         _submit(A * 144 / 100);
-
-        // t0 + 120 min: epoch 2 has expired; the first value of epoch 3 is 1.72A (within the cap of 1.44A).
         _advance(60 minutes);
-        _submit(A * 172 / 100);
-        (uint256 v,) = f.latestValue();
-        assertEq(v, A * 172 / 100, "the ratchet landed: 1.72A is the live value");
-
-        // The market never left A. The honest relayer tries every ten minutes for a day. Expected: accepted within a few
-        // epochs (the README: "a larger gap is followed at the cap per epoch"). Actual: refused on every attempt.
-        bool accepted;
-        for (uint256 i; i < 144 && !accepted; ++i) {
-            _advance(10 minutes);
-            accepted = _try(A);
-        }
-        emit log_named_uint("hours before the honest level was accepted (145 = never in a day)", (block.timestamp - 1_800_000_000) / 1 hours);
-        (uint256 anchor,, uint256 allowance) = f.epoch();
-        emit log_named_uint("anchor after a day", anchor);
-        emit log_named_uint("allowance bps after a day", allowance);
-        assertTrue(accepted, "the honest level is locked out for good: the feed is halted at 1.72A");
+        _submit(A * 1728 / 1000);
+        assertEq(_value(), A * 1728 / 1000, "the ratchet landed: 1.728A is the stored value");
+        assertEq(_honestUntilBack(60 minutes, 3), 3);
     }
 
-    /// The beta's legs are "bought on demand and stale most hours" (DeployConfig). After any two hours of silence the next
-    /// value may move 2x the cap. Two attestations then suffice: 1.4A opens a wide epoch (its first value), 1.67A opens the
-    /// next one an hour later (within the cap of 1.4A). From there A is below 0.8 x 1.4A (the way back), below 0.8 x 1.4A
-    /// (the live band) and below 0.6 x 1.67A (the stale allowance from the last value): refused for good.
-    function test_twoPushedAttestationsAfterASilenceDoNotLockTheHonestLevelOut() public {
+    /// The same, but the honest relayer tries every ten minutes (several relays per epoch): still back within 3 epochs.
+    function test_W2_honestEveryTenMinutesIsBackWithinThreeEpochs() public {
         _submit(A);
-        _advance(2 hours + 1); // the honest level has been stale for a whole hour past its lifetime
+        _advance(59 minutes);
+        _submit(A * 120 / 100);
+        _advance(1 minutes);
+        _submit(A * 144 / 100);
+        _advance(60 minutes);
+        _submit(A * 1728 / 1000);
+        uint256 t0 = vm.getBlockTimestamp();
+        _honestUntilBack(10 minutes, 3 * 6 + 1);
+        assertLe(vm.getBlockTimestamp() - t0, 3 hours, "within three epochs of the first honest relay");
+    }
+
+    /// After two hours of silence the first push may move 2x the cap (1.4A), then 1.67A an hour later. Back in <= 3 epochs.
+    function test_W2_twoPushedAttestationsAfterASilenceDoNotLockTheHonestLevelOut() public {
+        _submit(A);
+        _advance(2 hours + 1);
         (,, uint256 allowance) = f.epoch();
         assertEq(allowance, 4000, "stale allowance: 2x the cap");
         _submit(A * 140 / 100);
         _advance(1 hours);
         _submit(A * 167 / 100);
-
-        bool accepted;
-        for (uint256 i; i < 144 && !accepted; ++i) {
-            _advance(10 minutes);
-            accepted = _try(A);
-        }
-        assertTrue(accepted, "two attestations after a silence halt the feed against the honest level");
+        assertEq(_value(), A * 167 / 100);
+        assertLe(_honestUntilBack(60 minutes, 3), 3);
     }
 
-    /// The residual (README known issues): four boundary-timed pushes in a row walk both remembered anchors more than a cap
-    /// from the honest level, and it is refused until the Safe re-points the feed. Pinned so a change to the rule is seen.
-    function test_fourBoundaryPushesInARowStillLockOut() public {
+    /// The old residual ("four boundary-timed pushes lock out until the Safe re-points") is gone: after four pushes the
+    /// stored value is 2.0736A and the honest level is reached within ceil(ln 2.0736 / ln 1.25) = 4 epochs (falls move
+    /// by 1/0.8 per epoch).
+    function test_W2_fourBoundaryPushesInARowNoLongerLockOut() public {
         _submit(A);
         _advance(59 minutes);
-        _submit(A * 120 / 100); // last value of epoch 1
+        _submit(A * 120 / 100);
         _advance(1 minutes);
-        _submit(A * 144 / 100); // first value of epoch 2 (anchored at 1.2A)
+        _submit(A * 144 / 100);
         _advance(60 minutes);
-        _submit(A * 172 / 100); // first value of epoch 3 (anchored at 1.44A)
+        _submit(A * 1728 / 1000);
         _advance(60 minutes);
-        _submit(A * 206 / 100); // first value of epoch 4 (anchored at 1.72A)
-        for (uint256 i; i < 144; ++i) {
-            _advance(10 minutes);
-            assertFalse(_try(A), "documented residual: refused");
-        }
+        _submit(A * 20736 / 10000);
+        assertEq(_value(), A * 20736 / 10000);
+        assertLe(_honestUntilBack(60 minutes, 4), 4);
     }
 }

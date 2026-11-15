@@ -267,6 +267,10 @@ abstract contract StageGenesis is StagePeg {
 
     function _stageDepth(DeployTypes.Config memory cfg, Deployed memory d) internal {
         uint256 g;
+        // A resume never re-points Parameters (audit wave 3, low): wired to an ImdDepth the record does not name is a Mismatch,
+        // as for the sleeves, not a second wiring (the first one's hourly lows would be orphaned and the depth rule restart).
+        address wired = address(d.params.imdDepth());
+        if (wired != address(0) && wired != address(d.imdDepth)) revert Mismatch("Parameters points at another ImdDepth");
         if (!(_has(address(d.imdDepth)) && _ok(d.imdDepth.params() == address(d.params), "ImdDepth"))) {
             g = gasleft();
             d.imdDepth = new ImdDepth(address(d.params));

@@ -77,6 +77,7 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
         address marker;
         uint40 attestedAt; // `updatedAt` of the median attestation live at `lastTick`
         uint40 ran; // priced seconds counted up to `lastTick`
+        bool zeroAtTick; // SeatFeed read 0 at `lastTick` (audit wave 3): priced time restarts only at a repricing event
     }
 
     uint256 public constant UNIT = 1e18;
@@ -416,7 +417,8 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
             ethAt: uint40(ethAt),
             marker: marker,
             attestedAt: uint40(at),
-            ran: 0
+            ran: 0,
+            zeroAtTick: _readsZero(f)
         });
         emit Opened(id, start, marker);
     }
@@ -456,6 +458,15 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
         a.attestedAt = uint40(at);
         (, uint64 ethAt) = _feed().ethUsd().latestValue();
         a.ethAt = uint40(ethAt);
+        a.zeroAtTick = _readsZero(_feed());
+    }
+
+    /// @dev A take could settle only while the Pricer prices the seat type: SeatFeed reads a non-zero value and neither leg is
+    /// stale (`Pricer.quote`: `medianOk = m != 0 && !median.isStale()`; the seat type has no NHI leg). Staleness is
+    /// reconstructed from the legs' times (`_fresh`, `_freshEth`); a zero value is not, so it is recorded at each tick.
+    function _readsZero(SeatFeed f) private view returns (bool) {
+        (uint256 v,) = f.latestValue();
+        return v == 0;
     }
 
     /// @dev Priced seconds since the opening: `ran` plus, since `lastTick`, the time the median attestation
@@ -475,8 +486,18 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
     /// as fresh throughout (the heartbeat keeps it so); a stretch counts as stale only while the leg is stale NOW (up to
     /// its last update + maxAge) or was already stale at the last tick (from its newest update on). A gap that opened and
     /// closed between two ticks is not seen: the keeper ticks an auction when its type goes unpriced, which records it.
+    /// PRICED, NOT ONLY FRESH (audit wave 3, medium): the type is also unpriced while SeatFeed reads 0 with both legs fresh (an
+    /// accepted figure of 0 zeroes its liquidity term). While it reads 0 now, nothing since `lastTick` counts (when it fell to
+    /// 0 is not on chain: slow, never fast); a tick records `zeroAtTick`, and once it reads a value again only time from the
+    /// event that can have lifted it (a newer median attestation's arrival, else the ETH/USD leg's newest update) counts.
+    /// Residual: a stretch at 0 that began and ended between two ticks (two median attestations) is not seen; the keeper
+    /// ticks when SeatFeed reads 0, and hourly while an auction is live (which also bounds the slow loss to an hour).
     function _elapsed(Auction memory a) private view returns (uint256 ran) {
         SeatFeed f = _feed();
+        // Unpriced by its VALUE now (audit wave 3, medium: an accepted figure of 0 reads 0 with both legs fresh): nothing since
+        // the last tick counts, as the time of the change is not on chain (slow, never fast; the keeper ticks when it happens).
+        (uint256 v,) = f.latestValue();
+        if (v == 0) return a.ran;
         IFeed m = f.median();
         (, uint64 newAt) = m.latestValue();
         uint256 opened = Math.max(uint256(newAt), uint256(IRelayedAt(address(m)).acceptedAt()));
@@ -484,8 +505,12 @@ contract SeatJoin is TransientReentrancyGuard, IHolderJoin, IAuctionJoin {
         IFeed e = f.ethUsd();
         (, uint64 ethNow) = e.latestValue();
         uint256[4] memory ew = _freshEth(a.lastTick, a.ethAt, ethNow, e.maxAge());
-        ran = a.ran + _overlap(mw[0], mw[1], ew[0], ew[1]) + _overlap(mw[0], mw[1], ew[2], ew[3])
-            + _overlap(mw[2], mw[3], ew[0], ew[1]) + _overlap(mw[2], mw[3], ew[2], ew[3]);
+        // At 0 at the last tick and not now: priced time starts no earlier than the event that can have lifted it, the arrival
+        // of a newer median attestation (its figure), else the ETH/USD leg's newest update.
+        uint256 lo;
+        if (a.zeroAtTick) lo = Math.max(newAt != a.attestedAt ? opened : uint256(ethNow), uint256(a.lastTick));
+        ran = a.ran + _overlap(Math.max(mw[0], lo), mw[1], ew[0], ew[1]) + _overlap(Math.max(mw[0], lo), mw[1], ew[2], ew[3])
+            + _overlap(Math.max(mw[2], lo), mw[3], ew[0], ew[1]) + _overlap(Math.max(mw[2], lo), mw[3], ew[2], ew[3]);
     }
 
     /// @dev The fresh stretches of one leg from `from` to now, as up to two disjoint intervals [w0, w1) and [w2, w3): the

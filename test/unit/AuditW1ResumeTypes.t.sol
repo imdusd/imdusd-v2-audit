@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import "forge-std/Test.sol";
 import {DeployTypes, MainnetConfig, BetaConfig} from "script/DeployConfig.sol";
 import {DeployBase} from "script/deploy/DeployBase.sol";
@@ -34,7 +35,7 @@ contract AuditW1ResumeTypesTest is Test {
 
     function setUp() public {
         h = new W1Stage3();
-        params = new Parameters(address(0x5AFE), address(h)); // the stage contract is the wirer, as the deployer EOA is
+        params = Modules.newParameters(address(0x5AFE), address(h)); // the stage contract is the wirer, as the deployer EOA is
         ledger = address(new W1ResumeBlank());
         token = address(new W1ResumeBlank());
         address usd = address(new W1ResumeBlank());

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -66,11 +67,11 @@ contract W1RvProofRiskVersionRebind is Test {
         weth = new W1RvRVToken();
         feed = new W1RvRVFeed(2000e18);
         usd = new ImdUSD(address(this), 10_000_000e18);
-        params = new Parameters(governor, address(this));
+        params = Modules.newParameters(governor, address(this));
         pricer = new Pricer(params);
         treasury = new Treasury(governor, IERC20(address(usd)), address(this));
         PositionNFT nft_ = new PositionNFT(address(this));
-        ledger = new Ledger(usd, params, pricer, address(treasury), address(this), IPulse(address(0)), nft_);
+        ledger = Modules.newLedger(usd, params, pricer, address(treasury), address(this), IPulse(address(0)), nft_);
         nft_.bind(address(ledger));
         Redeemer redeemer = new Redeemer(ledger);
         liquidator = new Liquidator(ledger, pricer);

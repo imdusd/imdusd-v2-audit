@@ -114,7 +114,7 @@ contract SeatHandler is Test {
 
     function take(uint256 u, uint256 wait) external {
         address who = _u(u);
-        (, uint40 at,,,,,) = join.auctions(_pid(SEAT, who));
+        (, uint40 at,,,,,,) = join.auctions(_pid(SEAT, who));
         if (at == 0) return;
         vm.warp(vm.getBlockTimestamp() + bound(wait, 0, 7 hours));
         _fresh();

@@ -10,15 +10,11 @@ contract W1WayBackLeaf is SwarmPricePolicy {
     constructor(address att) SwarmFeed(att, address(0), 1, 3, 1 hours, 2000) {}
 }
 
-/// SwarmFeed._returnAnchor ("the way back") accepts a value within the cap of the EXPIRED epoch's level even when
-/// that value is 50% away from the last accepted value, with no silence at all. The README trust model says a value
-/// "moves at most a fixed cap per epoch, widened at most 2x after an hour of staleness"; here a fresh feed moves
-/// +50% in one accepted attestation (0.8A -> 1.2A). Fails on this commit (the value is accepted); passes once the
-/// way back only admits values between the last accepted value and the expired epoch's level.
-/// @notice Audit wave 1 (fa11up/imdusd-v2-audit at 2875ffb, panel 3; the permissions specialist's proof, adapted: its
-/// signature is now made before expectRevert, which the original pointed at the signing call). The way back is bounded by
-/// 2x the cap from the last accepted value too. The second test pins the lock-out a tighter bound caused (pre-publish
-/// review of the wave-2 snapshot): only values between the last one and the level refused an honest fall past the level.
+/// Audit wave 1 (fa11up/imdusd-v2-audit at 2875ffb, panel 3, low): the way back (`_returnAnchor`) let a fresh feed move
+/// +50% in one accepted attestation (0.8A -> 1.2A) against the trust model's "at most the cap per epoch". Wave 2 then showed
+/// the bound that fixed it made a pushed lock-out permanent. Design C (2026-11-14) deleted the way back: these tests now
+/// assert the PROPERTIES on the same sequences: P1 (no epoch moves the stored value more than the cap from its anchor) and
+/// P2 (an honest level returning after a push is reached within the bounded number of epochs, never refused).
 contract AuditW1WayBackTest is Test {
     uint256 constant KEY = 0xA11CE;
     uint256 nonce;
@@ -32,7 +28,7 @@ contract AuditW1WayBackTest is Test {
     }
 
     function _att(uint256 value) internal returns (SwarmFeed.OracleAttestation memory a) {
-        uint64 toBlock = uint64(block.number);
+        uint64 toBlock = uint64(vm.getBlockNumber());
         a.requestId = bytes32(++nonce);
         a.chainId = 1;
         a.answerType = 3;
@@ -43,8 +39,8 @@ contract AuditW1WayBackTest is Test {
         a.panelSize = 100;
         a.quorum = 67;
         a.agreed = 67;
-        a.issuedAt = uint64(block.timestamp);
-        a.expiresAt = uint64(block.timestamp + 1 days);
+        a.issuedAt = uint64(vm.getBlockTimestamp());
+        a.expiresAt = uint64(vm.getBlockTimestamp() + 1 days);
     }
 
     function _sign(SwarmFeed.OracleAttestation memory a) internal view returns (bytes memory) {
@@ -61,48 +57,49 @@ contract AuditW1WayBackTest is Test {
     }
 
     function _advance(uint256 secs) internal {
-        vm.warp(block.timestamp + secs);
-        vm.roll(block.number + secs / 12);
+        vm.warp(vm.getBlockTimestamp() + secs);
+        vm.roll(vm.getBlockNumber() + secs / 12);
     }
 
-    /// Wave 1 refused this +50% one-step return; wave 2 (high, AuditW2Ratchet) dropped that step bound because it made a
-    /// pushed ratchet permanent. The way back now reaches the cap around a held level and no further: 1.2A is taken,
-    /// 1.21A is not.
-    function test_wayBackReachesTheCapAroundAHeldLevelAndNoFurther() public {
-        uint256 A = 4e15; // wei of ETH per 1e18 IMD, the order of the live feed
-        // t0: the first value anchors epoch 1 at A with the 20% cap.
+    function _value() internal view returns (uint256 v) {
+        (v,) = f.latestValue();
+    }
+
+    /// P1 on the wave-1 sequence: A, 0.8A at minute 59, then a 1.2A target at minute 60. The way back took 1.2A in one
+    /// step (+50%); now the new epoch anchors at the stored 0.8A and the value stops at 0.96A (the cap).
+    function test_W1_oneStepReturnIsBoundedByTheCap() public {
+        uint256 A = 4e15;
         SwarmFeed.OracleAttestation memory first = _att(A);
         f.submitAttestation(first, _sign(first));
-        // t0 + 59 min: the market fell 20%; an honest attestation of 0.8A is accepted (within the cap of the anchor).
         _advance(59 minutes);
         SwarmFeed.OracleAttestation memory lo = _att(A * 80 / 100);
         f.submitAttestation(lo, _sign(lo));
-        (uint256 v,) = f.latestValue();
-        assertEq(v, A * 80 / 100);
-        assertFalse(f.isStale(), "the feed is fresh: no silence has been earned");
-
-        // t0 + 60 min: epoch 1 has just expired. The cap from the last value (0.8A, fresh) admits at most 0.96A.
+        assertEq(_value(), A * 80 / 100);
         _advance(1 minutes);
-        (uint256 anchor, , uint256 allowanceBps) = f.epoch();
-        assertEq(anchor, A * 80 / 100, "the next epoch anchors on the last value");
-        assertEq(allowanceBps, 2000, "with the plain cap: the feed is fresh");
-
-        // 1.21A is past the cap of every held level (A; no epoch before it): refused.
-        SwarmFeed.OracleAttestation memory over = _att(A * 121 / 100);
-        bytes memory sig = _sign(over);
-        vm.expectRevert(SwarmFeed.ExcessDeviation.selector);
-        f.submitAttestation(over, sig);
-        // 1.2A, +50% from the last accepted value, is within the cap of the held level A: accepted, anchored at A.
+        (uint256 anchor,, uint256 allowanceBps) = f.epoch();
+        assertEq(anchor, A * 80 / 100, "the next epoch anchors on the stored value");
+        assertEq(allowanceBps, 2000);
         SwarmFeed.OracleAttestation memory hi = _att(A * 120 / 100);
         f.submitAttestation(hi, _sign(hi));
-        (anchor, , allowanceBps) = f.epoch();
-        assertEq(anchor, A, "the way back anchors the new epoch at the held level");
-        assertEq(allowanceBps, 2000);
+        assertEq(_value(), A * 96 / 100, "+20% from the anchor, not +50%");
+        assertEq(f.attested(), A * 120 / 100);
+        assertFalse(f.converged());
+        // P2: the 1.2A target held honestly is reached within ceil(ln 1.5 / ln 1.2) = 3 epochs.
+        uint256 epochs = 1;
+        while (_value() != A * 120 / 100) {
+            _advance(1 hours);
+            SwarmFeed.OracleAttestation memory h = _att(A * 120 / 100);
+            f.submitAttestation(h, _sign(h));
+            ++epochs;
+        }
+        assertLe(epochs, 3);
+        assertTrue(f.converged());
     }
 
-    /// A push to 1.2A in the last minute of an epoch anchored at A, then the market at 0.95A: the way back must take the
-    /// honest value at once (5% from the level, 21% from the pushed last value, inside 2x the cap), not two hours later.
-    function test_honestFallPastTheLevelAfterAPushIsNotLockedOut() public {
+    /// P2 on the pre-publish sequence: a push to 1.2A in the last minute of an epoch anchored at A, then the market at
+    /// 0.95A. The honest value is taken at once (it is a target, never refused) and the stored value is at 0.95A within
+    /// ceil(ln(1.2 / 0.95) / ln 1.2) = 2 epochs.
+    function test_W1_honestFallPastTheLevelAfterAPushIsNotLockedOut() public {
         uint256 A = 4e15;
         SwarmFeed.OracleAttestation memory first = _att(A);
         f.submitAttestation(first, _sign(first));
@@ -112,7 +109,11 @@ contract AuditW1WayBackTest is Test {
         _advance(2 minutes);
         SwarmFeed.OracleAttestation memory honest = _att(A * 95 / 100);
         f.submitAttestation(honest, _sign(honest));
-        (uint256 v,) = f.latestValue();
-        assertEq(v, A * 95 / 100, "accepted at t0 + 61 min");
+        assertEq(_value(), A * 96 / 100, "taken at once: 1.2A anchors the epoch, the value falls the cap to 0.96A");
+        _advance(1 hours);
+        honest = _att(A * 95 / 100);
+        f.submitAttestation(honest, _sign(honest));
+        assertEq(_value(), A * 95 / 100, "the honest level, one epoch later");
+        assertTrue(f.converged());
     }
 }

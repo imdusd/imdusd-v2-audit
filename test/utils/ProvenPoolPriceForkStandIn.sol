@@ -27,7 +27,6 @@ contract ProvenPoolPriceForkStandIn {
     uint64 internal _provenAt;
 
     error BadHeader();
-    error NotNewer(uint256 block, uint256 provenBlock);
 
     event Proven(uint256 indexed blockNumber, uint160 sqrtPriceX96, uint256 value);
 
@@ -44,13 +43,17 @@ contract ProvenPoolPriceForkStandIn {
         return _provenAt == 0 || block.timestamp > uint256(_provenAt) + maxAge;
     }
 
+    function proven() external pure returns (bool) {
+        return true;
+    }
+
     function prove(bytes calldata header, bytes[] calldata, bytes[] calldata) external returns (uint256 value) {
         bytes memory h = header;
         RLPReader.RLPItem[] memory fields = RLPReader.readList(h);
         uint256 number = _toUint(RLPReader.readBytes(fields[8]));
         bytes32 bh = blockhash(number);
         if (bh == bytes32(0) || bh != keccak256(h)) revert BadHeader();
-        if (number <= provenBlock) revert NotNewer(number, provenBlock);
+        if (number <= provenBlock) return _value; // as the real feed (audit wave 3): a same or older block is a no-op
         (uint160 sqrtP,,,) = IPoolManager(manager).getSlot0(poolId);
         uint256 q = Math.mulDiv(sqrtP, sqrtP, 1 << 64);
         value = baseIsToken0 ? Math.mulDiv(q, 1e18, 1 << 128) : Math.mulDiv(1e18, 1 << 128, q);

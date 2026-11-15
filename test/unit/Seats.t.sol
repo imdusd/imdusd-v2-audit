@@ -1212,14 +1212,14 @@ contract SeatsTest is SeatSystem {
         seatJoin.reopen(_pid(SEAT, alice));
         assertEq(seatJoin.price(_pid(SEAT, alice)), 3_200e18, "a fresh Dutch clock from the current median");
         assertFalse(seatJoin.expired(_pid(SEAT, alice)));
-        (, uint40 startAt,,,,,) = seatJoin.auctions(_pid(SEAT, alice));
+        (, uint40 startAt,,,,,,) = seatJoin.auctions(_pid(SEAT, alice));
         assertEq(startAt, uint40(block.timestamp));
         _skip(24 hours);
         _refresh();
         assertTrue(seatJoin.expired(_pid(SEAT, alice)));
         vm.prank(keeper);
         liquidator.liquidate(_pid(SEAT, alice)); // `open` replaces a void auction instead of reverting AuctionLive
-        (,,,, address marker,,) = seatJoin.auctions(_pid(SEAT, alice));
+        (,,,, address marker,,,) = seatJoin.auctions(_pid(SEAT, alice));
         assertEq(marker, keeper, "the restart's marker");
         assertEq(seatJoin.price(_pid(SEAT, alice)), 3_200e18);
         vm.startPrank(bob);
@@ -1453,6 +1453,46 @@ contract SeatsTest is SeatSystem {
             vm.expectRevert(ParametersBase.BadConfig.selector);
             params.propose(p);
         }
+    }
+
+    /// Audit wave 3 (low): the 13 token-moving selectors the 28-entry list missed (judge's reproduction: each was accepted).
+    function test_W3_claimRuleRefusesTheMissedTokenMovingSelectors() public {
+        bytes4[13] memory missed = [
+            bytes4(0xb753a98c), 0xbb35783b, 0xfe9d9303, 0xfc673c4f, 0x9dc29fac, 0x095bcdb6, 0xfe99049a, 0x426a8493, 0x558a7297,
+            0x1f0464d1, 0x69328dec, 0xdb006a75, 0x852a12e3
+        ];
+        uint8 k = params.SET_SEAT_CLAIM();
+        for (uint256 i; i < missed.length; ++i) {
+            for (uint8 rule = 1; rule <= 2; ++rule) {
+                bytes memory p = abi.encode(k, address(seatJoin), address(reward), missed[i], rule);
+                vm.prank(governor);
+                vm.expectRevert(ParametersBase.BadConfig.selector);
+                params.propose(p);
+            }
+        }
+    }
+
+    /// PROPERTY (audit wave 3): a claim rule is refused iff its selector is a listed token-moving form, for EVERY selector
+    /// (no false negative for a listed one wherever it sits in the packed list, no false positive for any other; fuzzed).
+    function testFuzz_W3_claimRuleRefusedIffSelectorIsListed(bytes4 sel, bool factoryRule) public {
+        bytes4[41] memory deny = [
+            bytes4(0x095ea7b3), 0xa9059cbb, 0x23b872dd, 0xd505accf, 0x8fcbaf0c, 0x39509351, 0xd73dd623, 0x87517c45, 0xa22cb465,
+            0x42842e0e, 0xb88d4fde, 0xf242432a, 0x2eb2c2d6, 0x1296ee62, 0x4000aea0, 0xd8fbe994, 0xc1d34b89, 0x3177029f,
+            0xcae9ca51, 0x9bd9bbc6, 0x62ad1b83, 0x959b8c3f, 0xba087652, 0xb460af94, 0x42966c68, 0x79cc6790, 0xac9650d8,
+            0x5ae401dc, 0xb753a98c, 0xbb35783b, 0xfe9d9303, 0xfc673c4f, 0x9dc29fac, 0x095bcdb6, 0xfe99049a, 0x426a8493,
+            0x558a7297, 0x1f0464d1, 0x69328dec, 0xdb006a75, 0x852a12e3
+        ];
+        // Half the runs draw a listed selector (a uniform bytes4 almost never hits the list).
+        if (uint32(sel) % 2 == 0) sel = deny[(uint32(sel) >> 1) % deny.length];
+        bool listed;
+        for (uint256 i; i < deny.length; ++i) {
+            if (deny[i] == sel) listed = true;
+        }
+        uint8 k = params.SET_SEAT_CLAIM();
+        bytes memory p = abi.encode(k, address(seatJoin), address(reward), sel, factoryRule ? uint8(2) : uint8(1));
+        vm.prank(governor);
+        if (listed) vm.expectRevert(ParametersBase.BadConfig.selector);
+        params.propose(p);
     }
 
     function test_panelG4_claimRuleRefusesTokenMovingSelectors() public {

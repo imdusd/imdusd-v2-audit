@@ -8,6 +8,7 @@ import {System} from "../utils/System.sol";
 import {MockERC20, MockFeed} from "../utils/Mocks.sol";
 import {IFeed} from "../../src/interfaces/IFeed.sol";
 import {Adjust} from "../../src/interfaces/IPositions.sol";
+import {ParametersBase} from "../../src/ParametersBase.sol";
 
 /// @notice GAS REVIEW: storage slots each user action CREATES (zero -> non-zero) and UPDATES. Under Glamsterdam's
 /// repricing (EIP-8037/8038, not final) a new slot costs 110,020 gas (now 22,100) and an update 12,100 (now 5,000), so the
@@ -124,6 +125,32 @@ contract GasSlotsTest is System {
         vm.prank(alice);
         usd.transfer(makeAddr("newHolder"), 100e18);
         _count("imdUSD transfer to a new holder");
+    }
+
+    /// Audit wave 3 (info): `version` shared slot 3 with `yieldMark`, so once a type's riskVersion was non-zero every open on a
+    /// non-yield type created an 8th slot. Pinned: an open at riskVersion 1 creates the same 7 slots as at genesis.
+    function test_slots_openAtRiskVersionOne() public {
+        _open(bob, 100e18, 50_000e18, 0.05e18);
+        ParametersBase.Risk memory r = params.storedRisk(ETH);
+        r.chop = r.chop + 0.01e18; // harsher: a new liquidation-risk version
+        uint8 kind = params.SET_RISK();
+        bytes memory payload = abi.encode(kind, ETH, r);
+        vm.prank(governor);
+        params.propose(payload);
+        vm.warp(vm.getBlockTimestamp() + 48 hours + 1);
+        ethMedian.set(2000e18);
+        ethSpot.set(2000e18);
+        params.applyPending(kind);
+        assertEq(params.riskVersion(ETH), 1);
+        // Accrue today's interest first (the Treasury's revenue meter opens today's bucket: not the open's slot).
+        uint256 bobId = ledger.positionId(bob, ETH, 0);
+        vm.prank(bob);
+        ledger.adjust(bobId, Adjust(0, 1e18, 0, 0, 0, false, type(uint256).max, address(0)));
+
+        vm.startStateDiffRecording();
+        _open(alice, 10e18, 10_000e18, 0.06e18);
+        assertEq(_count("open at riskVersion 1"), 7, "an open at riskVersion 1 creates 7 storage slots, as at genesis");
+        assertEq(ledger.position(ledger.positionId(alice, ETH, 0)).version, 1);
     }
 
     /// The type of a position lives in its record (ilkIndex); the sorted list reads the Ledger's rate.

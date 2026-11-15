@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {System} from "../utils/System.sol";
 import {MockERC20, MockFeed} from "../utils/Mocks.sol";
@@ -83,7 +84,7 @@ contract DepthRuleTest is System {
         _gov(_lineTo(50_000e18)); // 80k <= 80.1k
         params.applyPending();
         // At genesis too.
-        Parameters p = new Parameters(governor, address(this));
+        Parameters p = Modules.newParameters(governor, address(this));
         vm.expectRevert(ParametersBase.UnknownIlk.selector);
         p.setGenesisDepthRule(SIMD, 0.8e18, 1, 0, 0);
     }

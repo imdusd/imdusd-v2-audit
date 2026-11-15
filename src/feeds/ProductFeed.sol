@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {IFeed} from "../interfaces/IFeed.sol";
+import {FeedTraits} from "./FeedTraits.sol";
 
 /// @notice `a * b / 1e18`: chains a price with a ratio or a cross rate.
 /// @dev Uses: WBTC = BTC/USD (per 1e18 raw at 8 decimals) x WBTC/BTC ratio; IMD in USD = v1's
@@ -28,6 +29,17 @@ contract ProductFeed is IFeed {
 
     function isStale() external view returns (bool) {
         return a.isStale() || b.isStale();
+    }
+
+    /// @notice Both inputs hold the value their source attested (FeedTraits: an input without the trait counts as converged).
+    function converged() external view returns (bool) {
+        return FeedTraits.converged(a) && FeedTraits.converged(b);
+    }
+
+    /// @notice An input is a proven pool price. The deploy graph pairs one only with Chainlink ETH/USD (DeployConfig
+    /// F_IMD_USD_PROVEN, checked by DeployBase._feedIs), so the product has no attester in its path.
+    function proven() external view returns (bool) {
+        return FeedTraits.proven(a) || FeedTraits.proven(b);
     }
 
     function maxAge() external view returns (uint256) {

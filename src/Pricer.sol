@@ -5,6 +5,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ParametersBase} from "./ParametersBase.sol";
 import {Parameters} from "./Parameters.sol";
 import {IFeed} from "./interfaces/IFeed.sol";
+import {FeedTraits} from "./feeds/FeedTraits.sol";
 
 /// @notice Turns a type's feed pair, NHI and depeg breaker into one quote. Stateless.
 /// @dev Which price each action uses, and why:
@@ -16,7 +17,7 @@ import {IFeed} from "./interfaces/IFeed.sol";
 ///    price is read in this call, so a rally between attested updates is not paid to the redeemer. Pushing
 ///    the pool only raises the payout price, which only shrinks what a redeemer receives. An unreadable live
 ///    leg on such a type sets `payout = 0`: redemption against it waits (fail closed).
-///  - When the legs diverge past `skew`, `low` and `high` collapse to the median: the spot is the manipulable leg.
+///  - When the legs diverge past `skew`, `low` and `high` collapse to the median (a twin type: to the higher leg, below).
 ///    Borrowing stops (`borrowable = false`); liquidation continues on the median. The redemption `payout` on a
 ///    type WITHOUT a live leg keeps `max(median, spot)` while the spot is fresh: both legs are
 ///    oracles there (cbBTC/USD vs BTC/USD), and a stalled median in a rally must not hand the redeemer collateral
@@ -25,6 +26,15 @@ import {IFeed} from "./interfaces/IFeed.sol";
 ///    deposits (`priced = false`). Refusing to act is the only safe answer to not knowing a price (v1).
 ///  - A depegged stablecoin (pegAggregator below pegFloor) stops borrowing only; it is valued at the
 ///    reading, never at $1, and stays liquidatable.
+///  - CONVERGED LEGS ONLY AGREE (price design C, 2026-11-14). A swarm leaf clamps an attested target into its epoch's band,
+///    so a leg can read a value nobody attested (`FeedTraits.converged` false, through any composite). Such a leg still
+///    PRICES (liquidation, redemption), but the pair does not agree: no new debt, no withdrawal, no charged rate change at
+///    it. An NHI leaf that is not converged also stops borrowing (its mat is one nobody attested), not liquidation.
+///  - TWIN RULE (price design C): a type whose spot leg is derived from a pool price PROVEN from Ethereum state
+///    (`FeedTraits.proven`: ProvenPoolPrice x ETH/USD x rate for sIMD) has a trustless twin of its swarm median. While the
+///    legs disagree and that spot is fresh, `low = high = max(median, spot)` instead of the median alone: a wrong or
+///    compromised median (attester key, wrong majority) cannot liquidate below the proven price, and a pushed proven
+///    price cannot lower `low` below the median. Borrowing still needs agreement. Other types keep the median rule.
 ///  - `borrow = min(low, cap)`: the price new debt, withdrawals and a charged rate change are measured
 ///    at. `Parameters.cap` is a governed ceiling (0 = none). Only `borrow` is capped: liquidation health and liquidation
 ///    prices use the uncapped `low`, and redemption the uncapped `payout`, so a ceiling below market can only refuse new
@@ -75,12 +85,20 @@ contract Pricer {
         if (!same) (s,) = c.spot.latestValue();
         bool spotOk = same || (s != 0 && !c.spot.isStale());
         bool agree = spotOk && Math.mulDiv(m > s ? m - s : s - m, 1e18, m) <= r.skew;
-        q.low = agree ? Math.min(m, s) : m;
-        q.high = agree ? Math.max(m, s) : m;
+        // A clamped leg prices but does not agree (design C). Read only when the values agree, so a disagreeing pair pays nothing.
+        if (agree) agree = FeedTraits.converged(c.median) && (same || FeedTraits.converged(c.spot));
+        if (agree) {
+            (q.low, q.high) = (Math.min(m, s), Math.max(m, s));
+        } else if (spotOk && !same && FeedTraits.proven(c.spot)) {
+            q.low = q.high = Math.max(m, s); // the twin rule: neither leg alone can set the liquidation price below the other
+        } else {
+            q.low = q.high = m;
+        }
         q.payout = q.high;
         q.agree = agree;
         q.priced = true;
-        q.borrowable = agree && !_depegged(c.pegAggregator, r.pegFloor);
+        q.borrowable = agree && !_depegged(c.pegAggregator, r.pegFloor)
+            && (address(c.nhi) == address(0) || FeedTraits.converged(c.nhi));
         uint256 ceiling = params.cap(ilk);
         q.borrow = ceiling != 0 && ceiling < q.low ? ceiling : q.low;
         if (address(c.liveSpot) != address(0)) {

@@ -6,6 +6,7 @@ import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20P
 import {ERC20FlashMint} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20FlashMint.sol";
 import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @notice imdUSD (v2). Minted only by its Ledger, the v1 Migrator, one peg keeper and (where set) one bridge.
 /// @dev No owner, upgrade, pause, blocklist or rescue. Four minters, each fixed once:
@@ -39,6 +40,12 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
     address public bridge;
     /// @notice The peg keeper: mints only against USDC it receives above $1, burns what it buys back.
     address public keeper;
+    /// @notice The redemption fee base's window (audit wave 3): `feeBase` is at most the lowest supply in the current and the
+    /// previous FEE_BASE_WINDOW bucket, so debt counts in a redemption's fee only once it has stood for 1-2 hours.
+    uint256 public constant FEE_BASE_WINDOW = 1 hours;
+    /// @dev The supply's low water mark per bucket: bucket (32 bits, timestamp / FEE_BASE_WINDOW) | lowest supply in that
+    /// bucket so far (112) | lowest supply in the bucket before it (112). Moved only by mints and burns.
+    uint256 private _lows;
     /// @notice The address allowed to call `setBridge` and `setKeeper` exactly once each (wired: Parameters).
     address public bridgeSetter;
 
@@ -153,7 +160,7 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
     /// wave 1, panel 2: a minter burn of flash-minted imdUSD under-read it). Audit wave 2 (medium): real debt borrowed earlier in
     /// the transaction and repaid before its end still raised it, diluting a redemption's fee and base-rate rise (a 9,000
     /// redemption on a 90,000 supply paid 3% instead of 5% behind 90,000 of same-transaction debt).
-    function circulating() external view returns (uint256) {
+    function circulating() public view returns (uint256) {
         uint256 start;
         assembly ("memory-safe") {
             start := tload(TX_SUPPLY_SLOT)
@@ -161,21 +168,66 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
         return start == 0 ? totalSupply() : start - 1;
     }
 
-    /// @dev Record the supply before the transaction's first mint or burn (`circulating`). Flash mints are mints.
+    /// @notice What the Redeemer's fee ramp and base-rate rise divide by: min(`circulating()`, the lowest supply of the current
+    /// and the previous FEE_BASE_WINDOW bucket). Property (audit wave 3, medium): the fee base does not count debt that exists
+    /// only around a redemption. `circulating()` alone held only within one transaction, so borrow / redeem / repay as three
+    /// transactions of one block (or consecutive blocks) diluted the fee (a 9,000 redemption on a 90,000 supply paid 2.99%
+    /// instead of 5%). Debt now counts only once it has stood for a whole bucket (1-2 hours), which no bundle can fake.
+    /// Bound, not a guarantee: debt held through the window is indistinguishable from any other debt, so the cost of a
+    /// dilution is its upfront fee (7 days at the type's average rate) plus holding it 1-2 h across blocks with its price
+    /// risk. Supply that fell is counted at once (the lower figure: a higher fee), so a repay and re-borrow raises other
+    /// redeemers' fees for up to 2 h at the cost of an upfront fee. Before any supply was recorded it is `circulating()`.
+    function feeBase() external view returns (uint256) {
+        uint256 c = circulating();
+        uint256 rec = _lows;
+        uint256 b = block.timestamp / FEE_BASE_WINDOW;
+        uint256 rb = rec >> 224;
+        uint256 m;
+        if (rb == b) m = Math.min((rec >> 112) & LOW_MASK, rec & LOW_MASK);
+        else if (rb + 1 == b) m = Math.min((rec >> 112) & LOW_MASK, totalSupply());
+        else m = totalSupply();
+        return m == 0 || m > c ? c : m;
+    }
+
+    uint256 private constant LOW_MASK = (1 << 112) - 1;
+
+    /// @dev Record the supply before the transaction's first mint or burn (`circulating`), and the bucket lows (`feeBase`).
+    /// Flash mints are mints.
     function _update(address from, address to, uint256 value) internal override {
         if (from == address(0) || to == address(0)) {
+            uint256 pre = totalSupply();
             uint256 start;
             assembly ("memory-safe") {
                 start := tload(TX_SUPPLY_SLOT)
             }
             if (start == 0) {
-                uint256 mark = totalSupply() + 1;
+                uint256 mark = pre + 1;
                 assembly ("memory-safe") {
                     tstore(TX_SUPPLY_SLOT, mark)
                 }
             }
+            super._update(from, to, value);
+            _noteLow(pre, totalSupply());
+            return;
         }
         super._update(from, to, value);
+    }
+
+    /// @dev The supply moved from `pre` to `post`. Between mints and burns it is constant, so the lows are exact: a new bucket
+    /// starts at `pre`; the bucket before it is the old bucket's low when they are adjacent, else `pre` (constant through it).
+    function _noteLow(uint256 pre, uint256 post) private {
+        uint256 rec = _lows;
+        uint256 b = block.timestamp / FEE_BASE_WINDOW;
+        uint256 rb = rec >> 224;
+        uint256 cur = (rec >> 112) & LOW_MASK;
+        uint256 prev = rec & LOW_MASK;
+        if (rb != b || rec == 0) {
+            prev = rb + 1 == b && rec != 0 ? cur : Math.min(pre, LOW_MASK);
+            cur = Math.min(pre, LOW_MASK);
+        }
+        if (post < cur) cur = post;
+        uint256 next = (b << 224) | (cur << 112) | prev;
+        if (next != rec) _lows = next;
     }
 
     /// @dev OpenZeppelin's `flashLoan` with the in-flight counter around the callback. `maxFlashLoan` already subtracts

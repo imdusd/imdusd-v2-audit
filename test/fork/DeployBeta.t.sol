@@ -377,8 +377,8 @@ contract DeployBetaForkTest is Test {
         }
         assertEq(
             found,
-            10 + d.joins.length + _createdFeeds() + 3 + 1 + 2 + d.samplers.length + 4 + 5,
-            "every create accounted for (+ 3 seat contracts + PegLPVault + PositionNFT + ImdDepth + samplers + PricerOracle, 2 sleeves, Allocator + 5 peg)"
+            10 + 2 + d.joins.length + _createdFeeds() + 3 + 1 + 2 + d.samplers.length + 4 + 5,
+            "every create accounted for (+ 2 modules + 3 seat contracts + PegLPVault + PositionNFT + ImdDepth + samplers + PricerOracle, 2 sleeves, Allocator + 5 peg)"
         );
 
         // The Compound DEX hook's would-be address (same init code and mining rule as the script) is empty.
@@ -432,6 +432,8 @@ contract DeployBetaForkTest is Test {
             address(d.notes)
         ];
         for (uint256 i; i < core.length; ++i) if (a == core[i]) return true;
+        // Audit wave 3: the delegatecall modules are deployed by the script, not inside their parents' constructors.
+        if (a == address(d.params.rules()) || a == d.ledger.settlement()) return true;
         for (uint256 i; i < d.joins.length; ++i) if (a == address(d.joins[i])) return true;
         for (uint256 i; i < d.feeds.length; ++i) if (a == address(d.feeds[i])) return true;
         for (uint256 i; i < d.samplers.length; ++i) if (a == address(d.samplers[i])) return true;

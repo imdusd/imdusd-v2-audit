@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {System} from "../utils/System.sol";
@@ -150,7 +151,7 @@ contract FeeNotesTest is System {
 
     function test_genesisNotesChecks() public {
         // A fresh Parameters refuses a notes contract bound to another Parameters / token.
-        Parameters other = new Parameters(governor, address(this));
+        Parameters other = Modules.newParameters(governor, address(this));
         vm.expectRevert(ParametersBase.BadConfig.selector);
         other.setGenesisNotes(address(notes)); // token not wired yet
         MockERC20 tok = new MockERC20("x", 18);

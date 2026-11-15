@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import "forge-std/Test.sol";
 import {DeployTypes} from "script/DeployConfig.sol";
 import {StageGenesis} from "script/deploy/StageGenesis.sol";
@@ -63,7 +64,7 @@ contract AuditW2ResumeSamplersTest is Test {
 
     function test_resumedDepthStepListsTheSamplersItKeeps() public {
         RsStage.Deployed memory d;
-        d.params = new Parameters(makeAddr("gov"), address(h));
+        d.params = Modules.newParameters(makeAddr("gov"), address(h));
         d.feeds = new IFeed[](0);
         // Run 1 lists one exit pool's sampler A in ImdDepth (the run then stops later in stage 4, before the seal).
         d = h.depthStep(_cfg(1), d);

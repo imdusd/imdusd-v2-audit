@@ -2,8 +2,9 @@
 pragma solidity 0.8.26;
 
 /// @dev The slice of the Ledger a manager reads and calls. `ManagedPosition` is a PREFIX of LedgerBase.Position's ABI: the
-/// first seven fields, in order; Position's eighth (`uint32 version`) is not read. A field inserted ahead of these in
-/// Position would shift every read here.
+/// first seven fields, in order; Position's eighth and ninth (`uint32 version`, `uint192 yieldMark`) are not read. The
+/// PREFIX rule, not the field count, keeps these reads right: a field inserted ahead of these in Position would shift every
+/// read here.
 /// @dev Ledger.position's first fields, in its order (LedgerBase.Position).
 struct ManagedPosition {
     uint128 collateral;

@@ -22,6 +22,8 @@ import {CompoundSystem} from "../utils/CompoundSystem.sol";
 import {CdxRouter} from "../utils/DexMocks.sol";
 import {PoolRoute} from "./LoopVault.fork.t.sol";
 import {IFeed} from "../../src/interfaces/IFeed.sol";
+import {Pricer} from "../../src/Pricer.sol";
+import {IProven, IConverged} from "../../src/feeds/FeedTraits.sol";
 import {ParametersBase} from "../../src/ParametersBase.sol";
 import {Parameters} from "../../src/Parameters.sol";
 import {FeeNotes} from "../../src/peg/FeeNotes.sol";
@@ -104,6 +106,37 @@ contract DeployFullForkTest is CompoundSystem {
         _borrowEth(desk, 1_000e18, 1_000_000e18, 0.03e18);
     }
 
+    // ------------------------------------------------------------ price design C on the deployed graph
+
+    /// sIMD's spot leg is the proven pool price (x ETH/USD x share rate): it reports `proven`, the median does not. With the
+    /// legs agreeing borrowing is open; a wrong median (half the pool: a compromised attester or a wrong majority) cannot
+    /// liquidate below the proven price (the twin rule); a proven price far below an honest median cannot lower `low` below the median.
+    function test_designC_simdTwinRuleOnTheDeployedGraph() public {
+        ParametersBase.Config memory c = d.params.config(SIMD);
+        assertTrue(IProven(address(c.spot)).proven(), "spot proven");
+        assertFalse(IProven(address(c.median)).proven(), "median not proven");
+        assertTrue(IConverged(address(c.median)).converged());
+        _attest();
+        Pricer.Quote memory q = d.pricer.quote(SIMD);
+        assertTrue(q.priced && q.agree && q.borrowable, "legs agree at the pool");
+        (uint256 spot,) = c.spot.latestValue();
+        (uint256 median,) = c.median.latestValue();
+
+        (uint256 imdEth,) = d.feeds[MainnetConfig.F_IMD_LIVE].latestValue();
+        _leaf(MainnetConfig.F_IMD_MEDIAN, imdEth / 2);
+        q = d.pricer.quote(SIMD);
+        assertTrue(q.priced, "still priced: liquidation runs");
+        assertFalse(q.agree || q.borrowable, "no new debt while the legs disagree");
+        assertEq(q.low, spot, "liquidation at the proven price, not the wrong median");
+
+        _leaf(MainnetConfig.F_IMD_MEDIAN, imdEth);
+        address proven = address(d.feeds[MainnetConfig.F_IMD_PROVEN]);
+        vm.store(proven, bytes32(uint256(0)), bytes32(imdEth / 2)); // a pushed proven block, half the pool
+        q = d.pricer.quote(SIMD);
+        assertFalse(q.agree);
+        assertEq(q.low, median, "a pushed proven price cannot lower low below the median");
+    }
+
     // ------------------------------------------------------------ fork helpers
 
     function _existing(address f) internal pure returns (DeployTypes.FeedNode memory n) {
@@ -131,8 +164,8 @@ contract DeployFullForkTest is CompoundSystem {
         assertGt(d.imdDepth.depth(), 0, "measured depth after a keeper week");
     }
 
-    /// @dev Chainlink ETH/USD at its forked answer stamped now; v2's swarm leaves (sIMD's attested legs + NHI) fresh, at the
-    /// live pool (they deploy empty).
+    /// @dev Chainlink ETH/USD at its forked answer stamped now; v2's swarm leaves (sIMD's attested median + NHI) fresh, at the
+    /// live pool (they deploy empty); the proven spot (design C) at the live pool too.
     function _freshen() internal {
         // The depth reference (ProvenPoolPrice) is the keeper's end-of-block proof; a forge fork cannot produce a storage proof
         // that verifies, so stand in for the keeper's prove: the live pool price, dated now (storage: _value, then
@@ -151,7 +184,6 @@ contract DeployFullForkTest is CompoundSystem {
         if (d.feeds.length == 0) return; // setUp, before the deploy
         (uint256 imdEth,) = d.feeds[MainnetConfig.F_IMD_LIVE].latestValue();
         _leaf(MainnetConfig.F_IMD_MEDIAN, imdEth);
-        _leaf(MainnetConfig.F_IMD_SPOT, imdEth);
         _leaf(MainnetConfig.F_NHI, 0.98e18);
     }
 
@@ -170,7 +202,7 @@ contract DeployFullForkTest is CompoundSystem {
         );
     }
 
-    /// @dev The keeper's fresh attestation: sIMD's attested median and spot = the live IMD/ETH pool, now.
+    /// @dev The keeper's fresh attestation and proof: sIMD's attested median and proven spot = the live IMD/ETH pool, now.
     function _attest() internal {
         _freshen();
         seatMedian.set(seatMedian.value());

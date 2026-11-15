@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import "forge-std/Test.sol";
 import {Parameters} from "src/Parameters.sol";
 import {ParametersBase} from "src/ParametersBase.sol";
@@ -42,7 +43,7 @@ contract AuditW2LowerOtherImdTest is Test {
     bytes32 constant SIMD = "SIMD";
 
     function setUp() public {
-        params = new Parameters(gov, address(this));
+        params = Modules.newParameters(gov, address(this));
         address ledger = address(new OlStub());
         params.wire(ledger, address(new OlStub()));
         address t = address(new OlStub());

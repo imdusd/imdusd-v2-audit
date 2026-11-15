@@ -329,7 +329,7 @@ abstract contract ParametersBase is GovernedByKind {
     error OutOfBounds();
     error DepthRuleFails(uint256 need, uint256 room);
     /// @dev The end of a BATCH's dry run at propose (`Parameters.dryRun`): every item applied in order.
-    error DryRunOk();
+    error DryRunDone(uint256 failed);
 
     event IlkAdded(bytes32 indexed ilk, Config config);
     event RiskSet(bytes32 indexed ilk, Risk risk);

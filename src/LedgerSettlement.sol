@@ -17,8 +17,9 @@ import {Adjust, IHolderJoin} from "./interfaces/IPositions.sol";
 import {LedgerBase, IPulse, IRateSource, ISavingsAssets, IRevenueMeter} from "./LedgerBase.sol";
 
 /// @notice The Ledger's redemption, liquidation and write-off (size split). Runs ONLY by delegatecall from the
-/// Ledger that deployed it (`onlyLedger`), on that Ledger's storage, with the same immutables; a direct call reverts. Fixed
-/// at deployment: nothing here or in the Ledger can point it anywhere else.
+/// Ledger named at construction (`onlyLedger`; deployed just before it, at its predicted address: audit wave 3), on that
+/// Ledger's storage, with the same immutables; a direct call reverts. Fixed at deployment: nothing here or in the Ledger can
+/// point it anywhere else.
 contract LedgerSettlement is LedgerBase {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
@@ -42,9 +43,10 @@ contract LedgerSettlement is LedgerBase {
         address wirer_,
         IPulse pulse_,
         SortedPositions sorted_,
-        PositionNFT nft_
+        PositionNFT nft_,
+        address ledger_
     ) LedgerBase(token_, params_, pricer_, treasury_, wirer_, pulse_, sorted_, nft_) {
-        ledger = msg.sender;
+        ledger = ledger_;
     }
 
     // ================================================================ module actions (run by delegatecall from the Ledger)

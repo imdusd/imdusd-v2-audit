@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Modules} from "test/utils/Modules.sol";
 import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -71,11 +72,11 @@ contract AuditW2RedeemFeeBaseTest is Test {
     function setUp() public {
         vm.warp(1_800_000_000);
         usd = new ImdUSD(address(this), 100_000e18);
-        Parameters params = new Parameters(makeAddr("gov"), address(this));
+        Parameters params = Modules.newParameters(makeAddr("gov"), address(this));
         Pricer pricer = new Pricer(params);
         Treasury treasury = new Treasury(makeAddr("gov"), IERC20(address(usd)), address(this));
         PositionNFT nft = new PositionNFT(address(this));
-        ledger = new Ledger(usd, params, pricer, address(treasury), address(this), IPulse(address(0)), nft);
+        ledger = Modules.newLedger(usd, params, pricer, address(treasury), address(this), IPulse(address(0)), nft);
         nft.bind(address(ledger));
         redeemer = new Redeemer(ledger);
         ledger.wire(address(redeemer), address(new Liquidator(ledger, pricer)));

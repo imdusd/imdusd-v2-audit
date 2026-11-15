@@ -50,7 +50,6 @@ contract ProvenPoolPrice is IFeed {
 
     error InvalidConfig();
     error BadHeader();
-    error NotNewer(uint256 block, uint256 provenBlock);
     error BadAccount();
     error EmptySlot();
 
@@ -76,10 +75,18 @@ contract ProvenPoolPrice is IFeed {
         return _provenAt == 0 || block.timestamp > uint256(_provenAt) + maxAge;
     }
 
+    /// @notice The price is proven from Ethereum state, no attester in its path (FeedTraits.proven; the Pricer's twin rule).
+    function proven() external pure returns (bool) {
+        return true;
+    }
+
     // ---------------------------------------------------------------- prove
 
     /// @notice Prove the pool's price at the end of the block `header` describes. Anyone; the block must be one of the last
-    /// 256 and newer than the one held. The keeper calls this right before `DepthSampler.sample()` in the same bundle.
+    /// 256. The keeper calls this right before `DepthSampler.sample()` in the same bundle.
+    /// A block no newer than the one held is a NO-OP that returns the held value (audit wave 3, info: it reverted `NotNewer`,
+    /// so anyone proving the same block first made the keeper's atomic [prove, sample] bundle lose its hour). Nothing is
+    /// written and the proof is not read: the held block is the same or newer, so the price can never move backwards.
     function prove(bytes calldata header, bytes[] calldata accountProof, bytes[] calldata storageProof)
         external
         returns (uint256 value)
@@ -91,7 +98,7 @@ contract ProvenPoolPrice is IFeed {
         // blockhash is 0 for the current block and for blocks more than 256 back: either fails here.
         bytes32 bh = blockhash(number);
         if (bh == bytes32(0) || bh != keccak256(h)) revert BadHeader();
-        if (number <= provenBlock) revert NotNewer(number, provenBlock);
+        if (number <= provenBlock) return _value;
         bytes32 stateRoot = _toBytes32(RLPReader.readBytes(fields[H_STATE_ROOT]));
         uint256 timestamp = _toUint(RLPReader.readBytes(fields[H_TIMESTAMP]));
 

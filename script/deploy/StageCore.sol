@@ -4,6 +4,9 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ImdUSD} from "../../src/ImdUSD.sol";
 import {Parameters} from "../../src/Parameters.sol";
+import {ParametersRules} from "../../src/ParametersRules.sol";
+import {LedgerSettlement} from "../../src/LedgerSettlement.sol";
+import {SortedPositions} from "../../src/SortedPositions.sol";
 import {Pricer} from "../../src/Pricer.sol";
 import {Pulse} from "../../src/Pulse.sol";
 import {Treasury, ICoverable} from "../../src/Treasury.sol";
@@ -33,10 +36,18 @@ abstract contract StageCore is DeployBase {
             d.usd = new ImdUSD(me, cfg.flashCap);
             _rec("ImdUSD", g, type(ImdUSD).creationCode.length + 64);
         }
-        if (!(_has(address(d.params)) && _ok(d.params.wirer() == me && d.params.governor() == cfg.governor, "Parameters"))) {
+        if (
+            !(_has(address(d.params)) && _ok(d.params.wirer() == me && d.params.governor() == cfg.governor
+                    && _rulesAre(d.params.rules(), cfg.governor), "Parameters"))
+        ) {
+            // The rules module first, by the deployer (audit wave 3): Parameters takes its address. A fresh one for every new
+            // Parameters, so a resume never has to adopt a module nothing points at yet.
             g = gasleft();
-            d.params = new Parameters(cfg.governor, me);
-            _rec("Parameters", g, type(Parameters).creationCode.length + 64);
+            ParametersRules rules_ = new ParametersRules(cfg.governor);
+            _rec("ParametersRules", g, type(ParametersRules).creationCode.length + 32);
+            g = gasleft();
+            d.params = new Parameters(cfg.governor, me, rules_);
+            _rec("Parameters", g, type(Parameters).creationCode.length + 96);
         }
         if (!(_has(address(d.pricer)) && _ok(d.pricer.params() == d.params, "Pricer"))) {
             g = gasleft();
@@ -55,15 +66,25 @@ abstract contract StageCore is DeployBase {
         if (
             !(_has(address(d.ledger)) && _ok(d.ledger.token() == d.usd && d.ledger.params() == d.params && d.ledger.pricer() == d.pricer
                     && d.ledger.treasury() == address(d.treasury) && d.ledger.wirer() == me
-                    && address(d.ledger.pulse()) == address(d.pulse),
+                    && address(d.ledger.pulse()) == address(d.pulse) && _settlementIs(d.ledger),
                 "Ledger"))
         ) {
             g = gasleft();
             PositionNFT nft_ = new PositionNFT(me); // first, so the Ledger's creation code stays under EIP-3860
             _rec("PositionNFT", g, type(PositionNFT).creationCode.length + 32);
+            // The settlement module next, by the deployer, for the Ledger this deployer creates right after it and that
+            // Ledger's SortedPositions (its first creation) (audit wave 3); the Ledger checks the rest of its immutables.
+            address next = vm.computeCreateAddress(me, vm.getNonce(me) + 1);
             g = gasleft();
-            d.ledger = new Ledger(d.usd, d.params, d.pricer, address(d.treasury), me, IPulse(address(d.pulse)), nft_);
-            _rec("Ledger (+SortedPositions, LedgerSettlement)", g, type(Ledger).creationCode.length + 192);
+            LedgerSettlement s_ = new LedgerSettlement(
+                d.usd, d.params, d.pricer, address(d.treasury), me, IPulse(address(d.pulse)),
+                SortedPositions(vm.computeCreateAddress(next, 1)), nft_, next
+            );
+            _rec("LedgerSettlement", g, type(LedgerSettlement).creationCode.length + 288);
+            g = gasleft();
+            d.ledger = new Ledger(d.usd, d.params, d.pricer, address(d.treasury), me, IPulse(address(d.pulse)), nft_, s_);
+            _rec("Ledger (+SortedPositions)", g, type(Ledger).creationCode.length + 256);
+            require(address(d.ledger) == next && _settlementIs(d.ledger), "Ledger: not at the settlement module's address");
         }
         if (d.ledger.nft().ledger() == address(0)) {
             g = gasleft();
@@ -120,5 +141,18 @@ abstract contract StageCore is DeployBase {
         } else if (address(d.treasury.ledger()) != address(d.ledger)) {
             revert Mismatch("Treasury wired to another Ledger");
         }
+    }
+
+    /// @dev A Parameters' rules module is this build's ParametersRules serving `governor` (code: LaunchBase._checkRecordedCode).
+    function _rulesAre(ParametersRules r, address governor) internal view returns (bool) {
+        return _has(address(r)) && r.governor() == governor;
+    }
+
+    /// @dev A Ledger's settlement module carries that Ledger's immutables, including the two its address fixes.
+    function _settlementIs(Ledger l) internal view returns (bool) {
+        LedgerSettlement m = LedgerSettlement(l.settlement());
+        return _has(address(m)) && m.ledger() == address(l) && m.sorted() == l.sorted() && m.token() == l.token()
+            && m.params() == l.params() && m.pricer() == l.pricer() && m.treasury() == l.treasury() && m.wirer() == l.wirer()
+            && m.pulse() == l.pulse() && m.nft() == l.nft();
     }
 }

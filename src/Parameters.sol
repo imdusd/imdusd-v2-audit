@@ -17,11 +17,15 @@ import {ParametersRules} from "./ParametersRules.sol";
 /// Genesis types are registered by the deployer (`wirer`) before `seal()`, so a launch does not wait
 /// 48h per type; after sealing only the timelock can add one.
 contract Parameters is ParametersBase {
-    /// @notice The per-kind validate/apply module this contract delegate-calls (deployed here; fixed).
+    /// @notice The per-kind validate/apply module this contract delegate-calls (fixed).
     ParametersRules public immutable rules;
 
-    constructor(address governor_, address wirer_) ParametersBase(governor_, wirer_) {
-        rules = new ParametersRules(governor_);
+    /// @param rules_ The ParametersRules module, deployed beforehand by the deployer (audit wave 3: deployed here it put its
+    /// whole creation code in this contract's init code, 762 bytes under EIP-3860). It must serve the same governor (its
+    /// GovernedByKind immutable runs in this context); the deployment checks its code (DeployBase, Check.s.sol / verify.py).
+    constructor(address governor_, address wirer_, ParametersRules rules_) ParametersBase(governor_, wirer_) {
+        if (address(rules_).code.length == 0 || rules_.governor() != governor_) revert BadConfig();
+        rules = rules_;
     }
 
     function wire(address ledger_, address token_) external {
@@ -112,11 +116,12 @@ contract Parameters is ParametersBase {
         emit OtherImdSet(otherLines, otherChop);
     }
 
-    /// @notice The measured IMD depth at genesis. Only before `seal`; once set the posted figure is only a cap.
+    /// @notice The measured IMD depth at genesis. Only before `seal`, and once (audit wave 3, low: a second call
+    /// re-pointed it); once set the posted figure is only a cap.
     function setGenesisImdDepth(address imdDepth_, address[] calldata samplers) external {
         if (msg.sender != wirer) revert Unauthorized();
         if (sealed_) revert Sealed();
-        if (imdDepth_.code.length == 0 || IImdDepth(imdDepth_).params() != address(this)) revert BadConfig();
+        if (address(imdDepth) != address(0) || imdDepth_.code.length == 0 || IImdDepth(imdDepth_).params() != address(this)) revert BadConfig();
         imdDepth = IImdDepth(imdDepth_);
         for (uint256 i; i < samplers.length; ++i) IImdDepth(imdDepth_).addSampler(samplers[i]);
         emit ImdDepthSet(imdDepth_);
@@ -319,14 +324,14 @@ contract Parameters is ParametersBase {
     /// instant risk-reducing acts (the `lower*` functions, `postLowerDepth`, `removeDepthSampler`, `disableSleeveIlk`).
     function seal() external {
         if (msg.sender != wirer) revert Unauthorized();
-        if (sealed_) revert Sealed(); // one-shot: a second seal would restart every type's redemption fee at the cap
+        if (sealed_) revert Sealed(); // one-shot: a second seal would restart every type's redemption base rate
         if (ledger == address(0)) revert BadConfig();
         sealed_ = true;
         sealedAt = uint64(block.timestamp);
     }
 
     /// @notice When a type went live: the seal for a genesis type, its addition for a later one; 0 before the seal.
-    /// The Redeemer starts each type's redemption base rate at its cap from this moment (launch at the cap).
+    /// The Redeemer starts each type's redemption base rate at LISTING_BASE (0.5%) from this moment (audit wave 2; it was the cap).
     function listedAt(bytes32 ilk) external view returns (uint256) {
         if (!sealed_) return 0;
         uint256 a = _addedAt[ilk];
@@ -406,32 +411,66 @@ contract Parameters is ParametersBase {
 
     // ---------------------------------------------------------------- governance (in ParametersRules)
 
-    /// @notice A BATCH's check at propose (audit wave 2, low: two ADD_ILK of one type, two SET_KEEPER, two sleeve listings
-    /// past MAX_TOKENS each passed propose against the state before the batch and always failed at apply). Dry-run the items
-    /// in order, rolled back; if item i fails there but would apply alone, an earlier item broke it: refused (BadConfig). One
-    /// that fails alone too is waiting on state (a retire before its feed stops, a line before its depth), as a single
-    /// proposal may: allowed. Only this contract may call it (ParametersRules' BATCH check runs in this context).
+    /// @notice A BATCH's check at propose. Property (audit waves 2 and 3, low): every item is checked against the items before
+    /// it, and the check fits one transaction. ONE in-order dry run, rolled back: each item is validated and applied on the
+    /// state the earlier items left, and an item that fails there is skipped (its own frame is rolled back) and recorded.
+    /// Then each recorded item is dry-run ALONE against the state before the batch: if it applies alone, an earlier item
+    /// broke it: refused (BadConfig); if it fails alone too it is waiting on state (a retire before its feed stops, a line
+    /// before its depth), as a single proposal may: allowed. At most n + (failures) item applications (wave 2's version
+    /// re-ran every prefix: quadratic, 17.85M gas for 8 items, and it stopped at the first waiting item).
+    /// Residual: a waiting item is skipped in the dry run, so a later item that only the waiting item (once applicable)
+    /// would break is not caught at propose; the apply then reverts as a whole and the Safe cancels.
+    /// Only this contract may call it (ParametersRules' BATCH check runs in this context).
     function checkBatch(bytes[] calldata items) external {
         if (msg.sender != address(this)) revert Unauthorized();
-        if (_dry(items, 0, items.length)) return;
-        uint256 n = 1;
-        while (_dry(items, 0, n)) ++n;
-        if (_dry(items, n - 1, n)) revert BadConfig();
-    }
-
-    /// @notice Validate and apply `items[from..to)` in order and always revert: `DryRunOk` when every one applied. Self only.
-    function dryRun(bytes[] calldata items, uint256 from, uint256 to) external {
-        if (msg.sender != address(this)) revert Unauthorized();
-        for (uint256 i = from; i < to; ++i) {
-            _validate(items[i]);
-            _apply(items[i]);
+        uint256 all = (uint256(1) << items.length) - 1;
+        uint256 failed = _dry(items, 0);
+        for (uint256 i; failed != 0; ++i) {
+            uint256 bit = uint256(1) << i;
+            if (failed & bit == 0) continue;
+            failed &= ~bit;
+            if (_dry(items, all & ~bit) == 0) revert BadConfig();
         }
-        revert DryRunOk();
     }
 
-    function _dry(bytes[] calldata items, uint256 from, uint256 to) private returns (bool) {
-        (, bytes memory ret) = address(this).call(abi.encodeCall(this.dryRun, (items, from, to)));
-        return ret.length == 4 && bytes4(ret) == DryRunOk.selector;
+    /// @notice Validate and apply, in order, every item whose bit is clear in `skip`, skipping (rolling back) any that fails;
+    /// always revert `DryRunDone(failed)`, the bit set of items that failed. Self only.
+    function dryRun(bytes[] calldata items, uint256 skip) external {
+        if (msg.sender != address(this)) revert Unauthorized();
+        uint256 failed;
+        for (uint256 i; i < items.length; ++i) {
+            if (skip & (uint256(1) << i) != 0) continue;
+            if (
+                !_try(abi.encodeCall(ParametersRules.validateKind, (items[i])))
+                    || !_try(abi.encodeCall(ParametersRules.applyKind, (items[i])))
+            ) failed |= uint256(1) << i;
+        }
+        revert DryRunDone(failed);
+    }
+
+    /// @dev The failed set of a dry run; anything but `DryRunDone` (out of gas, a revert outside the items) is all failed.
+    function _dry(bytes[] calldata items, uint256 skip) private returns (uint256) {
+        (, bytes memory ret) = address(this).call(abi.encodeCall(this.dryRun, (items, skip)));
+        if (ret.length != 36 || bytes4(ret) != DryRunDone.selector) return type(uint256).max;
+        uint256 failed;
+        assembly ("memory-safe") {
+            failed := mload(add(ret, 36))
+        }
+        return failed;
+    }
+
+    /// @dev Run `data` in ParametersRules on this contract's storage; false (its changes rolled back) if it reverts.
+    function _try(bytes memory data) private returns (bool ok) {
+        address m = address(rules);
+        assembly ("memory-safe") {
+            ok := delegatecall(gas(), m, add(data, 0x20), mload(data), 0, 0)
+        }
+    }
+
+    /// @dev At application a BATCH is not dry-run again: its apply validates and applies each item in order and reverts as a
+    /// whole on the first that fails (audit wave 3: the re-run doubled the apply's gas).
+    function _validateAtApply(bytes memory payload) internal override {
+        if (abi.decode(payload, (uint8)) != BATCH) _validate(payload);
     }
 
     function _validate(bytes memory payload) internal override {
