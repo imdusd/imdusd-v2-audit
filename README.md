@@ -102,6 +102,25 @@ anything you rely on with solc. Fork suites without their RPC variable skip. The
 (`Robinhood*.t.sol`) need `ROBINHOOD_RPC_URL`; every other fork file needs `MAINNET_RPC_URL` (an archive node for the
 files that pin a block).
 
+## Audit history
+
+Every review of v2 so far, oldest first. The public audits are IdentityMD swarm panel audits bought on this repository:
+each panel is four specialists (math, permissions, economics, control flow) and a judge who rules on their findings.
+Counts below are the **judges'** findings (critical / high / medium / low / info); specialists' raw findings are more
+and are folded into the judges'. None of these is a third-party audit firm.
+
+| # | Date | Review | Code | Jobs | Judges' findings (C/H/M/L/I) | Fixes |
+|---|---|---|---|---|---|---|
+| 0 | 2026-10-30 | In-house adversarial review of the full v2 tree (eleven areas, with PoCs and economic models) | private tree `dd776c7` | in-house | 1 / 4 / 19 / 33 / ~60 | Resolved 2026-10-31 before the first snapshot: the critical, every high and most mediums fixed with regression tests that fail on `dd776c7` (37 fixed, 7 settled by decision, 16 left open with reasons). |
+| 1 | 2026-11-10 | Public audit, wave 1: eight panels (ledger and liquidation, treasury and backstop, oracles and depth, governance, peg, seats, deploy, full system) | `2875ffb` | [`59d97f98`](https://explorer.imd.fun/jobs/59d97f98-3694-4e00-9c77-f2195bd39818) [`584aadc2`](https://explorer.imd.fun/jobs/584aadc2-a902-47dd-b639-e46a8223a277) [`bd0ce553`](https://explorer.imd.fun/jobs/bd0ce553-aab0-46da-be9b-00db8049dbd7) [`cd9184ac`](https://explorer.imd.fun/jobs/cd9184ac-e25e-4415-8605-194bf21e3501) [`561e7d5b`](https://explorer.imd.fun/jobs/561e7d5b-d64f-4233-9443-9761bd51546c) [`3d73817d`](https://explorer.imd.fun/jobs/3d73817d-9b86-45c4-b371-4e179fb3bb38) [`17e4edf1`](https://explorer.imd.fun/jobs/17e4edf1-6697-4353-9311-12eb9ca61aab) [`4384ebcc`](https://explorer.imd.fun/jobs/4384ebcc-37f4-4bc3-8e2b-fc48f01f0701) | 0 / 0 / 6 / 31 / 43 | In `5de80a6`; tests `AuditW1*`. 57 of the 58 Foundry proofs reproduced before fixing. |
+| 2 | 2026-11-13 | Public audit, wave 2: three panels (money paths, prices, running the system), each re-checking the wave-1 fixes | `5de80a6` | [`5fcd4063`](https://explorer.imd.fun/jobs/5fcd4063-312b-4b6f-aa7b-e848428876a7) [`5a8d427d`](https://explorer.imd.fun/jobs/5a8d427d-7b2d-401b-b11d-86ecf5b96364) [`62b92eb1`](https://explorer.imd.fun/jobs/62b92eb1-7472-440c-ad76-2e55e66a1f65) | 0 / 1 / 3 / 8 / 5 | In `c64ecee`; tests `AuditW2*`. |
+| 3 | 2026-11-14 | Public audit, wave 3: three panels re-checking the wave-2 fixes (Allocator, Backstop, imdUSD; SwarmFeed and seats; Parameters and depth); a gas review alongside | `c64ecee` | [`f3a96d58`](https://explorer.imd.fun/jobs/f3a96d58-3fc2-418b-b2e9-cd72c50fd656) [`ff9ebb9d`](https://explorer.imd.fun/jobs/ff9ebb9d-f675-492e-84e4-32cf85c0375a) [`b19b5e0c`](https://explorer.imd.fun/jobs/b19b5e0c-704e-4104-a012-f4a8bfc22b72) | 0 / 0 / 4 / 6 / 7 | In `67eadea` (this snapshot); tests `AuditW3*`, each with a property test that fails on `c64ecee`. |
+| 4 | 2026-11-15 | Public audit, wave 4: price design C, the LayerZero bridge, Robinhood stock tokens | `67eadea` | [`0cb1541e`](https://explorer.imd.fun/jobs/0cb1541e-5d63-4866-815a-425703d326e1) [`34e546c2`](https://explorer.imd.fun/jobs/34e546c2-837d-46c9-8a21-0671ec934a8b) [`549dae1c`](https://explorer.imd.fun/jobs/549dae1c-abf5-4fad-9d13-d4571492dd9b) | price 0 / 0 / 2 / 4 / 0; bridge 0 / 2 / 1 / 9 / 2; stocks 0 / 2 / 2 / 4 / 1 | Every finding reproduced and fixed on branches, each with a property test. **Not yet in this snapshot**: they land in the next wave's snapshot. |
+| 4k | 2026-11-15 | Public audit of the v2 keeper (an off-chain process with no on-chain rights), in [imdusd/imdusd-v2-keeper-audit](https://github.com/imdusd/imdusd-v2-keeper-audit) | `e53d362` | [`ae48df88`](https://explorer.imd.fun/jobs/ae48df88-ca87-40e8-b8c2-5ed739b81de5) | 0 / 2 / 8 / 2 / 1 | Fixed on a branch, with the judge's 12 proofs kept as regression tests; not yet published. |
+
+The "Known issues" and "What changed since" sections below list, wave by wave, what each audit found that we accept and
+what each snapshot changed.
+
 ## Audit scope
 
 nSLOC per area: Solidity source lines left after removing `//` and `/* */` comments and blank lines, counted per file
