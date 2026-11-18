@@ -78,8 +78,13 @@ contract StocksTest is StockSystem {
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         cal.applyPending();
         assertFalse(cal.isOpen(MON_1400 + 3 days), "a new closure");
-        // a weekend day is refused at application; a day that has passed by then is refused too
+        // a weekend day is refused at propose (audit wave 4: it used to pass propose and fail at apply)
         list[0] = uint32(SAT_1500 / 1 days) + 7;
+        vm.prank(governor);
+        vm.expectRevert(abi.encodeWithSelector(MarketCalendar.BadDay.selector, list[0]));
+        cal.propose(abi.encode(uint8(1), uint8(1), list));
+        // a day that has passed by the time the change applies is refused at apply
+        list[0] = uint32(vm.getBlockTimestamp() / 1 days) + 1;
         vm.prank(governor);
         cal.propose(abi.encode(uint8(1), uint8(1), list));
         vm.warp(vm.getBlockTimestamp() + 48 hours);
@@ -102,7 +107,9 @@ contract StocksTest is StockSystem {
         _price(97e8);
         assertTrue(mhf.isStale(), "Sunday night prints never price");
         vm.warp(NEXT_MON_OPEN);
-        assertFalse(mhf.isStale(), "Monday 09:30, feed 13.5h old");
+        assertTrue(mhf.isStale(), "Monday 09:30: the Sunday-night print does not price the open (audit wave 4, P1)");
+        vm.warp(NEXT_MON_OPEN + mhf.OPEN_GRACE());
+        assertFalse(mhf.isStale(), "Monday 09:35, no print since: the standing answer, 13.6h old, prices");
         (uint256 v,) = mhf.latestValue();
         assertEq(v, 97e18);
     }
@@ -152,8 +159,12 @@ contract StocksTest is StockSystem {
         assertTrue(mhf.frozen(), "scheduled: pending");
         vm.warp(vm.getBlockTimestamp() + 1 days);
         assertTrue(mhf.frozen(), "in effect, the feed has not published since");
+        vm.warp(vm.getBlockTimestamp() + 1);
         _price(100e8);
-        assertTrue(mhf.frozen(), "an answer in the same second may predate the change");
+        assertTrue(mhf.frozen(), "in effect and printed since, but not yet recorded by sync (audit wave 4)");
+        mhf.sync();
+        _price(100e8);
+        assertTrue(mhf.frozen(), "an answer in the same second as the sync may predate the change");
         vm.warp(vm.getBlockTimestamp() + 1);
         _price(100e8);
         assertFalse(mhf.frozen(), "re-priced at the new multiplier");
@@ -169,6 +180,7 @@ contract StocksTest is StockSystem {
 
     function test_valuationIsBalanceTimesPriceNotTimesMultiplier() public {
         stock.scheduleMultiplier(1.05e18, vm.getBlockTimestamp()); // 5% of dividends folded into the multiplier already
+        mhf.sync();
         vm.warp(vm.getBlockTimestamp() + 1);
         _price(105e8); // the feed prices the TOKEN: share $100 x 1.05
         _open(alice, 10e18, 0);

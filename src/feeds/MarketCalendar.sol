@@ -11,8 +11,9 @@ import {Governed} from "../Governed.sol";
 ///  - DATA: exchange holidays and early closes, which no rule predicts (Good Friday, national days of mourning). Seeded at
 ///    construction from NYSE's published calendar; extended or corrected only through the 48h timelock, and only for days
 ///    that are still in the future when the change applies, so no session that has begun (or has been priced against) is
-///    ever reclassified. A wrong entry can only freeze stock types for a day (closed) or leave them to the feed's own
-///    freshness rule (open), never move a price.
+///    ever reclassified, except by `closeDay` (governor, no delay, today to 3 days ahead, CLOSED only), which can only
+///    freeze. A wrong entry can only freeze stock types for a day (closed) or leave them to the feed's own freshness rule
+///    (open), never move a price.
 ///  - A calendar that runs out (no entries after the last seeded year) treats every weekday as open: the Chainlink feeds'
 ///    own heartbeat and the per-feed freshness bound remain. The Safe extends it each year (NYSE publishes ~3 years ahead).
 contract MarketCalendar is Governed {
@@ -50,6 +51,25 @@ contract MarketCalendar is Governed {
         uint256 minute = (ts % 1 days) / 60;
         uint256 close = status == EARLY_CLOSE ? EARLY_MINUTE : CLOSE_MINUTE;
         return minute >= OPEN_MINUTE + offset && minute < close + offset;
+    }
+
+    /// @notice When the regular session opens (09:30 New York) on UTC day `day`, whether or not the day trades.
+    function openAt(uint256 day) public pure returns (uint256) {
+        uint256 offset = isDst(day) ? 4 * 60 : 5 * 60;
+        return day * 1 days + (OPEN_MINUTE + offset) * 60;
+    }
+
+    /// @notice How far ahead `closeDay` reaches: a closure announced on a Friday evening for the Monday.
+    uint256 public constant FAST_CLOSE_DAYS = 3;
+
+    /// @notice Close a weekday from today to `FAST_CLOSE_DAYS` ahead at once (governor; audit wave 4, low): an unscheduled
+    /// closure the exchange announces at short notice (2012-10-29/30 was announced the evening before) cannot wait 48 h. It
+    /// can only CLOSE, so it can only freeze stock types (a closed day is unpriced), never price one or move a close. It may
+    /// close a session that has begun: that too only freezes.
+    function closeDay(uint32 day) external onlyGovernor {
+        uint256 today = block.timestamp / 1 days;
+        if (day < today || day > today + FAST_CLOSE_DAYS) revert BadDay(day);
+        _set(day, CLOSED);
     }
 
     function isOpenNow() external view returns (bool) {
@@ -98,7 +118,9 @@ contract MarketCalendar is Governed {
         if (list.length == 0 || list.length > MAX_DAYS) revert BadDay(0);
         uint256 today = block.timestamp / 1 days;
         for (uint256 i; i < list.length; ++i) {
-            if (list[i] <= today) revert BadDay(list[i]);
+            // a weekend day is refused here too (audit wave 4, low), not only at apply: a list propose accepts always applies
+            uint256 wd = (uint256(list[i]) + 4) % 7;
+            if (list[i] <= today || wd == 0 || wd == 6) revert BadDay(list[i]);
         }
     }
 

@@ -22,6 +22,7 @@ interface IRateSource {
 
 interface IPulse {
     function poke() external;
+    function inGrace() external view returns (bool);
 }
 
 interface ISavingsAssets {
@@ -188,6 +189,8 @@ abstract contract LedgerBase is TransientReentrancyGuard {
     error GroupLineExceeded();
     error NotWorthless();
     error WriteOffTooSoon(uint256 at);
+    /// @notice A seizure (writeOff) inside the Pulse's sequencer grace (wave 5): it waits, as liquidation and redemption do.
+    error SequencerGrace();
     error UpfrontFeeTooHigh(uint256 fee);
     error UnknownPosition();
     error WrongType();
@@ -241,10 +244,15 @@ abstract contract LedgerBase is TransientReentrancyGuard {
 
     /// @dev The type's quote, or an unpriced one if a feed reverts outright: repayment and deposits never need a price, so
     /// a broken feed must not block them. Everything that needs a price checks `priced`/`borrowable` and still refuses.
+    /// NEW DEBT WAITS OUT THE SEQUENCER GRACE (fixed before audit wave 5, Aave's sentinel): on a chain with a Pulse, `borrowable` reads
+    /// false while the chain is down or inside the grace after it (`inGrace` also counts a silence no poke has ended yet),
+    /// so a borrow, a withdrawal that leaves debt and a charged rate change are refused as seizure and redemption are;
+    /// repayment, deposits and debt-free actions never read `borrowable`.
     function _quote(bytes32 ilk) internal view returns (Pricer.Quote memory q) {
         try pricer.quote(ilk) returns (Pricer.Quote memory got) {
             q = got;
         } catch {}
+        if (address(pulse) != address(0) && pulse.inGrace()) q.borrowable = false;
     }
 
     /// @notice The collateral type of a position (zero: no such position).

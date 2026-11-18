@@ -72,6 +72,23 @@ abstract contract SwarmNhiPolicy is SwarmFeed {
     function questionPolicy() internal pure override returns (bytes memory, uint64, uint64) {
         return (SwarmQuestions.NHI, SwarmQuestions.NHI_MIN_SPAN, SwarmQuestions.NHI_MAX_SPAN);
     }
+
+    /// @dev NO STALE WIDENING (audit wave 4, medium). NHI sets sIMD's liquidation mat (Pricer._mat) and has no trustless twin,
+    /// so one attestation after a silence must not move it two caps: with the 2x band, one signed value after a 25 h silence
+    /// moved NHI 0.98 -> 0.588 and mat 1.7 -> 2.0 at once. Now every epoch, silent or not, moves NHI at most one cap from its
+    /// anchor (one attester, any sequence). A genuine NHI gap after a silence is followed at the cap per epoch (a day), and
+    /// borrowing waits for convergence meanwhile (the Pricer's convergence rule).
+    function _staleMultiple() internal pure override returns (uint256) {
+        return 1;
+    }
+
+    /// @dev ONE CAP PER WINDOW OF TIME, NOT PER EPOCH (fixed before audit wave 5). Epochs abut, so one cap per epoch still let an
+    /// attestation at an epoch's last second and another at the next one's first move NHI two caps one second apart
+    /// (0.85 -> 0.68 -> 0.544, mat 1.7 -> 2.0). Carrying the previous anchor keeps every window of one day within one cap
+    /// of a value NHI held in the day before it (SwarmFeed._carryNow; test/unit/AuditW5NhiWindow.t.sol).
+    function _carriesAnchor() internal pure override returns (bool) {
+        return true;
+    }
 }
 
 /// @notice IMD/ETH median (wei of ETH per 1e18 IMD) over a mainnet window, for any consumer chain. Signer, answer type and

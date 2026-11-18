@@ -5,10 +5,20 @@ import {MessagingParams, MessagingReceipt, MessagingFee, Origin} from "layerzero
 import {SetConfigParam} from "layerzero-v2/protocol/interfaces/IMessageLibManager.sol";
 import {ILayerZeroReceiver} from "layerzero-v2/protocol/interfaces/ILayerZeroReceiver.sol";
 
-/// @notice A LayerZero EndpointV2 stand-in for two chains in one EVM: `send` queues a packet (in flight), `deliver` hands it to
-/// the destination endpoint, which calls the receiver's `lzReceive` AS that endpoint. A reverting delivery leaves the packet
-/// in flight, retryable, as the real endpoint stores a verified payload until `lzReceive` succeeds. What is NOT modelled:
-/// DVN verification, the executor, nonce ordering (ImdBridge is unordered), fees beyond a flat native fee.
+/// @notice A LayerZero EndpointV2 stand-in for two chains in one EVM: `send` queues a packet and the (honest) DVNs verify it
+/// at the destination at once; `deliver` executes it there as EndpointV2.lzReceive does (permissionless). A reverting
+/// delivery leaves the payload stored, retryable.
+/// @dev Wave 4 (audit 34e546c2): the INBOUND CHANNEL now follows EndpointV2's MessagingChannel, checked against the real
+/// endpoint 0x1a44…728c on a mainnet fork (test/fork/AuditW4BridgeEndpoint.t.sol), where the old mock disagreed:
+///  - nonces are per path (sender, dstEid, receiver); executing nonce n needs every nonce in (lazyInboundNonce, n) to hold
+///    a payload hash, and moves lazyInboundNonce to n;
+///  - `verify` is allowed for any nonce above lazyInboundNonce, or at/below it while a hash is stored, and OVERWRITES the
+///    stored hash (so a forged payload can replace a waiting honest one, and an executed nonce can never be verified again);
+///  - `nilify` stores NIL (0xff..ff), which stays verifiable: the DVNs (honest or compromised) can verify any payload there
+///    again; `burn` needs a stored, non-empty hash at a nonce <= lazyInboundNonce; `skip` only the nonce after
+///    `inboundNonce` (the first with no hash);
+///  - pinning the library already pinned reverts (LZ_SameValue).
+/// Not modelled: DVN signatures and ULN configs (recorded, not enforced), the executor, real fees, receive-library grace.
 contract MockLzEndpoint {
     struct Packet {
         uint32 dstEid;
@@ -23,18 +33,33 @@ contract MockLzEndpoint {
 
     uint32 public immutable eid;
     uint256 public constant FEE = 0.0001 ether;
+    bytes32 public constant NIL_PAYLOAD_HASH = bytes32(type(uint256).max);
 
     mapping(uint32 eid => MockLzEndpoint) public remotes;
     Packet[] public packets;
+    /// @notice The nonce of the last packet queued here (sent or forged).
     uint64 public nonce;
+    /// @notice Source side: the last nonce sent on each path, and the last nonce a forger claimed on it.
+    mapping(bytes32 sender => mapping(uint32 dstEid => mapping(bytes32 receiver => uint64))) public sentNonce;
+    mapping(bytes32 sender => mapping(uint32 dstEid => mapping(bytes32 receiver => uint64))) public forgedNonce;
+
+    // destination side: EndpointV2's MessagingChannel
+    mapping(address receiver => mapping(uint32 srcEid => mapping(bytes32 sender => uint64))) public lazyInboundNonce;
+    mapping(address receiver => mapping(uint32 srcEid => mapping(bytes32 sender => mapping(uint64 => bytes32)))) public
+        inboundPayloadHash;
 
     // what the OApp configured through `setConfig` & co (recorded, not enforced)
     mapping(address oapp => uint256) public configCalls;
     mapping(address oapp => mapping(uint32 eid => address)) public sendLibrary;
     mapping(address oapp => mapping(uint32 eid => address)) public receiveLibrary;
+    mapping(address oapp => mapping(uint32 eid => uint256)) public receiveGrace;
 
     error InsufficientFee();
     error NotRemote();
+    error LZ_InvalidNonce(uint64 nonce);
+    error LZ_PayloadHashNotFound(bytes32 expected, bytes32 actual);
+    error LZ_SameValue();
+    error LZ_InvalidPayloadHash();
 
     constructor(uint32 eid_) {
         eid = eid_;
@@ -50,9 +75,13 @@ contract MockLzEndpoint {
 
     function send(MessagingParams calldata p, address refund) external payable returns (MessagingReceipt memory r) {
         if (msg.value < FEE) revert InsufficientFee();
-        uint64 n = ++nonce;
-        bytes32 guid = keccak256(abi.encodePacked(n, eid, msg.sender, p.dstEid, p.receiver));
-        packets.push(Packet(p.dstEid, p.receiver, bytes32(uint256(uint160(msg.sender))), n, guid, p.message, p.options, false));
+        bytes32 sender = bytes32(uint256(uint160(msg.sender)));
+        uint64 n = ++sentNonce[sender][p.dstEid][p.receiver];
+        nonce = n;
+        bytes32 guid = keccak256(abi.encodePacked(n, eid, sender, p.dstEid, p.receiver)); // GUID.generate
+        packets.push(Packet(p.dstEid, p.receiver, sender, n, guid, p.message, p.options, false));
+        // the honest DVNs verify it at the destination (fails if a forged packet already executed at this nonce)
+        remotes[p.dstEid].verify(Origin(eid, sender, n), _addr(p.receiver), keccak256(abi.encodePacked(guid, p.message)));
         if (msg.value > FEE) {
             (bool ok,) = refund.call{value: msg.value - FEE}("");
             ok;
@@ -60,62 +89,125 @@ contract MockLzEndpoint {
         r = MessagingReceipt(guid, n, MessagingFee(FEE, 0));
     }
 
-    /// @notice Hand packet `i` to its destination. Returns false (and keeps it in flight) if the receiver reverted.
+    /// @notice A packet a compromised DVN set verified: claims to come from `sender` on this endpoint's chain, at the first
+    /// nonce above both what the real sender has sent and what was forged before on the path (test stand-in).
+    function forge(uint32 dstEid, bytes32 receiver, bytes32 sender, bytes calldata message) external returns (uint256 i) {
+        uint64 s = sentNonce[sender][dstEid][receiver];
+        uint64 f = forgedNonce[sender][dstEid][receiver];
+        i = forgeAt(dstEid, receiver, sender, message, (s > f ? s : f) + 1);
+    }
+
+    /// @notice The same at a chosen nonce (e.g. one an honest packet is waiting at: the forged hash overwrites it).
+    function forgeAt(uint32 dstEid, bytes32 receiver, bytes32 sender, bytes calldata message, uint64 n)
+        public
+        returns (uint256 i)
+    {
+        if (n > forgedNonce[sender][dstEid][receiver]) forgedNonce[sender][dstEid][receiver] = n;
+        nonce = n;
+        bytes32 guid = keccak256(abi.encodePacked("forged", n, sender, dstEid, receiver, message));
+        packets.push(Packet(dstEid, receiver, sender, n, guid, message, "", false));
+        i = packets.length - 1;
+        remotes[dstEid].verify(Origin(eid, sender, n), _addr(receiver), keccak256(abi.encodePacked(guid, message)));
+    }
+
+    /// @notice The DVNs verify packet `i` again (after a nilify, or over a forged overwrite). False if not verifiable.
+    function reverify(uint256 i) external returns (bool) {
+        Packet storage p = packets[i];
+        return remotes[p.dstEid].verify(
+            Origin(eid, p.sender, p.nonce), _addr(p.receiver), keccak256(abi.encodePacked(p.guid, p.message))
+        );
+    }
+
+    /// @notice Execute packet `i` at its destination (EndpointV2.lzReceive, permissionless). False (state unchanged) if the
+    /// receiver reverted or the channel refused it.
     function deliver(uint256 i) external returns (bool ok) {
         Packet storage p = packets[i];
         if (p.delivered) return true;
-        ok = remotes[p.dstEid].receivePacket(Origin(eid, p.sender, p.nonce), p.receiver, p.guid, p.message);
-        if (ok) p.delivered = true;
-    }
-
-    function receivePacket(Origin calldata origin, bytes32 receiver, bytes32 guid, bytes calldata message)
-        external
-        returns (bool ok)
-    {
-        if (address(remotes[origin.srcEid]) != msg.sender) revert NotRemote();
-        address to = address(uint160(uint256(receiver)));
-        if (!ILayerZeroReceiver(to).allowInitializePath(origin)) return false;
-        if (voided[to][origin.srcEid][origin.sender][origin.nonce] != 0) return false;
-        try ILayerZeroReceiver(to).lzReceive(origin, guid, message, address(this), "") {
+        try remotes[p.dstEid].lzReceive(Origin(eid, p.sender, p.nonce), _addr(p.receiver), p.guid, p.message, "") {
+            p.delivered = true;
             ok = true;
-        } catch {
-            ok = false;
+        } catch {}
+    }
+
+    function payloadHashOf(uint256 i) external view returns (bytes32) {
+        return keccak256(abi.encodePacked(packets[i].guid, packets[i].message));
+    }
+
+    function originOf(uint256 i) external view returns (Origin memory) {
+        return Origin(eid, packets[i].sender, packets[i].nonce);
+    }
+
+    // ---------------------------------------------------------------- destination: EndpointV2 + MessagingChannel
+
+    /// @notice A receive library's commit (EndpointV2.verify), for DVN stand-ins: false where the real one reverts.
+    function verify(Origin calldata o, address receiver, bytes32 payloadHash) public returns (bool) {
+        if (payloadHash == bytes32(0)) revert LZ_InvalidPayloadHash();
+        uint64 lazy = lazyInboundNonce[receiver][o.srcEid][o.sender];
+        if (lazy == 0 && !ILayerZeroReceiver(receiver).allowInitializePath(o)) return false; // LZ_PathNotInitializable
+        if (!_verifiable(o, receiver, lazy)) return false; // LZ_PathNotVerifiable
+        inboundPayloadHash[receiver][o.srcEid][o.sender][o.nonce] = payloadHash;
+        return true;
+    }
+
+    function verifiable(Origin calldata o, address receiver) external view returns (bool) {
+        return _verifiable(o, receiver, lazyInboundNonce[receiver][o.srcEid][o.sender]);
+    }
+
+    function _verifiable(Origin calldata o, address receiver, uint64 lazy) internal view returns (bool) {
+        return o.nonce > lazy || inboundPayloadHash[receiver][o.srcEid][o.sender][o.nonce] != bytes32(0);
+    }
+
+    /// @notice EndpointV2.lzReceive: clear the payload (lazy nonce rules), then call the receiver; any revert undoes both.
+    function lzReceive(Origin calldata o, address receiver, bytes32 guid, bytes calldata message, bytes calldata extra)
+        external
+        payable
+    {
+        _clearPayload(receiver, o.srcEid, o.sender, o.nonce, abi.encodePacked(guid, message));
+        ILayerZeroReceiver(receiver).lzReceive{value: msg.value}(o, guid, message, msg.sender, extra);
+    }
+
+    function _clearPayload(address receiver, uint32 srcEid, bytes32 sender, uint64 n, bytes memory payload) internal {
+        uint64 current = lazyInboundNonce[receiver][srcEid][sender];
+        if (n > current) {
+            for (uint64 j = current + 1; j < n; ++j) {
+                if (inboundPayloadHash[receiver][srcEid][sender][j] == bytes32(0)) revert LZ_InvalidNonce(j);
+            }
+            lazyInboundNonce[receiver][srcEid][sender] = n;
         }
+        bytes32 expected = inboundPayloadHash[receiver][srcEid][sender][n];
+        bytes32 actual = keccak256(payload);
+        if (expected != actual) revert LZ_PayloadHashNotFound(expected, actual);
+        delete inboundPayloadHash[receiver][srcEid][sender][n];
     }
 
-    // ---- channel acts: skip / nilify / burn an inbound nonce, by the receiving OApp only. A voided nonce is
-    // refused on delivery; a nilified one can be re-verified (`reverify`), a burned or skipped one never.
+    function inboundNonce(address receiver, uint32 srcEid, bytes32 sender) public view returns (uint64 n) {
+        n = lazyInboundNonce[receiver][srcEid][sender];
+        while (inboundPayloadHash[receiver][srcEid][sender][n + 1] != bytes32(0)) ++n;
+    }
 
-    /// @notice 1 skipped, 2 nilified, 3 burned; keyed by (receiver, srcEid, sender, nonce) on the RECEIVING endpoint.
-    mapping(address oapp => mapping(uint32 srcEid => mapping(bytes32 sender => mapping(uint64 nonce => uint8)))) public voided;
-
-    function skip(address oapp, uint32 srcEid, bytes32 sender, uint64 nonce_) external {
+    function skip(address oapp, uint32 srcEid, bytes32 sender, uint64 n) external {
         if (msg.sender != oapp) revert NotRemote();
-        voided[oapp][srcEid][sender][nonce_] = 1;
+        if (n != inboundNonce(oapp, srcEid, sender) + 1) revert LZ_InvalidNonce(n);
+        lazyInboundNonce[oapp][srcEid][sender] = n;
     }
 
-    function nilify(address oapp, uint32 srcEid, bytes32 sender, uint64 nonce_, bytes32) external {
+    function nilify(address oapp, uint32 srcEid, bytes32 sender, uint64 n, bytes32 payloadHash) external {
         if (msg.sender != oapp) revert NotRemote();
-        voided[oapp][srcEid][sender][nonce_] = 2;
+        bytes32 cur = inboundPayloadHash[oapp][srcEid][sender][n];
+        if (cur != payloadHash) revert LZ_PayloadHashNotFound(cur, payloadHash);
+        if (n <= lazyInboundNonce[oapp][srcEid][sender] && cur == bytes32(0)) revert LZ_InvalidNonce(n);
+        inboundPayloadHash[oapp][srcEid][sender][n] = NIL_PAYLOAD_HASH;
     }
 
-    function burn(address oapp, uint32 srcEid, bytes32 sender, uint64 nonce_, bytes32) external {
+    function burn(address oapp, uint32 srcEid, bytes32 sender, uint64 n, bytes32 payloadHash) external {
         if (msg.sender != oapp) revert NotRemote();
-        voided[oapp][srcEid][sender][nonce_] = 3;
+        bytes32 cur = inboundPayloadHash[oapp][srcEid][sender][n];
+        if (cur != payloadHash) revert LZ_PayloadHashNotFound(cur, payloadHash);
+        if (cur == bytes32(0) || n > lazyInboundNonce[oapp][srcEid][sender]) revert LZ_InvalidNonce(n);
+        delete inboundPayloadHash[oapp][srcEid][sender][n];
     }
 
-    /// @notice The DVNs verify a nilified nonce again (test stand-in).
-    function reverify(address oapp, uint32 srcEid, bytes32 sender, uint64 nonce_) external {
-        if (voided[oapp][srcEid][sender][nonce_] == 2) voided[oapp][srcEid][sender][nonce_] = 0;
-    }
-
-    /// @notice A packet a compromised DVN set verified: claims to come from `sender` on this endpoint's chain (test stand-in).
-    function forge(uint32 dstEid, bytes32 receiver, bytes32 sender, bytes calldata message) external returns (uint256 i) {
-        uint64 n = ++nonce;
-        bytes32 guid = keccak256(abi.encodePacked("forged", n));
-        packets.push(Packet(dstEid, receiver, sender, n, guid, message, "", false));
-        i = packets.length - 1;
-    }
+    // ---------------------------------------------------------------- packet views
 
     function packetCount() external view returns (uint256) {
         return packets.length;
@@ -134,6 +226,12 @@ contract MockLzEndpoint {
     function isDelivered(uint256 i) external view returns (bool) {
         return packets[i].delivered;
     }
+
+    function _addr(bytes32 b) private pure returns (address) {
+        return address(uint160(uint256(b)));
+    }
+
+    // ---------------------------------------------------------------- libraries + config
 
     function setConfig(address oapp, address lib, SetConfigParam[] calldata params) external {
         if (msg.sender != oapp) revert NotRemote();
@@ -178,12 +276,15 @@ contract MockLzEndpoint {
 
     function setSendLibrary(address oapp, uint32 eid_, address lib) external {
         if (msg.sender != oapp) revert NotRemote();
+        if (sendLibrary[oapp][eid_] == lib) revert LZ_SameValue();
         sendLibrary[oapp][eid_] = lib;
     }
 
-    function setReceiveLibrary(address oapp, uint32 eid_, address lib, uint256) external {
+    function setReceiveLibrary(address oapp, uint32 eid_, address lib, uint256 grace) external {
         if (msg.sender != oapp) revert NotRemote();
+        if (receiveLibrary[oapp][eid_] == lib) revert LZ_SameValue();
         receiveLibrary[oapp][eid_] = lib;
+        receiveGrace[oapp][eid_] = grace;
     }
 }
 

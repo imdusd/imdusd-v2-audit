@@ -63,10 +63,14 @@ contract StockLendingTest is StockSystem {
         vm.expectRevert(Liquidator.NotPriced.selector);
         liquidator.bark(_pid(STK, alice));
         vm.warp(NEXT_MON_OPEN);
+        vm.expectRevert(Liquidator.NotPriced.selector); // the Sunday-night print does not price the open (audit wave 4, P1)
+        liquidator.bark(_pid(STK, alice));
+        vm.warp(NEXT_MON_OPEN + 1 minutes);
+        _price(85e8); // the first regular-session print
         vm.prank(marker);
-        liquidator.liquidate(_pid(STK, alice)); // marks and opens the auction at the open
-        (uint64 at, address m) = sjoin.auctions(_pid(STK, alice));
-        assertEq(at, NEXT_MON_OPEN);
+        liquidator.liquidate(_pid(STK, alice)); // marks and opens the auction at once
+        (uint64 at, address m,,) = sjoin.auctions(_pid(STK, alice));
+        assertEq(at, NEXT_MON_OPEN + 1 minutes);
         assertEq(m, marker);
     }
 
@@ -131,15 +135,25 @@ contract StockLendingTest is StockSystem {
         liquidator.liquidate(_pid(STK, alice));
     }
 
+    /// @dev Walk with a tick every `TICK_SPAN` (the keeper's duty while an auction is live): the clock then runs on wall time.
+    function _walkTicking(uint256 len) internal {
+        uint256 end = vm.getBlockTimestamp() + len;
+        while (vm.getBlockTimestamp() < end) {
+            uint256 next = vm.getBlockTimestamp() + sjoin.TICK_SPAN();
+            vm.warp(next < end ? next : end);
+            sjoin.tick(_pid(STK, alice));
+        }
+    }
+
     function test_auctionPriceIsLiveAndDecaysToTheFloor() public {
         _unhealthyAtOpen();
         // prices are per 1e18 vault SHARES = 1e-6 of a token (StockVault offset)
         assertEq(sjoin.price(_pid(STK, alice)), 80e12, "starts at the live quote");
-        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        _walkTicking(30 minutes);
         assertEq(sjoin.price(_pid(STK, alice)), 76e12, "halfway to the 90% floor");
         _price(70e8);
         assertEq(sjoin.price(_pid(STK, alice)), 66.5e12, "follows the feed, not a snapshot");
-        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        _walkTicking(30 minutes);
         assertEq(sjoin.price(_pid(STK, alice)), 63e12, "floor");
         vm.warp(vm.getBlockTimestamp() + 1 hours + 1);
         assertEq(sjoin.price(_pid(STK, alice)), 0, "lapsed at 2x the auction time");
@@ -186,7 +200,7 @@ contract StockLendingTest is StockSystem {
         reg.setBlocked(taker, true);
         vm.expectRevert(abi.encodeWithSelector(MockStockToken.Blocked.selector, taker));
         _take(80e18);
-        (uint64 at,) = sjoin.auctions(_pid(STK, alice));
+        (uint64 at,,,) = sjoin.auctions(_pid(STK, alice));
         assertTrue(at != 0, "still live");
         reg.setBlocked(taker, false);
         _take(80e18);

@@ -24,6 +24,14 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// nested loans share the cap (review T1); a loan repaid frees its room, so sequential loans in one transaction each
 /// get the full cap (audit wave 1: this said "per transaction"). `circulating()` is the supply before the transaction's
 /// first mint or burn, for every rule that nothing earlier in the same transaction may move.
+/// @dev What `checkBridge` reads from a candidate bridge (ImdBridge's public views) and from this chain's Parameters / Ledger.
+interface IBridgeWiring {
+    function token() external view returns (address);
+    function endpoint() external view returns (address);
+    function governor() external view returns (address);
+    function treasury() external view returns (address);
+}
+
 contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
     /// @notice The address allowed to call `wire` exactly once.
     address public immutable wirer;
@@ -95,10 +103,31 @@ contract ImdUSD is ERC20, ERC20Permit, ERC20FlashMint {
         emit Wired(ledger_, migrator_);
     }
 
+    /// @notice LayerZero EndpointV2 on Ethereum and on Robinhood Chain (LayerZero's deployments; script/DeployConfig.sol).
+    address public constant LZ_ENDPOINT_ETHEREUM = 0x1a44076050125825900e736c501f859c50fE728c;
+    address public constant LZ_ENDPOINT_ROBINHOOD = 0x6F475642a6e85809B1c36Fa62763669b1b48DD5B;
+
+    /// @notice The bridge already set (0 if none), after checking that `b` is wired to THIS chain (fixed before audit wave 5): its
+    /// `token()` is this imdUSD, its `governor()` the governor of Parameters (the Safe), its `treasury()` the Ledger's
+    /// Treasury, and its `endpoint()` LayerZero's EndpointV2 on Ethereum / Robinhood Chain (on any other chain, a contract).
+    /// Reverts `InvalidMinter` otherwise, or if a view is missing. Parameters calls it at SET_BRIDGE's propose and
+    /// `setBridge` at apply. It reads the candidate's own views: a contract written to report this wiring passes, so a
+    /// bridge that is not ImdBridge's code is still caught only by reading it in the 48 h before SET_BRIDGE applies.
+    function checkBridge(address b) public view returns (address) {
+        if (b.code.length == 0) revert InvalidMinter();
+        IBridgeWiring w = IBridgeWiring(b);
+        address ep = w.endpoint();
+        address want = block.chainid == 1 ? LZ_ENDPOINT_ETHEREUM : block.chainid == 4663 ? LZ_ENDPOINT_ROBINHOOD : address(0);
+        if (
+            w.token() != address(this) || w.governor() != IBridgeWiring(bridgeSetter).governor()
+                || w.treasury() != IBridgeWiring(ledger).treasury() || (want == address(0) ? ep.code.length == 0 : ep != want)
+        ) revert InvalidMinter();
+        return bridge;
+    }
+
     function setBridge(address bridge_) external {
         if (msg.sender != bridgeSetter) revert Unauthorized();
-        if (bridge != address(0)) revert AlreadySet();
-        if (bridge_.code.length == 0) revert InvalidMinter();
+        if (checkBridge(bridge_) != address(0)) revert AlreadySet();
         bridge = bridge_;
         emit BridgeSet(bridge_);
     }

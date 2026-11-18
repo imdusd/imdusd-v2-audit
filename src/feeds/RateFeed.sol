@@ -105,6 +105,12 @@ contract RateFeed is IFeed {
         return FeedTraits.proven(underlying);
     }
 
+    /// @notice The capped rate times the underlying's attested value (FeedTraits.attested): what this feed would read with
+    /// no clamp on the underlying. The rate is read live, as in `latestValue`.
+    function attested() external view returns (uint256) {
+        return rate() * FeedTraits.attested(underlying) / 1e18;
+    }
+
     function maxAge() external view returns (uint256) {
         return underlying.maxAge();
     }

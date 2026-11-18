@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {System} from "./System.sol";
-import {MockERC20, MockFeed, MockAggregator} from "./Mocks.sol";
+import {MockERC20, MockFeed, MockAggregator, MockUSDG} from "./Mocks.sol";
 import {MockStockRegistry, MockStockToken} from "./StockMocks.sol";
 import {ParametersBase} from "../../src/ParametersBase.sol";
 import {Parameters} from "../../src/Parameters.sol";
@@ -37,7 +37,7 @@ abstract contract StockSystem is System {
     bytes32 internal constant ETH = "ETH";
     uint8 internal constant GROUP = 1;
 
-    MockERC20 internal usdg;
+    MockUSDG internal usdg;
     MockERC20 internal weth;
     MockFeed internal ethFeed;
     MockStockRegistry internal reg;
@@ -53,7 +53,7 @@ abstract contract StockSystem is System {
     function _deployStocks(uint128 stockLine, uint256 groupLine) internal {
         vm.warp(MON_1400);
         _deploySystem(IERC20(address(new MockERC20("v1", 18))));
-        usdg = new MockERC20("USDG", 6);
+        usdg = new MockUSDG();
         weth = new MockERC20("WETH", 18);
         ethFeed = new MockFeed(2_000e18);
         reg = new MockStockRegistry();

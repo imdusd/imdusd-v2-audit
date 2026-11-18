@@ -71,7 +71,7 @@ contract BridgeTest is TwoChains {
     function test_pathBoundsAndBatch() public {
         vm.startPrank(safe);
         vm.expectRevert(ImdBridge.OutOfBounds.selector);
-        rh.bridge.propose(_path(HOME_EID, _peer(home.bridge), 10_000_001e18, 1));
+        rh.bridge.propose(_path(HOME_EID, _peer(home.bridge), 250_000_001e18, 1)); // MAX_LIMIT 250,000,000
         vm.expectRevert(ImdBridge.OutOfBounds.selector);
         rh.bridge.propose(abi.encode(uint8(1), HOME_EID, _peer(home.bridge), 1e18, uint256(30 minutes), 1e18, uint256(1 days), bytes("")));
         vm.expectRevert(ImdBridge.BadPayload.selector);
@@ -82,18 +82,18 @@ contract BridgeTest is TwoChains {
         nested[0] = abi.encode(uint8(6), new bytes[](0));
         vm.expectRevert(ImdBridge.BadPayload.selector);
         rh.bridge.propose(abi.encode(uint8(6), nested));
-        // a batch: the path and the DVN config in one 48h window
-        bytes[] memory items = new bytes[](2);
-        items[0] = _path(HOME_EID, _peer(home.bridge), OUT_LIMIT, IN_LIMIT);
-        items[1] = abi.encode(uint8(2), address(rhEp), new SetConfigParam[](0));
-        rh.bridge.propose(abi.encode(uint8(6), items));
+        // a path alone (no pinned, configured libraries) is refused (audit wave 4)
+        vm.expectRevert(abi.encodeWithSelector(ImdBridge.Unconfigured.selector, HOME_EID));
+        rh.bridge.propose(_path(HOME_EID, _peer(home.bridge), OUT_LIMIT, IN_LIMIT));
+        // a batch: the path, both pins and the DVN configs in one 48h window
+        rh.bridge.propose(_openBatch(_path(HOME_EID, _peer(home.bridge), OUT_LIMIT, IN_LIMIT), HOME_EID, rhSendLib, rhRecvLib));
         vm.stopPrank();
         vm.expectRevert(abi.encodeWithSelector(Governed.TooEarly.selector, vm.getBlockTimestamp() + 48 hours));
         rh.bridge.applyPending();
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         rh.bridge.applyPending();
         assertEq(rh.bridge.peers(HOME_EID), _peer(home.bridge));
-        assertEq(rhEp.configCalls(address(rh.bridge)), 1, "DVN config only through the timelock, by the OApp itself");
+        assertEq(rhEp.configCalls(address(rh.bridge)), 2, "DVN config only through the timelock, by the OApp itself");
         assertEq(rh.bridge.availableOut(HOME_EID), OUT_LIMIT);
     }
 
@@ -133,6 +133,28 @@ contract BridgeTest is TwoChains {
         _assertChainSupply(rh);
     }
 
+    /// A transfer above the instant cap is received and queued, not minted: in flight for the global
+    /// equation, outside the per-chain one, until anyone claims it after DELAY (then received, minted, both hold).
+    function test_queuedTransferKeepsEverySupplyEquation() public {
+        _open();
+        uint256 amount = home.bridge.DEFAULT_INSTANT_CAP() + 1_000e18;
+        _borrow(rh.ledger, ETH, 20e18, amount + 1_000e18);
+        _send(rh.bridge, HOME_EID, bob, amount);
+        assertTrue(rhEp.deliver(0));
+        assertEq(home.usd.balanceOf(bob), 0, "queued, not minted");
+        assertEq(home.bridge.queued(), amount);
+        assertEq(home.bridge.received(), 0);
+        _assertChainSupply(home);
+        _assertChainSupply(rh);
+        _assertGlobalSupply();
+        _claimAfterDelay(rhEp, 0, home.bridge);
+        assertEq(home.usd.balanceOf(bob), amount);
+        assertEq(home.bridge.queued(), 0);
+        assertEq(home.bridge.received(), amount);
+        _assertChainSupply(home);
+        _assertGlobalSupply();
+    }
+
     function test_outboundLimitAndDecay() public {
         _open();
         _borrow(rh.ledger, ETH, 100e18, 25_000e18);
@@ -150,9 +172,16 @@ contract BridgeTest is TwoChains {
 
     function test_inboundLimitLeavesMessageInFlightUntilRoom() public {
         _open();
-        // lower rh's inbound limit from home to 1,000/day to exercise it (home's outbound stays 50k)
+        // lower rh's inbound limit from home to 1,000/day to exercise it (home's outbound stays 50k); lowering an inbound
+        // limit needs a paused path (audit wave 4), reopened by its own proposal
+        vm.prank(safe);
+        rh.bridge.pause(HOME_EID);
         vm.prank(safe);
         rh.bridge.propose(_path(HOME_EID, _peer(home.bridge), OUT_LIMIT, 1_000e18));
+        vm.warp(vm.getBlockTimestamp() + 48 hours);
+        rh.bridge.applyPending();
+        vm.prank(safe);
+        rh.bridge.propose(abi.encode(uint8(5), HOME_EID));
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         rh.bridge.applyPending();
         deal(address(home.usd), alice, 2_000e18, true); // test-only supply on home (no supply equation asserted here)
@@ -185,9 +214,9 @@ contract BridgeTest is TwoChains {
         _open();
         _borrow(rh.ledger, ETH, 10e18, 5_000e18);
         vm.prank(alice);
-        vm.expectRevert(ImdBridge.Unauthorized.selector);
+        vm.expectRevert(Governed.NotGovernor.selector);
         rh.bridge.pause(HOME_EID);
-        vm.prank(guardian);
+        vm.prank(safe);
         rh.bridge.pause(HOME_EID);
         SendParam memory p = _param(HOME_EID, bob, 1_000e18);
         MessagingFee memory fee = rh.bridge.quoteSend(p, false);
@@ -233,8 +262,8 @@ contract BridgeTest is TwoChains {
     function test_beforeSetBridgeNothingMints() public {
         // a path opened without the minter: a delivery cannot mint, so it stays in flight
         vm.startPrank(safe);
-        rh.bridge.propose(_path(HOME_EID, _peer(home.bridge), OUT_LIMIT, IN_LIMIT));
-        home.bridge.propose(_path(RH_EID, _peer(rh.bridge), IN_LIMIT, OUT_LIMIT));
+        rh.bridge.propose(_openBatch(_path(HOME_EID, _peer(home.bridge), OUT_LIMIT, IN_LIMIT), HOME_EID, rhSendLib, rhRecvLib));
+        home.bridge.propose(_openBatch(_path(RH_EID, _peer(rh.bridge), IN_LIMIT, OUT_LIMIT), RH_EID, homeSendLib, homeRecvLib));
         home.params.propose(abi.encode(uint8(4), address(home.bridge)));
         vm.stopPrank();
         vm.warp(vm.getBlockTimestamp() + 48 hours);
@@ -358,7 +387,7 @@ contract BridgeTest is TwoChains {
     function testFuzz_feeSplitIsExact(uint256 amount, uint256 bps) public {
         _open();
         bps = bound(bps, 0, 25);
-        amount = bound(amount, 2e12, 4_000e18); // >= 2 shared units: 1 unit less any fee delivers 0 (refused, )
+        amount = bound(amount, 10.03e18, 4_000e18); // delivers >= MIN_AMOUNT (10 imdUSD) after the largest fee (25 bps)
         if (bps != 0) _setFee(rh.bridge, HOME_EID, bps);
         _borrow(rh.ledger, ETH, 10e18, 5_000e18);
         uint256 before = rh.usd.balanceOf(alice);

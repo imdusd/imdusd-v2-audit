@@ -6,11 +6,13 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Deploy} from "../../script/Deploy.s.sol";
 import {DeployRobinhood} from "../../script/DeployRobinhood.s.sol";
 import {DeployChain} from "../../script/DeployChain.s.sol";
+import {DeployBase} from "../../script/deploy/DeployBase.sol";
 import {DeployTypes, RobinhoodConfig, BetaConfig} from "../../script/DeployConfig.sol";
 import {Ledger} from "../../src/Ledger.sol";
 import {LedgerBase} from "../../src/LedgerBase.sol";
 import {ParametersBase} from "../../src/ParametersBase.sol";
 import {Parameters} from "../../src/Parameters.sol";
+import {Redeemer} from "../../src/Redeemer.sol";
 import {ImdBridge, IMintableBurnable as IMintableBurnableMin} from "../../src/bridge/ImdBridge.sol";
 import {ILayerZeroEndpointV2 as ILayerZeroEndpointV2Min} from "layerzero-v2/protocol/interfaces/ILayerZeroEndpointV2.sol";
 import {SwarmFeed} from "../../src/feeds/SwarmFeed.sol";
@@ -48,7 +50,7 @@ abstract contract RobinhoodFork is Test {
         live = true;
     }
 
-    function _deployRobinhood() internal {
+    function _deployRobinhood() internal virtual {
         safe = address(new SafeStandIn());
         DeployTypes.Config memory c = RobinhoodConfig.get();
         c.governor = safe;
@@ -124,12 +126,22 @@ abstract contract RobinhoodFork is Test {
         // one BATCH: the path, both library pins, and this OApp's own executor + DVN config on them (the
         // endpoint's default for a new OApp is a dead DVN)
         bytes memory batch = RobinhoodConfig.launchBatch4663(
-            abi.encode(uint8(1), eid, peer, outLimit, uint256(1 days), inLimit, uint256(1 days), bytes(""))
+            abi.encode(uint8(1), eid, peer, outLimit, uint256(1 days), inLimit, uint256(1 days), RobinhoodConfig.enforcedOptions())
         );
         vm.prank(safe);
         d.bridge.propose(batch);
         _keepAlive(48 hours);
         d.bridge.applyPending();
+    }
+
+    /// @dev The Safe's later act: the IMD type opens at line 0 and is raised to 3,000 by SET_RISK (48h)
+    /// built from the live stored risk (RobinhoodConfig.imdLineRaise).
+    function _openImdLine() internal {
+        bytes memory raise = RobinhoodConfig.imdLineRaise(d.params.storedRisk("IMD")); // read before the prank
+        vm.prank(safe);
+        d.params.propose(raise);
+        _keepAlive(48 hours);
+        d.params.applyPending(uint8(1)); // SET_RISK
     }
 
     /// @dev Warp with the keeper poking the Pulse every 10 minutes, and Chainlink kept fresh.
@@ -186,8 +198,38 @@ contract RobinhoodForkTest is RobinhoodFork {
 
     function test_scriptRefusesTheMissingSafe() public {
         DeployRobinhood entry = new DeployRobinhood();
-        vm.expectRevert(abi.encodeWithSelector(DeployRobinhood.GovernorNotAContract.selector, address(0)));
+        // the 4663 Safe (the mainnet Safe's address) has no code on 4663 until its signers create it
+        vm.skip(RobinhoodConfig.GOVERNANCE_SAFE.code.length != 0);
+        vm.expectRevert(abi.encodeWithSelector(DeployRobinhood.GovernorNotAContract.selector, RobinhoodConfig.GOVERNANCE_SAFE));
         entry.run();
+    }
+
+    /// 12-07: every 4663 deploy path refuses a governor with no code, not only the DeployRobinhood entry (the staged and
+    /// rehearsal path `deployAs` too): a zero governor, the configured Safe before it exists on 4663 (next test), an EOA.
+    function test_anyDeployPathRefusesAZeroOrEoaGovernor() public {
+        Deploy script = new DeployChain();
+        DeployTypes.Config memory c = RobinhoodConfig.get();
+        c.governor = address(0);
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.NoSafe.selector, uint256(4663), address(0)));
+        script.deployAs(c, deployer);
+    }
+
+    /// The configured 4663 Safe (0xbeFd..., the mainnet Safe's address, script/launch/Safe4663.s.sol) has no code until its creation
+    /// tx is sent: until then every deploy path refuses it.
+    function test_anyDeployPathRefusesTheSafeBeforeItExists() public {
+        vm.skip(RobinhoodConfig.GOVERNANCE_SAFE.code.length != 0); // the Safe exists on this fork: nothing to refuse
+        Deploy script = new DeployChain();
+        DeployTypes.Config memory c = RobinhoodConfig.get();
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.NoSafe.selector, uint256(4663), RobinhoodConfig.GOVERNANCE_SAFE));
+        script.deployAs(c, deployer);
+    }
+
+    function test_anyDeployPathRefusesAnEoaGovernor() public {
+        Deploy script = new DeployChain();
+        DeployTypes.Config memory c = RobinhoodConfig.get();
+        c.governor = makeAddr("an EOA");
+        vm.expectRevert(abi.encodeWithSelector(DeployBase.NoSafe.selector, uint256(4663), c.governor));
+        script.deployAs(c, deployer); // (one refused deployAs per test: a reverted deployAs leaves the broadcast cheat open)
     }
 
     function test_deployedAsConfiguredAndPowerless() public {
@@ -255,7 +297,26 @@ contract RobinhoodForkTest is RobinhoodFork {
         assertLe(IERC20(RobinhoodConfig.USDG).balanceOf(alice), 100_100e6, "at most the unharvested dust of the yield");
     }
 
+    function test_imdLineZeroAtGenesisThenRaisedBySafe() public {
+        assertEq(d.params.storedRisk(IMD).line, 0, "IMD listed at line 0");
+        assertTrue(d.params.exists(IMD), "the type stays listed");
+        _mockSwarm(IMD_ETH, NHI);
+        vm.expectRevert(LedgerBase.CeilingExceeded.selector);
+        _adjust(IMD, 5_000e18, 1_000e18, false);
+        ParametersBase.Risk memory before = d.params.storedRisk(IMD);
+        _openImdLine();
+        ParametersBase.Risk memory r = d.params.storedRisk(IMD);
+        assertEq(r.line, RobinhoodConfig.IMD_LINE, "raised to 3,000");
+        assertEq(r.line, 3_000e18);
+        before.line = r.line;
+        assertEq(abi.encode(r), abi.encode(before), "only the line moved");
+        _mockSwarm(IMD_ETH, NHI);
+        _adjust(IMD, 5_000e18, 1_000e18, false);
+        assertEq(d.usd.balanceOf(alice), 1_000e18);
+    }
+
     function test_roundTripImdFromMainnetAttestations() public {
+        _openImdLine();
         vm.expectRevert(LedgerBase.NotPriced.selector);
         _adjust(IMD, 1_000e18, 1_000e18, false);
         _mockSwarm(IMD_ETH, NHI);
@@ -272,6 +333,7 @@ contract RobinhoodForkTest is RobinhoodFork {
     // ------------------------------------------------------------ caps and limits
 
     function test_chainLineAcrossTypes() public {
+        _openImdLine();
         _mockSwarm(IMD_ETH, NHI);
         _adjust(ETH, 50e18, int256(_net(20_000e18)), false); // each type up to its line, upfront fee included
         _adjust(IMD, 5_000e18, int256(_net(3_000e18)), false);
@@ -304,7 +366,8 @@ contract RobinhoodForkTest is RobinhoodFork {
         p.amountLD = 1e18;
         fee = d.bridge.quoteSend(p, false);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.RateLimited.selector, RobinhoodConfig.MAINNET_EID, 1e18, 0));
+        // under the 10 imdUSD minimum (audit wave 4): refused at send, so a peer of ours never sends what would revert there
+        vm.expectRevert(abi.encodeWithSelector(ImdBridge.BelowMinimum.selector, 1e18, 10e18));
         d.bridge.send{value: fee.nativeFee}(p, fee, alice);
     }
 
@@ -340,6 +403,26 @@ contract RobinhoodForkTest is RobinhoodFork {
         assertGt(repaid, 0, "seized once the grace has run");
         _supplyHolds();
     }
+
+    /// 12-07: redemption waits out the same grace on the real deployment (S-USDG and ETH are redeemable).
+    function test_sequencerGapRedemptionWaitsOutTheGrace() public {
+        _adjust(ETH, 20e18, 10_000e18, false);
+        vm.warp(vm.getBlockTimestamp() + 2 hours); // the sequencer is down for 2 hours
+        _freshChainlink();
+        vm.prank(alice);
+        vm.expectRevert(Redeemer.SequencerGrace.selector);
+        d.redeemer.redeem(ETH, 1_000e18, 0.05e18, 10, 0);
+        d.pulse.poke(); // the chain is back: the grace starts now
+        _keepAlive(50 minutes);
+        vm.prank(alice);
+        vm.expectRevert(Redeemer.SequencerGrace.selector);
+        d.redeemer.redeem(ETH, 1_000e18, 0.05e18, 10, 0);
+        _keepAlive(10 minutes);
+        vm.prank(alice);
+        (uint256 redeemed,) = d.redeemer.redeem(ETH, 1_000e18, 0.05e18, 10, 0);
+        assertEq(redeemed, 1_000e18, "redeems once the grace has run");
+        _supplyHolds();
+    }
 }
 
 /// @notice imdUSD 4663 -> Ethereum -> 4663 across two forks (needs ROBINHOOD_RPC_URL and MAINNET_RPC_URL).
@@ -370,8 +453,7 @@ contract RobinhoodMainnetLzTest is RobinhoodFork {
         Deploy script = new Deploy();
         m = script.deployAs(_beta(), deployer);
         m.bridge = new ImdBridge(
-            ILayerZeroEndpointV2Min(MAINNET_ENDPOINT), IMintableBurnableMin(address(m.usd)), MAINNET_SAFE, address(0),
-            address(m.treasury)
+            ILayerZeroEndpointV2Min(MAINNET_ENDPOINT), IMintableBurnableMin(address(m.usd)), MAINNET_SAFE, address(m.treasury)
         );
         vm.resumeGasMetering();
         // mainnet's Safe: SET_BRIDGE, then the path to 4663 (mirror limits)
@@ -380,7 +462,7 @@ contract RobinhoodMainnetLzTest is RobinhoodFork {
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         m.params.applyPending();
         bytes memory batch =
-            RobinhoodConfig.launchBatchMainnet(RobinhoodConfig.robinhoodPathOnMainnet(_b32(address(d.bridge)), ""));
+            RobinhoodConfig.launchBatchMainnet(RobinhoodConfig.robinhoodPathOnMainnet(_b32(address(d.bridge))));
         vm.prank(MAINNET_SAFE);
         m.bridge.propose(batch);
         vm.warp(vm.getBlockTimestamp() + 48 hours);
@@ -405,17 +487,20 @@ contract RobinhoodMainnetLzTest is RobinhoodFork {
         internal
         returns (uint64 nonce, bytes32 guid, bytes memory message)
     {
-        SendParam memory p = SendParam(dst, _b32(alice), amount, amount, _lzOpts(), "", "");
+        // no caller options: the path's enforced lzReceive gas (RobinhoodConfig.enforcedOptions) is what the executor gets
+        SendParam memory p = SendParam(dst, _b32(alice), amount, amount, "", "", "");
         MessagingFee memory fee = b.quoteSend(p, false);
         vm.recordLogs();
         vm.prank(alice);
         b.send{value: fee.nativeFee}(p, fee, alice);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes memory payload;
+        bytes memory options;
         for (uint256 i; i < logs.length; ++i) {
-            if (logs[i].topics[0] == PACKET_SENT) (payload,,) = abi.decode(logs[i].data, (bytes, bytes, address));
+            if (logs[i].topics[0] == PACKET_SENT) (payload, options,) = abi.decode(logs[i].data, (bytes, bytes, address));
         }
         require(payload.length > 113, "no PacketSent");
+        assertEq(options, RobinhoodConfig.enforcedOptions(), "the real endpoint carries the enforced 250k lzReceive gas");
         // PacketV1Codec: version(1) nonce(8) srcEid(4) sender(32) dstEid(4) receiver(32) | guid(32) | message
         assembly {
             nonce := shr(192, mload(add(payload, 33)))
@@ -423,10 +508,6 @@ contract RobinhoodMainnetLzTest is RobinhoodFork {
         }
         message = new bytes(payload.length - 113);
         for (uint256 i; i < message.length; ++i) message[i] = payload[113 + i];
-    }
-
-    function _lzOpts() internal pure returns (bytes memory) {
-        return abi.encodePacked(uint16(3), uint8(1), uint16(17), uint8(1), uint128(200_000));
     }
 
     function test_roundTripBetweenRobinhoodAndEthereum() public {

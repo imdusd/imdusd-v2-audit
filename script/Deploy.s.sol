@@ -65,7 +65,7 @@ contract Deploy is DeployBase, StageCore, StageFeeds, StageTypes, StageGenesis, 
         // path (peer, limits, enforced options, DVN config) on the bridge's own 48h timelock.
         if (cfg.bridge.enabled) {
             uint256 g = gasleft();
-            d.bridge = _newBridge(cfg.bridge.endpoint, address(d.usd), cfg.governor, cfg.bridge.guardian, address(d.treasury));
+            d.bridge = _newBridge(cfg.bridge.endpoint, address(d.usd), cfg.governor, address(d.treasury));
             _rec("ImdBridge", g, type(ImdBridge).creationCode.length + 160);
         }
 

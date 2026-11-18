@@ -10,6 +10,7 @@ import {Pricer} from "./Pricer.sol";
 import {ParametersBase} from "./ParametersBase.sol";
 import {Parameters} from "./Parameters.sol";
 import {SortedPositions} from "./SortedPositions.sol";
+import {Pulse} from "./Pulse.sol";
 
 /// @notice The peg floor: anyone burns imdUSD for $1 of a redeemable type's collateral, less a fee,
 /// taken from the lowest-rate positions first.
@@ -28,8 +29,12 @@ import {SortedPositions} from "./SortedPositions.sol";
 /// in BUCKET-second buckets over WINDOW + BUCKET, so every 2h window, however aligned, sees at most the cap
 /// (the counted span is 10 min longer than 2h: conservative). An over-size request is filled up to what
 /// the window has left, and reverts only when nothing is left.
-/// NO SEQUENCER GRACE. Redemption does not read the Pulse (chains with one, e.g. Robinhood): a redemption can run inside a
-/// grace that holds liquidations, before borrowers could raise their rate or repay. Mainnet has no Pulse.
+/// SEQUENCER GRACE: on a chain with a Pulse (Robinhood, 4663) redemption is refused exactly when
+/// the Liquidator holds a seizure: while `Pulse.inGrace()` reads true, i.e. inside the grace after a silence longer than the
+/// gap, and in the first block back before any poke has ended that silence (a pending long gap reads as a grace). Borrowers
+/// get the outage's time back to raise their rate or repay before being redeemed, as they do before being seized. The check
+/// is a view, made before the Ledger is touched: a refused redemption starts no grace (the next poke does) and a redemption
+/// that passes cannot open one (no pending gap). Ethereum has no Pulse: unchanged.
 contract Redeemer is TransientReentrancyGuard {
     uint256 public constant FEE_CAP = 0.05e18;
     /// @notice A never-redeemed type's base rate when it goes live (`decayedBaseRate`).
@@ -46,6 +51,8 @@ contract Redeemer is TransientReentrancyGuard {
     Parameters public immutable params;
     SortedPositions public immutable sorted;
     IERC20 public immutable token;
+    /// @notice The Ledger's Pulse; zero where the chain does not use one.
+    Pulse public immutable pulse;
 
     struct Rate {
         uint192 baseRate;
@@ -63,6 +70,7 @@ contract Redeemer is TransientReentrancyGuard {
     error ZeroAmount();
     error WindowFull();
     error CollateralTooLow(uint256 collateral);
+    error SequencerGrace();
 
     event Redemption(bytes32 indexed ilk, address indexed redeemer, uint256 amount, uint256 fee, uint256 collateral);
 
@@ -72,6 +80,7 @@ contract Redeemer is TransientReentrancyGuard {
         params = ledger_.params();
         sorted = ledger_.sorted();
         token = IERC20(address(ledger_.token()));
+        pulse = Pulse(address(ledger_.pulse()));
     }
 
     /// @notice Current fee for redeeming `amount` against `ilk`, 1e18.
@@ -126,6 +135,7 @@ contract Redeemer is TransientReentrancyGuard {
         returns (uint256 redeemed, uint256 collateral)
     {
         if (amount == 0) revert ZeroAmount();
+        if (address(pulse) != address(0) && pulse.inGrace()) revert SequencerGrace();
         if (!params.config(ilk).redeemable) revert NotRedeemable();
         Pricer.Quote memory q = pricer.quote(ilk);
         if (!q.priced || q.payout == 0) revert NotPriced();

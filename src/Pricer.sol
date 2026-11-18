@@ -32,9 +32,12 @@ import {FeedTraits} from "./feeds/FeedTraits.sol";
 ///    it. An NHI leaf that is not converged also stops borrowing (its mat is one nobody attested), not liquidation.
 ///  - TWIN RULE (price design C): a type whose spot leg is derived from a pool price PROVEN from Ethereum state
 ///    (`FeedTraits.proven`: ProvenPoolPrice x ETH/USD x rate for sIMD) has a trustless twin of its swarm median. While the
-///    legs disagree and that spot is fresh, `low = high = max(median, spot)` instead of the median alone: a wrong or
-///    compromised median (attester key, wrong majority) cannot liquidate below the proven price, and a pushed proven
-///    price cannot lower `low` below the median. Borrowing still needs agreement. Other types keep the median rule.
+///    legs disagree and that spot is fresh, `low = high = max(spot, min(median, attestedMedian))` instead of the median
+///    alone: a wrong or compromised median (attester key, wrong majority) cannot liquidate below the proven price, and a
+///    pushed proven price cannot lower `low` below what the median attested. `attestedMedian` (FeedTraits.attested, through
+///    the composites) is the median leaf's last target: a median CLAMPED above it holds a level nobody attested, so after a
+///    genuine fall the proven spot shows and the median attests, `low` follows at once instead of one allowance per epoch
+///    (audit wave 4; it was `max(median, spot)`). Borrowing still needs agreement. Other types keep the median rule.
 ///  - `borrow = min(low, cap)`: the price new debt, withdrawals and a charged rate change are measured
 ///    at. `Parameters.cap` is a governed ceiling (0 = none). Only `borrow` is capped: liquidation health and liquidation
 ///    prices use the uncapped `low`, and redemption the uncapped `payout`, so a ceiling below market can only refuse new
@@ -90,7 +93,10 @@ contract Pricer {
         if (agree) {
             (q.low, q.high) = (Math.min(m, s), Math.max(m, s));
         } else if (spotOk && !same && FeedTraits.proven(c.spot)) {
-            q.low = q.high = Math.max(m, s); // the twin rule: neither leg alone can set the liquidation price below the other
+            // The twin rule: neither leg alone can set the liquidation price below the other. A median above the spot counts
+            // at most at its ATTESTED value (audit wave 4): one clamped above its target holds a level nobody attested, so a
+            // fall the proven spot shows and the median attests is followed at once, not one allowance per epoch.
+            q.low = q.high = m > s ? Math.max(s, Math.min(m, FeedTraits.attested(c.median))) : s;
         } else {
             q.low = q.high = m;
         }

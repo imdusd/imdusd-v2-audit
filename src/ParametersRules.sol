@@ -50,9 +50,10 @@ contract ParametersRules is ParametersBase {
             abi.decode(payload, (uint8, uint256));
         } else if (kind == SET_BRIDGE || kind == SET_KEEPER) {
             (, address minter) = abi.decode(payload, (uint8, address));
-            // Audit wave 1: ImdUSD names each minter once (AlreadySet), so a second proposal could never apply.
+            // Audit wave 1: ImdUSD names each minter once (AlreadySet), so a second proposal could never apply. Fixed before
+            // audit wave 5: a bridge must be an ImdBridge wired to this chain (ImdUSD.checkBridge reverts otherwise, here and at apply).
             IBridgeSettable t = IBridgeSettable(token);
-            if (minter.code.length == 0 || (kind == SET_BRIDGE ? t.bridge() : t.keeper()) != address(0)) revert BadConfig();
+            if (minter.code.length == 0 || (kind == SET_BRIDGE ? t.checkBridge(minter) : t.keeper()) != address(0)) revert BadConfig();
         } else if (kind == SET_SAVINGS_SHARE) {
             (, uint64 share) = abi.decode(payload, (uint8, uint64));
             if (savings == address(0) || share > MAX_SAVINGS_SHARE) revert OutOfBounds();

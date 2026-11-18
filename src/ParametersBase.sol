@@ -26,6 +26,7 @@ interface IBridgeSettable {
     function setBridge(address bridge) external;
     function setKeeper(address keeper) external;
     function bridge() external view returns (address);
+    function checkBridge(address bridge) external view returns (address);
     function keeper() external view returns (address);
 }
 

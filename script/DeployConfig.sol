@@ -147,8 +147,7 @@ library DeployTypes {
     /// (SET_BRIDGE) and opening each path (peer + limits, ImdBridge.SET_PATH) are the Safe's timelocked acts afterwards.
     struct BridgeSpec {
         bool enabled;
-        address endpoint; // LayerZero EndpointV2
-        address guardian; // may pause a path instantly; zero = only the Safe
+        address endpoint; // LayerZero EndpointV2 (no guardian: only the Safe pauses, holds and voids)
     }
 
     /// @notice One Robinhood stock-token type: the token pooled in a StockVault, priced by its Chainlink
@@ -811,26 +810,42 @@ library RobinhoodConfig {
     address internal constant PLANE_INTAKE = 0xa43e6F75ee006411F79Ac1C84120606C2330DE82;
     address internal constant PLANE_INTAKE_DELIVERY = 0xCE0E6a670AA75E161d02aca3C7F00B94cA428CCb;
 
-    /// @notice The governance Safe on 4663. NONE EXISTS YET (the mainnet Safe's address has no code on 4663, 2026-10-21):
-    /// one is to be deployed (Safe 1.4.1 and 1.5.0 factories are on 4663) and records it here. DeployRobinhood refuses a
-    /// governor with no code, so this placeholder cannot be deployed with, and an EOA can never be the governor.
-    address internal constant GOVERNANCE_SAFE = address(0);
+    /// @notice The governance Safe on 4663: THE MAINNET SAFE'S ADDRESS, created on 4663 by the same factory, singleton,
+    /// initializer and salt (script/launch/Safe4663.s.sol: same owners and threshold, 2 of 3). It has NO CODE on
+    /// 4663 until the signers send Safe4663's two transactions; every launch path (launch.sh, DeployRobinhood) refuses a governor
+    /// with no code, so nothing deploys against it before then, and an EOA can never be the governor.
+    address internal constant GOVERNANCE_SAFE = 0xbeFd108085613662356aa26A2466Ad3426DA9C32;
 
     bytes4 internal constant CONVERT = bytes4(keccak256("convertToAssets(uint256)"));
     uint256 internal constant CAP = uint256(0.001e18) / 1 days; // share-rate growth cap, 0.1%/day
     uint256 internal constant CL_MAX_AGE = 1 days + 1 hours; // the 4663 feeds' heartbeat is 24h (mainnet ETH/USD: 1h)
-    /// @notice The IMD type's line and chop. E2: mainnet's depth rule counts this line (Parameters.otherImdLines):
-    /// RAISE THE MAINNET VALUE FIRST (SET_OTHER_IMD, 48h), then this chain's line.
+    /// @notice The IMD type's TARGET line and chop. E2: mainnet's depth rule counts this line (Parameters.otherImdLines,
+    /// MainnetConfig sets it to IMD_LINE at genesis), so the later raise on 4663 needs no mainnet act. Any raise ABOVE 3,000:
+    /// RAISE THE MAINNET VALUE FIRST (SET_OTHER_IMD, 48h), then this chain's line (the operator runbook, not public).
     uint128 internal constant IMD_LINE = 3_000e18;
+    /// @notice The IMD line AT GENESIS = 0: the type is listed but borrows nothing until the three 4663 IMD
+    /// swarm feeds have been seeded and checked against mainnet for a few days; then the Safe raises it to IMD_LINE with the
+    /// timelocked SET_RISK in `imdLineRaise` (48h). Facts behind the caution (read 2026-11-15): 61,977 IMD exist on 4663;
+    /// ~$201k sits in the v4 IMD/ETH pool on mainnet (DexScreener), the only market the price legs attest; the IMD OFT's owner
+    /// is 0x047F...54B7, an EOA that can set peers and so mint IMD on 4663 with no delay.
+    uint128 internal constant IMD_LINE_GENESIS = 0;
     uint64 internal constant IMD_CHOP = 0.2e18;
 
     // ---- chain-risk caps, PROPOSED
     /// @notice 10% of Ethereum debt, as an absolute number. v2 Ethereum is not live, so 10% of the beta's 300k of
     /// lines (BetaConfig.TOTAL_LINES); the Safe moves it with Ethereum's debt through SET_CHAIN_LINE (48h, <= 50M).
     uint256 internal constant CHAIN_LINE = 30_000e18;
-    /// @notice The most that may leave 4663 per day, sized to normal flow at the cap (a third of the chain line),
-    /// and the inbound (mint) limit from mainnet, larger so arrivals for repayment are not throttled. Mainnet mirrors both.
-    uint256 internal constant OUT_LIMIT = 10_000e18;
+    /// @notice The most that may leave 4663 per window (refilling at that per day: up to ~2x inside any 24h, the
+    /// limiter's decaying form, audit wave 4). Mainnet's inbound from 4663 mirrors it (robinhoodPathOnMainnet).
+    /// 50,000 both ways: the LOSS bound on a forged inbound stream no longer comes from this limit but from
+    /// the inbound delay (a per-path INSTANT cap, 5,000/day, mints at once; anything above
+    /// it queues and is claimable after 12 h, where the Safe can stop it). The inbound delay carries the rule instant cap x 4
+    /// (the 72 h HOLD_TIME response: available + 3 refills) <= CHAIN_LINE. The 10,000 / 5,000 of wave 4 and before wave 5
+    /// were this limit doing the cap's job. RULE pinned here (test/unit/AuditW5BridgeInboundResponse.t.sol): both paths'
+    /// limits mirror each other and are within ImdBridge.MAX_LIMIT.
+    uint256 internal constant OUT_LIMIT = 50_000e18;
+    /// @notice The inbound (mint) limit into 4663; mainnet's outbound to 4663 mirrors it, so a send the 4663 side would
+    /// refuse is refused at the source. 50,000 (see OUT_LIMIT for where the loss bound now lives).
     uint256 internal constant IN_LIMIT = 50_000e18;
     uint256 internal constant LIMIT_WINDOW = 1 days;
 
@@ -864,7 +879,10 @@ library RobinhoodConfig {
         c.feeds[F_SUSDG].selector = CONVERT;
         c.feeds[F_SUSDG].passOneE18 = true;
         c.feeds[F_SUSDG].cap = CAP;
-        // v1's live feeds: price + spot live 1h, NHI 1 day, each capped at 20% per epoch (read from mainnet 2026-10-21)
+        // v2-native SwarmFeed legs deployed EMPTY here (priced 0 until their first relayed attestation, bought with consumer
+        // chain 4663): median + spot of the MAINNET IMD/ETH market, live 1h, and NHI live 1 day, each capped at 20% per epoch
+        // (the same parameters as v1's mainnet feeds, read 2026-10-21). Both price legs are attested (no proven/live leg on
+        // 4663), so a compromised attester or wrong majority moves both, within the epoch cap: hence line 0 at genesis.
         c.feeds[F_IMD_ETH] = _node(DeployTypes.SWARM_PRICE, address(0), 1 hours, 0, 2000);
         c.feeds[F_IMD_ETH_SPOT] = _node(DeployTypes.SWARM_SPOT, address(0), 1 hours, 0, 2000);
         c.feeds[F_NHI] = _node(DeployTypes.SWARM_NHI, address(0), 1 days, 0, 2000);
@@ -882,18 +900,15 @@ library RobinhoodConfig {
         sr.redeemDivisor = 8;
         c.ilks[1] = DeployTypes.IlkSpec("S-USDG", STEAKHOUSE_USDG, F_SUSDG, F_SUSDG, N, F_SUSDG, CL_USDG_USD, N, true, sr);
         // IMD: mat follows NHI (170-200%), chop 20% as sIMD, skew 10% (mainnet sIMD is 5%; this value
-        // is a governance choice, no 4663 analysis yet); NOT redeemable (no live pool leg to guard the payout),
+        // is a judgement call, no 4663 analysis yet); NOT redeemable (no live pool leg to guard the payout),
         // so a 5% floor rate; a small line (no IMD market on 4663: a liquidator bridges the IMD home to sell it).
-        ParametersBase.Risk memory ir = _r(1.7e18, IMD_CHOP, 0.05e18, 0, IMD_LINE);
-        ir.skew = 0.1e18;
-        c.ilks[2] = DeployTypes.IlkSpec("IMD", IMD, F_IMD_USD, F_IMD_USD_SPOT, F_NHI, N, address(0), N, false, ir);
+        c.ilks[2] = DeployTypes.IlkSpec("IMD", IMD, F_IMD_USD, F_IMD_USD_SPOT, F_NHI, N, address(0), N, false, imdRisk(IMD_LINE_GENESIS));
 
         c.chain = DeployTypes.ChainSpec({
             chainId: CHAIN_ID, pulse: true, pulseGap: 15 minutes, pulseGrace: 1 hours, capped: true, chainLine: CHAIN_LINE
         });
-        // guardian: filled by DeployRobinhood from env GUARDIAN (the operator's dedicated guardian key); zero refused off a local fork
-        c.bridge = DeployTypes.BridgeSpec({enabled: true, endpoint: LZ_ENDPOINT, guardian: address(0)});
-        // On 4663: the blue sleeve bids on ETH and S-USDG. IMD is NOT covered: there is no IMD market on 4663
+        c.bridge = DeployTypes.BridgeSpec({enabled: true, endpoint: LZ_ENDPOINT});
+        // On 4663 the blue sleeve bids on ETH and S-USDG. IMD is NOT covered: there is no IMD market on 4663
         // (a liquidator bridges IMD home to sell it), so a sleeve holding IMD could not unwind; IMD keeps the caller path.
         // The edge sleeve is deployed EMPTY (no edge type; premium 0) so a later type can be listed by ADD_SLEEVE_ILK.
         c.backstop.enabled = true;
@@ -959,7 +974,14 @@ library RobinhoodConfig {
         s.types[8].risk.chop = 0.05e18;
         s.types[8].risk.rateFloor = 0.04e18;
         s.types[8].auctionFloor = 0.97e18;
+        // Audit wave 4 (low): SGOV's feed prints only at its 20:00 New York heartbeat (3 of 114 rounds Jul-Nov 2026 inside the
+        // session), so one skipped heartbeat left a live feed unpriced a whole session at 25 h. 49 h covers one missed
+        // weekday heartbeat (Mon 20:00 -> Wed 16:00 = 44 h); two in a row still read stale. A T-bill fund moves ~0.02% a day,
+        // so a dead feed priced 24 h longer is far inside its 15% buffer. The other types keep 25 h (they print in session).
+        s.types[8].maxAge = SGOV_MAX_AGE;
     }
+
+    uint256 internal constant SGOV_MAX_AGE = 2 days + 1 hours;
 
     function _stock(bytes32 ilk, address token, address agg, uint64 mat, uint128 line)
         private
@@ -1005,10 +1027,13 @@ library RobinhoodConfig {
     address internal constant M_DVN_P2P = 0x06559EE34D85a88317Bf0bfE307444116c631b67; // sorted ascending
     address internal constant M_DVN_LZ_LABS = 0x589dEDbD617e0CBcB916A9223F4d1300c294236b;
     address internal constant M_DVN_TWINSTAKE = 0xa59BA433ac34D2927232918Ef5B2eaAfcF130BA5;
-    // 4663 -> mainnet: 20 (ImdBridge.MIN_CONFIRMATIONS_FROM_OTHER, LayerZero's Arbitrum-family default; ). The IMD
+    // 4663 -> mainnet: 20 (ImdBridge.MIN_CONFIRMATIONS_FROM_OTHER, LayerZero's Arbitrum-family default). The IMD
     // OFT uses 5 (~1-2 s of sequencer soft confirmations), which the bridge now refuses.
     uint64 internal constant CONF_FROM_4663 = 20;
     uint64 internal constant CONF_FROM_MAINNET = 15; // mainnet -> 4663
+    /// @dev optionalDVNCount = NIL: no optional DVNs. 0 would mean "LayerZero's default optional set" (ULN302 merges it), which
+    /// ImdBridge refuses (audit wave 4).
+    uint8 internal constant NIL = 255;
 
     struct UlnConfig {
         uint64 confirmations;
@@ -1064,28 +1089,46 @@ library RobinhoodConfig {
         receive_ = abi.encode(uint8(4), EID, M_RECEIVE_ULN, uint256(0));
     }
 
-    /// @notice 4663's whole launch BATCH for the mainnet path: SET_PATH, both library pins, then the executor + DVN config on
-    /// the pinned libraries (one 48h window). `path` = `mainnetPath(...)`.
+    /// @notice The inbound delay settings both paths launch with, set per path by ImdBridge.SET_DELAY
+    /// (kind 15) in the launch BATCH; the bridge also writes the same values at a path's first SET_PATH (its DEFAULT_*), so a
+    /// rule test pins these to them. Governable afterwards: loosening through the 48h timelock, tightening
+    /// instantly (`tighten`, which also takes the bulk-cancel cutoff); no bound on the cap and the breaker, the delay within [1 h, 7 days].
+    /// INSTANT_CAP: most imdUSD a path mints at once per day (decaying); a larger message, or one past what is left, waits.
+    uint256 internal constant INSTANT_CAP = 5_000e18;
+    /// CLAIM_DELAY: how long a queued transfer waits before anyone may claim it: the Safe's window to pause or cancel.
+    uint256 internal constant CLAIM_DELAY = 12 hours;
+    /// QUEUE_BREAKER: most imdUSD a path may queue in 4 UTC days before its claims stop until a timelocked RESET_BREAKER
+    /// (50,000 for whales: with no human action a 72 h weekend can lose 4 x 5,000 + 50,000 = 70,000, above the
+    /// 30,000 chain line, accepted; the line holds when the Safe acts within CLAIM_DELAY: 5,000 + 2,500 = 7,500).
+    uint256 internal constant QUEUE_BREAKER = 50_000e18;
+
+    /// @notice ImdBridge.SET_DELAY for the path from `srcEid`, at the launch values.
+    function delaySettings(uint32 srcEid) internal pure returns (bytes memory) {
+        return abi.encode(uint8(15), srcEid, INSTANT_CAP, CLAIM_DELAY, QUEUE_BREAKER, uint256(0), uint256(0)); // no cutoff; version 0: a fresh path
+    }
+
+    /// @notice 4663's whole launch BATCH for the mainnet path: SET_PATH, the delay settings, both library pins, then the
+    /// executor + DVN config on the pinned libraries (one 48h window). `path` = `mainnetPath(...)`.
     function launchBatch4663(bytes memory path) internal pure returns (bytes memory) {
         (bytes memory sl, bytes memory rl) = lzLibraries4663();
         (bytes memory sc, bytes memory rc) = lzConfig4663();
-        return _batch5(path, sl, rl, sc, rc);
+        return _batch6(path, delaySettings(MAINNET_EID), sl, rl, sc, rc);
     }
 
     /// @notice Mainnet's launch BATCH for the 4663 path. `path` = `robinhoodPathOnMainnet(...)`.
     function launchBatchMainnet(bytes memory path) internal pure returns (bytes memory) {
         (bytes memory sl, bytes memory rl) = lzLibrariesMainnet();
         (bytes memory sc, bytes memory rc) = lzConfigMainnet();
-        return _batch5(path, sl, rl, sc, rc);
+        return _batch6(path, delaySettings(EID), sl, rl, sc, rc);
     }
 
-    function _batch5(bytes memory a, bytes memory b, bytes memory c, bytes memory d, bytes memory e)
+    function _batch6(bytes memory a, bytes memory f, bytes memory b, bytes memory c, bytes memory d, bytes memory e)
         private
         pure
         returns (bytes memory)
     {
-        bytes[] memory items = new bytes[](5);
-        (items[0], items[1], items[2], items[3], items[4]) = (a, b, c, d, e);
+        bytes[] memory items = new bytes[](6);
+        (items[0], items[1], items[2], items[3], items[4], items[5]) = (a, f, b, c, d, e);
         return abi.encode(uint8(6), items);
     }
 
@@ -1102,21 +1145,58 @@ library RobinhoodConfig {
         (dvns[0], dvns[1], dvns[2]) = (sorted[0], sorted[1], sorted[2]);
         SetConfigParam[] memory sp = new SetConfigParam[](2);
         sp[0] = SetConfigParam(remote, 1, abi.encode(ExecutorConfig(10_000, executor)));
-        sp[1] = SetConfigParam(remote, 2, abi.encode(UlnConfig(sendConf, 3, 0, 0, dvns, new address[](0))));
+        sp[1] = SetConfigParam(remote, 2, abi.encode(UlnConfig(sendConf, 3, NIL, 0, dvns, new address[](0))));
         send_ = abi.encode(uint8(2), sendLib, sp);
         SetConfigParam[] memory rp = new SetConfigParam[](1);
-        rp[0] = SetConfigParam(remote, 2, abi.encode(UlnConfig(receiveConf, 3, 0, 0, dvns, new address[](0))));
+        rp[0] = SetConfigParam(remote, 2, abi.encode(UlnConfig(receiveConf, 3, NIL, 0, dvns, new address[](0))));
         receive_ = abi.encode(uint8(2), receiveLib, rp);
     }
 
-    /// @notice The Safe's ImdBridge.SET_PATH payload for the 4663 -> mainnet path (after SET_BRIDGE on both chains).
-    function mainnetPath(bytes32 mainnetPeer, bytes memory enforcedOptions) internal pure returns (bytes memory) {
-        return abi.encode(uint8(1), MAINNET_EID, mainnetPeer, OUT_LIMIT, LIMIT_WINDOW, IN_LIMIT, LIMIT_WINDOW, enforcedOptions);
+    /// @notice The IMD type's risk at `line` (genesis: IMD_LINE_GENESIS).
+    function imdRisk(uint128 line) internal pure returns (ParametersBase.Risk memory ir) {
+        ir = _r(1.7e18, IMD_CHOP, 0.05e18, 0, line);
+        ir.skew = 0.1e18;
+    }
+
+    /// @notice The 4663 Safe's Parameters.propose payload that opens the IMD type: SET_RISK (kind 1, 48h, then anyone calls
+    /// applyPending) with the line set to IMD_LINE (3,000) and every other field as `live` = Parameters.storedRisk("IMD")
+    /// read on 4663 at build time (SET_RISK replaces the whole struct: building it from the genesis config would undo any
+    /// change the Safe made meanwhile). Propose only after the three IMD swarm feeds are seeded, fresh and within 5% of
+    /// mainnet for a few days (the operator runbook, not public). Mainnet already counts 3,000 in otherImdLines, so no mainnet act is needed.
+    function imdLineRaise(ParametersBase.Risk memory live) internal pure returns (bytes memory) {
+        live.line = IMD_LINE;
+        return abi.encode(uint8(1), bytes32("IMD"), live);
+    }
+
+    /// @notice Destination gas for ImdBridge.lzReceive, enforced on both paths: without it a sender's own
+    /// options set the delivery gas, and an under-funded message waits at the endpoint (retryable, but stuck until someone
+    /// pays). MEASURED on the real mainnet EndpointV2 WITH THE REAL ImdUSD (test/fork/AuditW4BridgeEndpoint.t.sol
+    /// test_fork_lzReceiveGasRealImdUsd; re-measured on the audited code after the instant meter + governable delay: the earlier
+    /// 155,179 / 163,815 used a two-slot stub token): a path's first message on a token's first mint 192,275; first message to
+    /// a new holder after an expired hold 166,812; a steady path to a new holder 124,083, 132,827 after an expired hold with
+    /// the fee-base bucket rolled. 250,000 covers all today.
+    /// GLAMSTERDAM (EIP-8037/8038 as published, not final: a new slot 22,100 -> 110,020, an update 5,000 -> 12,100) would
+    /// make them ~653,175 / 466,072 / 261,703 / 270,447 (estimate from the slots written): 250,000 would NOT cover a path's
+    /// first messages nor a steady-path worst case. Raise it (SET_PATH, 48 h) before the fork; a short message only waits at
+    /// the endpoint (anyone retries with more gas). The 4663 side runs the same code (ArbOS meters EVM execution like L1).
+    /// A sender's extra options ADD to this.
+    uint128 internal constant LZ_RECEIVE_GAS = 250_000;
+
+    /// @notice The enforced options for SET_PATH: one type-3 executor lzReceive option (OptionsBuilder.addExecutorLzReceiveOption:
+    /// TYPE_3, worker 1 = executor, size 17, option 1 = LZRECEIVE, uint128 gas; no native value).
+    function enforcedOptions() internal pure returns (bytes memory) {
+        return abi.encodePacked(uint16(3), uint8(1), uint16(17), uint8(1), LZ_RECEIVE_GAS);
+    }
+
+    /// @notice The Safe's ImdBridge.SET_PATH payload for the 4663 -> mainnet path (after SET_BRIDGE on both chains), with the
+    /// enforced delivery gas.
+    function mainnetPath(bytes32 mainnetPeer) internal pure returns (bytes memory) {
+        return abi.encode(uint8(1), MAINNET_EID, mainnetPeer, OUT_LIMIT, LIMIT_WINDOW, IN_LIMIT, LIMIT_WINDOW, enforcedOptions());
     }
 
     /// @notice The mirror on mainnet's bridge: out = 4663's in, in = 4663's out (a forged 4663 message mints at most that).
-    function robinhoodPathOnMainnet(bytes32 robinhoodPeer, bytes memory enforcedOptions) internal pure returns (bytes memory) {
-        return abi.encode(uint8(1), EID, robinhoodPeer, IN_LIMIT, LIMIT_WINDOW, OUT_LIMIT, LIMIT_WINDOW, enforcedOptions);
+    function robinhoodPathOnMainnet(bytes32 robinhoodPeer) internal pure returns (bytes memory) {
+        return abi.encode(uint8(1), EID, robinhoodPeer, IN_LIMIT, LIMIT_WINDOW, OUT_LIMIT, LIMIT_WINDOW, enforcedOptions());
     }
 
     function _cl(address agg, uint8 dec) private pure returns (DeployTypes.FeedNode memory n) {

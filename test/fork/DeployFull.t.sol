@@ -187,9 +187,13 @@ contract DeployFullForkTest is CompoundSystem {
         _leaf(MainnetConfig.F_NHI, 0.98e18);
     }
 
+    /// @dev A leaf holding `v` as an honest, converged attestation would: stored == attested (audit wave 4: the twin rule reads
+    /// the median's attested value, so mocking only latestValue made a leaf no real attestation can produce).
     function _leaf(uint8 node, uint256 v) internal {
         vm.mockCall(address(d.feeds[node]), abi.encodeWithSignature("latestValue()"), abi.encode(v, uint64(block.timestamp)));
         vm.mockCall(address(d.feeds[node]), abi.encodeWithSignature("isStale()"), abi.encode(false));
+        vm.mockCall(address(d.feeds[node]), abi.encodeWithSignature("attested()"), abi.encode(v));
+        vm.mockCall(address(d.feeds[node]), abi.encodeWithSignature("converged()"), abi.encode(true));
     }
 
     /// @dev Chainlink USDC/USD at its forked answer stamped now (the PegHook's quote gate, fix A4).

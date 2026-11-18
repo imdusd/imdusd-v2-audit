@@ -140,6 +140,8 @@ abstract contract DeployBase is Script {
 
     error ModuleNeeds(string module, string what);
     error WrongChain(uint256 expected, uint256 actual);
+    /// @notice A deploy on chain 4663 whose governor has no code (zero until the 4663 Safe exists).
+    error NoSafe(uint256 chainId, address governor);
     error LibraryMissing(address lib);
     error BadDexPrice(uint160 sqrtPriceX96);
     error HookNotDeployed();
@@ -204,14 +206,26 @@ abstract contract DeployBase is Script {
         return ok && ret.length == 32;
     }
 
-    /// @notice True when node `i` is a proven pool price or priced through one (the Pricer's twin trait, design C). The deployed
-    /// feed must report the same through `FeedTraits.proven` (LaunchBase._checkFeeds).
+    /// @notice True when node `i` is a proven pool price or priced through one with no attester in its path (the Pricer's
+    /// twin trait, design C). The deployed feed must report the same through `FeedTraits.proven` (LaunchBase._checkFeeds).
+    /// Mirrors ProductFeed.proven() (audit wave 4, C5): a product is proven only when one input is and the other is
+    /// attester-free (proven, or a feed that answers no `converged()`: Chainlink, a live pool). An EXISTING node is read as
+    /// not free (unknown here), so a product over one fails the launch check rather than passing on the contract's word.
     function _provenAtDeploy(DeployTypes.FeedNode[] memory nodes, uint256 i) internal pure returns (bool) {
         DeployTypes.FeedNode memory n = nodes[i];
         if (n.kind == DeployTypes.PROVEN_POOL) return true;
-        if (n.kind == DeployTypes.PRODUCT) return _provenAtDeploy(nodes, n.a) || _provenAtDeploy(nodes, n.b);
+        if (n.kind == DeployTypes.PRODUCT) {
+            return (_provenAtDeploy(nodes, n.a) && _attesterFreeAtDeploy(nodes, n.b))
+                || (_provenAtDeploy(nodes, n.b) && _attesterFreeAtDeploy(nodes, n.a));
+        }
         if (n.kind == DeployTypes.RATE) return _provenAtDeploy(nodes, n.a);
         return false;
+    }
+
+    /// @dev FeedTraits.attesterFree at deploy: proven, or a node kind whose contract answers no `converged()`.
+    function _attesterFreeAtDeploy(DeployTypes.FeedNode[] memory nodes, uint256 i) internal pure returns (bool) {
+        uint8 k = nodes[i].kind;
+        return k == DeployTypes.CHAINLINK || k == DeployTypes.LIVE_POOL || _provenAtDeploy(nodes, i);
     }
 
     function _swarmQuestion(uint8 kind) internal pure returns (bytes memory) {
@@ -269,7 +283,7 @@ abstract contract DeployBase is Script {
         revert NeedsDeployChain();
     }
 
-    function _newBridge(address, address, address, address, address) internal virtual returns (ImdBridge) {
+    function _newBridge(address, address, address, address) internal virtual returns (ImdBridge) {
         revert NeedsDeployChain();
     }
 

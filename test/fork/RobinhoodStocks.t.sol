@@ -23,6 +23,14 @@ interface IStockToken {
     function adminBurn(address from, uint256 amount) external;
 }
 
+interface IUsdgRoles {
+    function defaultAdmin() external view returns (address);
+    function grantRole(bytes32 role, address account) external;
+    function freeze(address a) external;
+    function unfreeze(address a) external;
+    function isFrozen(address a) external view returns (bool);
+}
+
 interface IStockRegistry {
     function pause() external;
     function unpause() external;
@@ -134,8 +142,12 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         _walk(open);
         _spy(gapped);
         d.liquidator.liquidate(_pid(SPY, alice));
-        _walk(open + 1 hours);
-        _spy(gapped);
+        // the keeper ticks the live auction every TICK_SPAN (its clock runs on takeable time, audit wave 4)
+        while (vm.getBlockTimestamp() < open + 1 hours) {
+            _walk(vm.getBlockTimestamp() + _join().TICK_SPAN());
+            _spy(gapped);
+            _join().tick(_pid(SPY, alice));
+        }
         // per 1e18 vault shares = 1e-6 SPY (StockVault offset)
         assertEq(_join().price(_pid(SPY, alice)), uint256(gapped) * 1e10 * 0.9e18 / 1e18 / 1e6, "the floor");
         _give(RobinhoodConfig.USDG, taker, 10_000e6);
@@ -218,7 +230,7 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         _walk(open);
         _spy(spyAnswer * 60 / 100);
         d.liquidator.liquidate(_pid(SPY, alice));
-        (uint64 at,) = _join().auctions(_pid(SPY, alice));
+        (uint64 at,,,) = _join().auctions(_pid(SPY, alice));
         assertEq(at, open, "the auction opens with the session");
     }
 
@@ -248,6 +260,40 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         emit log_named_uint("USDG from the pool", usdgAfter - (usdgBefore - paid));
     }
 
+    /// @notice FIXED BEFORE AUDIT WAVE 5 on the REAL USDG: Paxos's own `freeze` (its asset-protection role, granted by the token's real
+    /// default admin) at the StockJoin reverts every take, so the auction shows no price and its clock stops; after `unfreeze`
+    /// the price resumes where it stood (at most TICK_SPAN lower) and a take settles.
+    function test_usdgFreezeAtTheJoinStopsTheAuctionClock() public {
+        _inSession();
+        _position(3e18, 1_500e18);
+        _spy(spyAnswer * 80 / 100);
+        uint256 id = _pid(SPY, alice);
+        d.liquidator.liquidate(id);
+        uint256 p0 = _join().price(id);
+        _give(RobinhoodConfig.USDG, taker, 10_000e6);
+        _approveAll(taker); // before the freeze: the real USDG refuses an approval of a frozen spender
+        IUsdgRoles u = IUsdgRoles(RobinhoodConfig.USDG);
+        bytes32 role = keccak256("ASSET_PROTECTION_ROLE");
+        vm.prank(u.defaultAdmin());
+        u.grantRole(role, address(this));
+        u.freeze(address(_join()));
+        assertTrue(u.isFrozen(address(_join())));
+        assertEq(_join().price(id), 0, "no price while USDG is frozen at the join");
+        for (uint256 i; i < 6; ++i) {
+            _walk(vm.getBlockTimestamp() + 5 minutes);
+            _spy(spyAnswer * 80 / 100);
+            _join().tick(id);
+        }
+        vm.prank(taker);
+        vm.expectRevert();
+        _join().take(id, type(uint256).max);
+        u.unfreeze(address(_join()));
+        uint256 p1 = _join().price(id);
+        assertGe(p1, p0 - p0 / 10 * 5 minutes / 1 hours, "the frozen half hour cost at most TICK_SPAN");
+        vm.prank(taker);
+        _join().take(id, type(uint256).max);
+    }
+
     /// @notice The issuer burns the whole custody (its real `adminBurn`, by its real burner): the type reads unpriced and the
     /// debt is written off as the type's bad debt, permissionlessly.
     function test_adminBurnOfTheCustodyIsWrittenOff() public {
@@ -257,7 +303,12 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         IStockToken(RobinhoodConfig.SPY).adminBurn(address(d.stockVaults[spyIndex]), 3e18);
         assertTrue(d.stockPrices[spyIndex].isStale());
         d.ledger.writeOff(_pid(SPY, alice)); // the first worthless reading only arms
-        vm.warp(vm.getBlockTimestamp() + d.ledger.WRITEOFF_DELAY());
+        // the chain stays alive over the hour (a Pulse poke every 10 min): a silence would open the sequencer grace, in
+        // which the write-off waits like every seizure (wave 5, AuditW5WriteOffGrace)
+        for (uint256 k; k < d.ledger.WRITEOFF_DELAY() / 10 minutes; ++k) {
+            vm.warp(vm.getBlockTimestamp() + 10 minutes);
+            d.pulse.poke();
+        }
         uint256 debt = d.ledger.debtOf(_pid(SPY, alice));
         d.ledger.writeOff(_pid(SPY, alice));
         assertEq(d.stockVaults[spyIndex].balanceOf(address(d.treasury)), 3e24, "seized shares to the Treasury");

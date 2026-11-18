@@ -65,8 +65,9 @@ What this core adds over a plain CDP:
   pass both traits through `FeedTraits`. The Pricer treats a leg that has not converged as not agreeing, so a clamped
   leg prices (and liquidates) but lends nothing. sIMD's SPOT leg is the proven pool price (`ProvenPoolPrice` x ETH/USD x
   the share rate), and for a type whose spot is proven the Pricer's liquidation price is `low = agree ? min(median,
-  spot) : max(median, spot)`: a wrong median cannot liquidate below the proven price, and a pushed proven price cannot
-  lower `low` below the median.
+  spot) : max(spot, min(median, attestedMedian))`, with `attestedMedian` the median leaf's last attested target (changed
+  in wave 4: a median clamped above its target counts at its target): a wrong median cannot liquidate below the proven
+  price, and a pushed proven price cannot lower `low` below what the median attested.
 - **RateManager.** Optional, outside the core: owners grant it SET_RATE only; a manager key re-rates members within fixed
   bounds, each member's own floor and ceiling, and only outside their 7-day rate cooldown.
 
@@ -75,11 +76,14 @@ that push the price away from $1 and runs a capped peg keeper; `SavingsVault` (s
 of borrower interest to savers; identity.md NFT seats as auction-liquidated collateral through per-seat accounts;
 `FeeNotes`; the v1 -> v2 `Migrator`.
 
-All governance goes through `Parameters` (a 2-of-3 Safe as governor). The repository also contains modules that are NOT
-part of the first deployment: a LayerZero V2 bridge (`ImdBridge`, `Pulse`), a leveraged loop vault (`LoopVault`), an AMM
-of two ERC-4626 tokens (`src/dex/`), `RateManager`, and stock-token collateral for Robinhood Chain (`src/stocks/`,
-`MarketCalendar`, `MarketHoursFeed`). The bridge and the stock tokens ship after the beta, with Robinhood Chain, and are
-in scope this round (see Audit scope). `script/` holds only the deploy scripts the tests import.
+All governance goes through `Parameters` (a 2-of-3 Safe as governor). **Launch on 12-07 (changed since the fourth
+audit):** the Ethereum beta AND the full Robinhood Chain (chain 4663) core, with stock-token collateral (`src/stocks/`,
+`MarketCalendar`, `MarketHoursFeed`), the sequencer grace (`Pulse`) and the LayerZero V2 bridge (`ImdBridge`) on both
+chains. Value crosses the bridge only after the Safe's one-time `SET_BRIDGE` on each chain, which the Safe proposes only
+once the re-check of this round's bridge findings comes back clean. Not part of the launch: a leveraged loop vault
+(`LoopVault`), an AMM of two ERC-4626 tokens (`src/dex/`) and `RateManager`. `script/` holds the deploy scripts the tests
+import, plus the four launch files listed under Audit scope (the rest of the launch tooling and the operator runbook are
+not public).
 
 ## Build and test
 
@@ -88,7 +92,7 @@ network is needed for the offline suites.
 
 ```bash
 forge build                                                    # solc via_ir: a clean build takes a long time
-forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,350 tests)
+forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,512 tests)
 forge build --use solar && forge test --use solar --no-match-path 'test/fork/*'   # fast dev loop (see below)
 
 # Fork suites: one file at a time, single-threaded (in parallel, set-up calls hit RPC rate limits)
@@ -114,9 +118,10 @@ and are folded into the judges'. None of these is a third-party audit firm.
 | 0 | 2026-10-30 | In-house adversarial review of the full v2 tree (eleven areas, with PoCs and economic models) | private tree `dd776c7` | in-house | 1 / 4 / 19 / 33 / ~60 | Resolved 2026-10-31 before the first snapshot: the critical, every high and most mediums fixed with regression tests that fail on `dd776c7` (37 fixed, 7 settled by decision, 16 left open with reasons). |
 | 1 | 2026-11-10 | Public audit, wave 1: eight panels (ledger and liquidation, treasury and backstop, oracles and depth, governance, peg, seats, deploy, full system) | `2875ffb` | [`59d97f98`](https://explorer.imd.fun/jobs/59d97f98-3694-4e00-9c77-f2195bd39818) [`584aadc2`](https://explorer.imd.fun/jobs/584aadc2-a902-47dd-b639-e46a8223a277) [`bd0ce553`](https://explorer.imd.fun/jobs/bd0ce553-aab0-46da-be9b-00db8049dbd7) [`cd9184ac`](https://explorer.imd.fun/jobs/cd9184ac-e25e-4415-8605-194bf21e3501) [`561e7d5b`](https://explorer.imd.fun/jobs/561e7d5b-d64f-4233-9443-9761bd51546c) [`3d73817d`](https://explorer.imd.fun/jobs/3d73817d-9b86-45c4-b371-4e179fb3bb38) [`17e4edf1`](https://explorer.imd.fun/jobs/17e4edf1-6697-4353-9311-12eb9ca61aab) [`4384ebcc`](https://explorer.imd.fun/jobs/4384ebcc-37f4-4bc3-8e2b-fc48f01f0701) | 0 / 0 / 6 / 31 / 43 | In `5de80a6`; tests `AuditW1*`. 57 of the 58 Foundry proofs reproduced before fixing. |
 | 2 | 2026-11-13 | Public audit, wave 2: three panels (money paths, prices, running the system), each re-checking the wave-1 fixes | `5de80a6` | [`5fcd4063`](https://explorer.imd.fun/jobs/5fcd4063-312b-4b6f-aa7b-e848428876a7) [`5a8d427d`](https://explorer.imd.fun/jobs/5a8d427d-7b2d-401b-b11d-86ecf5b96364) [`62b92eb1`](https://explorer.imd.fun/jobs/62b92eb1-7472-440c-ad76-2e55e66a1f65) | 0 / 1 / 3 / 8 / 5 | In `c64ecee`; tests `AuditW2*`. |
-| 3 | 2026-11-14 | Public audit, wave 3: three panels re-checking the wave-2 fixes (Allocator, Backstop, imdUSD; SwarmFeed and seats; Parameters and depth); a gas review alongside | `c64ecee` | [`f3a96d58`](https://explorer.imd.fun/jobs/f3a96d58-3fc2-418b-b2e9-cd72c50fd656) [`ff9ebb9d`](https://explorer.imd.fun/jobs/ff9ebb9d-f675-492e-84e4-32cf85c0375a) [`b19b5e0c`](https://explorer.imd.fun/jobs/b19b5e0c-704e-4104-a012-f4a8bfc22b72) | 0 / 0 / 4 / 6 / 7 | In `67eadea` (this snapshot); tests `AuditW3*`, each with a property test that fails on `c64ecee`. |
-| 4 | 2026-11-15 | Public audit, wave 4: price design C, the LayerZero bridge, Robinhood stock tokens | `67eadea` | [`0cb1541e`](https://explorer.imd.fun/jobs/0cb1541e-5d63-4866-815a-425703d326e1) [`34e546c2`](https://explorer.imd.fun/jobs/34e546c2-837d-46c9-8a21-0671ec934a8b) [`549dae1c`](https://explorer.imd.fun/jobs/549dae1c-abf5-4fad-9d13-d4571492dd9b) | price 0 / 0 / 2 / 4 / 0; bridge 0 / 2 / 1 / 9 / 2; stocks 0 / 2 / 2 / 4 / 1 | Every finding reproduced and fixed on branches, each with a property test. **Not yet in this snapshot**: they land in the next wave's snapshot. |
-| 4k | 2026-11-15 | Public audit of the v2 keeper (an off-chain process with no on-chain rights), in [imdusd/imdusd-v2-keeper-audit](https://github.com/imdusd/imdusd-v2-keeper-audit) | `e53d362` | [`ae48df88`](https://explorer.imd.fun/jobs/ae48df88-ca87-40e8-b8c2-5ed739b81de5) | 0 / 2 / 8 / 2 / 1 | Fixed on a branch, with the judge's 12 proofs kept as regression tests; not yet published. |
+| 3 | 2026-11-14 | Public audit, wave 3: three panels re-checking the wave-2 fixes (Allocator, Backstop, imdUSD; SwarmFeed and seats; Parameters and depth); a gas review alongside | `c64ecee` | [`f3a96d58`](https://explorer.imd.fun/jobs/f3a96d58-3fc2-418b-b2e9-cd72c50fd656) [`ff9ebb9d`](https://explorer.imd.fun/jobs/ff9ebb9d-f675-492e-84e4-32cf85c0375a) [`b19b5e0c`](https://explorer.imd.fun/jobs/b19b5e0c-704e-4104-a012-f4a8bfc22b72) | 0 / 0 / 4 / 6 / 7 | In `67eadea`; tests `AuditW3*`, each with a property test that fails on `c64ecee`. |
+| 4 | 2026-11-15 | Public audit, wave 4: price design C, the LayerZero bridge, Robinhood stock tokens | `67eadea` | [`0cb1541e`](https://explorer.imd.fun/jobs/0cb1541e-5d63-4866-815a-425703d326e1) [`34e546c2`](https://explorer.imd.fun/jobs/34e546c2-837d-46c9-8a21-0671ec934a8b) [`549dae1c`](https://explorer.imd.fun/jobs/549dae1c-abf5-4fad-9d13-d4571492dd9b) | price 0 / 0 / 2 / 4 / 0; bridge 0 / 2 / 1 / 9 / 2; stocks 0 / 2 / 2 / 4 / 1 | In this snapshot (the fifth commit); tests `AuditW4*`, each with a property test that fails on `67eadea`; the bridge then moved to holds with no guardian (`BridgeHold.t.sol`). |
+| 4k | 2026-11-15 | Public audit of the v2 keeper (an off-chain process with no on-chain rights), in [imdusd/imdusd-v2-keeper-audit](https://github.com/imdusd/imdusd-v2-keeper-audit) | `e53d362` | [`ae48df88`](https://explorer.imd.fun/jobs/ae48df88-ca87-40e8-b8c2-5ed739b81de5) | 0 / 2 / 8 / 2 / 1 | Fixed, with the judge's proofs kept as regression tests; published as the keeper repository's second commit. |
+| 5 | 2026-11 | Public audit, wave 5: the bridge and its Safe batches, Robinhood Chain core and stocks, a price re-check, the keeper | this snapshot | (to be listed) | | |
 
 The "Known issues" and "What changed since" sections below list, wave by wave, what each audit found that we accept and
 what each snapshot changed.
@@ -128,7 +133,7 @@ with a small script (the same rule as `cloc`'s code lines; pragma and import lin
 higher figures than the previous snapshot's table (for example 1,049 against 1,014 for the same old core files), so
 compare areas within this table, not across snapshots.
 
-**Round 1: what the beta deploys (7,865 nSLOC, plus 349 vendored)**
+**Round 1: what the beta deploys (7,950 nSLOC, plus 349 vendored)**
 
 The beta is `script/DeployBeta.s.sol`, which runs `script/Deploy.s.sol` with `BetaConfig` (`script/DeployConfig.sol`):
 the full mainnet config with lower lines, a 300k chain-wide debt cap, seats on, and LoopVault and the DEX off. It
@@ -136,26 +141,35 @@ deploys every contract below.
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,645 |
-| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 562 |
-| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min`, `ProvenPoolPrice`, `FeedTraits` | 755 |
+| A. Core | `Ledger`, `LedgerBase`, `LedgerSettlement`, `PositionNFT`, `SortedPositions`, `Join`, `ImdUSD`, `Migrator`, `SavingsVault`, `TransientReentrancyGuard`, `IPositions` | 1,667 |
+| B. Liquidation and redemption | `Liquidator`, `Redeemer`, `Pricer`, `Treasury` | 567 |
+| C. Feeds | `ChainlinkFeed`, `ProductFeed`, `RateFeed`, `LivePoolPrice`, `SwarmFeed`, `SwarmFeeds`, `IFeed`, `IERC4626Min`, `ProvenPoolPrice`, `FeedTraits` | 812 |
 | D. Peg | `PegHook`, `FeeNotes` | 596 |
-| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,155 |
+| E. Governance | `Parameters`, `ParametersBase`, `ParametersRules`, `Governed`, `GovernedByKind` | 1,156 |
 | F. Seats | `SeatAccount`, `SeatJoin`, `SeatFeed` | 871 |
 | G. Peg LP vault and PEG positions | `PegLPVault`, `PegCollateral`, `PegShareFeed`, `PegPositionZap` | 599 |
 | H. Backstop and Allocator | `Backstop`, `IBackstop`, `PricerOracle`, `Allocator` | 1,252 |
 | I. Measured depth | `DepthSampler`, `ImdDepth` | 430 |
 | Vendored (in scope as used) | `src/vendor/optimism`: `MerkleTrie`, `SecureMerkleTrie`, `RLPReader`, `RLPErrors`, `Bytes` (op-contracts/v9.0.0, imports made relative; PROVENANCE.md) | 349 |
 
-**Round 2, audited early: what ships after the beta, with Robinhood Chain (662 nSLOC)**
+**Round 2: Robinhood Chain and the bridge, launching on 12-07 with the beta (1,843 nSLOC)**
 
-New in scope this round. These do not deploy in the beta; they ship with the Robinhood Chain core after it, and are
-audited now so that findings land before they deploy.
+Audited early in wave 4 as "after the beta"; they now launch on 12-07. Robinhood Chain runs the SAME core contracts as
+Round 1 (one `Ledger`, `Parameters`, `Pricer`, ... per chain) with its own configuration; the chain-specific pieces are
+below. The Robinhood configuration, its deploy scripts and the bridge Safe batches are in scope for the first time.
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE`), `Pulse` (the sequencer grace on a chain with no uptime feed) | 412 |
-| Stock tokens | `src/stocks/StockVault.sol`, `src/stocks/StockJoin.sol`, `src/feeds/MarketHoursFeed.sol`, `src/feeds/MarketCalendar.sol` | 250 |
+| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE` and `ImdUSD.checkBridge`; per-path inbound delay: instant cap, claims, cancels, bulk-cancel cutoff, queue breaker, governable settings; Safe-only pause, hold, void, cancel and tighten, no guardian), `Pulse` (the sequencer grace on a chain with no uptime feed) | 735 |
+| Stock tokens | `src/stocks/StockVault.sol`, `src/stocks/StockJoin.sol`, `src/feeds/MarketHoursFeed.sol`, `src/feeds/MarketCalendar.sol` | 351 |
+| Robinhood configuration (new in scope) | `library RobinhoodConfig` in `script/DeployConfig.sol` (types, mats, lines incl. the IMD line 0 at genesis and its raise payload, feeds, chain line, Pulse gap/grace, bridge limits and inbound-delay launch values, DVNs, confirmations, enforced `lzReceive` gas) | 303 |
+| Robinhood deploy (new in scope) | `script/DeployRobinhood.s.sol`, `script/DeployChain.s.sol`, `script/deploy/StageChain.sol` (Pulse, ImdBridge and the stock module as resumable deploy hooks) | 204 |
+| Bridge Safe batches (new in scope) | `script/launch/BridgeBatch.s.sol` (each chain's path BATCH, and the separate, gated `SET_BRIDGE` file), `script/launch/Safe4663.s.sol` (re-creates the mainnet governance Safe at the same address on 4663, simulation only) | 250 |
+
+Compile-only, OUT of scope: `script/launch/LaunchBase.sol` and `script/launch/SafeBatch.s.sol` (1,066 nSLOC), included
+only because the bridge batches import them (the deployment record, the stage post-checks and the Safe Transaction
+Builder file writer). The rest of the launch tooling (the staged launch scripts, `launch.sh`, rehearsals, the operator
+runbook) is not public.
 
 **Other later modules**
 
@@ -165,13 +179,14 @@ audited now so that findings land before they deploy.
 | Loop vault | `src/earn/LoopVault.sol` | 510 | out of scope |
 | DEX | `src/dex/` | 875 | out of scope |
 
-Out of scope: `test/`, `script/`, `lib/`, unless a finding in scope reaches through them. The deploy scripts are worth
+Out of scope: `test/`, `script/` (except the Round 2 files named above), `lib/`, unless a finding in scope reaches through them. The deploy scripts are worth
 reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and sealed, and what is left to governance.
 
 ## Key invariants
 
 1. **Supply equation.** At rest, `totalSupply == Σ debt + Σ badDebt + reserveBacked + migrator outstanding + peg keeper
-   outstanding + bridge received − bridge sent` (see the `LedgerBase` header). Flash-minted amounts exist only inside a
+   outstanding + bridge received − bridge sent` (see the `LedgerBase` header; a queued inbound bridge transfer counts as
+   received when it is claimed, and the bridge's `queued` holds what is pending). Flash-minted amounts exist only inside a
    transaction (`circulating()` is the supply before the transaction's first mint or burn). The edge premium and interest are minted on both sides at once.
 2. **Solvency and health.** No action that adds debt or removes collateral leaves a position below its type's liquidation
    ratio at the borrow price (`min(low, cap)`), and none is allowed unless the price is fresh, its two legs agree
@@ -192,7 +207,8 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
    proposal expires 14 days after its ETA; one pending slot per kind.
 8. **Minters set once.** imdUSD has four minters, each fixed once: `ledger` and `migrator` (wired by the deployer),
    `keeper` (the peg hook, set by the deployer before the seal) and `bridge` (set once through the timelocked
-   `Parameters`; empty in the beta). The imdUSD token has no owner, upgrade, pause or rescue.
+   `Parameters`; on each chain the Safe proposes it only once the bridge re-check is clean, and until it applies the
+   bridge mints nothing). The imdUSD token has no owner, upgrade, pause or rescue.
 
 ## Trust model
 
@@ -202,7 +218,27 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
   `Allocator.returnToTreasury` (funds held there back to the Treasury, no bucket), and `Treasury.retireReserve` (burning
   Treasury imdUSD against reserve-backed supply; it was permissionless before wave 2). It cannot move user collateral or
   mint imdUSD directly. It can name one bridge minter, once, through the 48-hour timelock (`SET_BRIDGE`): that minter
-  can mint without limit and burn from any holder. The beta leaves the slot empty.
+  can mint without limit and burn from any holder. `ImdUSD.checkBridge` refuses, at propose and at apply, a candidate
+  that does not report itself wired to this chain's imdUSD, LayerZero EndpointV2, Safe and Treasury (it reads the
+  candidate's own views, so a contract written to report that wiring passes). On 12-07 it names `ImdBridge` on both chains, once the bridge
+  re-check is clean (`script/launch/BridgeBatch.s.sol` refuses to write that file otherwise).
+- **Bridge (no guardian):** only the Safe acts on `ImdBridge`. Its instant acts can only close or delay: `pause` a path,
+  `hold` one inbound message (72 h, once per nonce, never renewable), `voidPayload` a payload hash for good,
+  `cancelClaim` one queued transfer, `tighten` a path's delay settings (lower the instant cap or the queue breaker,
+  lengthen the delay, move the bulk-cancel cutoff earlier) and `tripBreaker`. Everything that opens, loosens or releases
+  (UNPAUSE, RELEASE, UNVOID, UNCANCEL, RESET_BREAKER, SET_DELAY, paths, libraries, DVN configs, limits) waits 48 hours,
+  and once it has waited anyone may apply it. Value relies on the DVN set (3 required: LayerZero Labs, Twinstake, P2P;
+  floors in source) and LayerZero's EndpointV2. Against a compromised DVN set the INBOUND DELAY is the bound: per path,
+  what mints at once is at most the instant cap C per day (decaying; C + C x t / 1 day over any interval t); anything else
+  queues and is claimable by anyone only after the path's delay D, inside which the Safe pauses the path or cancels; with
+  no human action at all, at most the queue breaker B queued within 4 UTC days reaches a claim before the path trips
+  (launch values per path: C 5,000/day, D 12 h, B 50,000; limits 50,000 per day each way). The minimum transfer (10
+  imdUSD) bounds how many honest nonces a forger can consume. An off-chain watcher holds no key: it matches `Received`,
+  `Queued` and `PacketVerified` on one chain with `Sent` on the other and alerts the Safe's signers.
+- **Robinhood Chain sequencer:** a silence longer than the Pulse gap opens a grace in which liquidations, stock auction
+  takes, write-offs, redemptions and new debt (a borrow, a withdrawal that leaves debt, a charged rate change) wait;
+  repayment and deposits always run. The Pulse sees only silence: anyone may poke it, so a sequencer that censors but
+  still includes a poke opens no grace (accepted).
 - **Swarm attester:** swarm-priced feeds (sIMD legs, NHI, seat median and spot, the depth leg) accept an EIP-712
   attestation only from one pinned signer, for one pinned question (bound by hash), with absolute floors (panel of at
   least 100, at least 51 agreeing). Every valid attestation is a target: the stored value moves toward it by at most a
@@ -230,7 +266,7 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
   burn, ERC-4626 and Compound-style redeem/withdraw, ERC-6909 operator forms and others). A denylist cannot be complete:
   what a selector does is the target's code, so every claim-rule proposal must be reviewed against the target's ABI and
   code before the Safe signs it.
-- **Issuers:** USDC/USDT can blacklist addresses; stock tokens (round 2, after the beta) carry issuer pause, blocklist and `adminBurn`
+- **Issuers:** USDC/USDT can blacklist addresses; stock tokens (Robinhood Chain) carry issuer pause, blocklist and `adminBurn`
   keys that the protocol cannot prevent, only cap by debt lines.
 - **Relayers and samplers:** permissionless; liveness of swarm-priced types depends on someone buying and relaying
   attestations. Stale prices stop borrowing, not repayment.
@@ -266,7 +302,7 @@ Items below are known and do not need to be reported unless you find a materiall
 - `PegLPVault` has no deposit hold, so just-in-time deposits around known fee or donation arrivals are possible.
 - DEX (round 2): IMD outputs require `hookData` naming the recipient; price limits are checked by the hook only;
   deposits and compounding can be delayed at a cost.
-- Stock types (round 2) are priced by a single leg.
+- Stock types are priced by a single leg.
 
 ### Known issues added 2026-11-07
 
@@ -395,8 +431,8 @@ redemption payout and `agree` only; `borrowable` and `low` do not read it.
   operator's duty. (Since wave 4, on a remote chain with no block clock only the deployment may relay it.)
 - **Edge bootstrap renewal.** The Safe can renew an edge type's 60-day bootstrap allowance by disabling it (instant) and
   re-listing it (48 h); while disabled, borrowing and the standing bid on it are off.
-- **Redemptions ignore the Pulse.** A redemption can run inside a sequencer grace that holds liquidations (Robinhood chain
-  only; mainnet has no Pulse).
+- **Redemptions ignore the Pulse. RESOLVED in wave 5:** the Redeemer refuses (`SequencerGrace`) while `Pulse.inGrace()`
+  reads true, the same condition that holds liquidations.
 - **Flash cap is per loan in flight, not per transaction.** Sequential flash loans in one transaction each get the full
   cap; `circulating()` stays correct.
 - **`circulating()` and flash loans (superseded in wave 2: now the supply before the transaction's first mint or burn;
@@ -482,6 +518,209 @@ asked to refute or bound more tightly.
   the epoch then re-anchors at the stored value at the cap, whoever lands first.
 - **A clamped depth leg.** The swarm depth leg is clamped too, so its stored value may be one nobody attested; it is only
   ever min'd with the sampler sum, so it can lower depth, never raise it.
+
+### Known issues added after the fourth public audit (wave 4, 67eadea)
+
+Residuals of the wave-4 fixes and of the bridge hold design. The bridge items are what the bridge panel of this round
+is asked to refute or bound more tightly.
+
+Bridge:
+- **Response speed is the Safe's.** There is no guardian: every instant act (pause, hold, void) needs a 2-of-3 Safe
+  signature round. Between a forgery verifying and the Safe acting, the inbound limit is the bound: about 2 x
+  `IN_LIMIT` per window can be minted (10,000 per day each way at launch, so up to ~20,000 inside 24 h, within the
+  4663 chain line of 30,000; `test/unit/AuditW4BridgeInLimitLine.t.sol` pins `2 x IN_LIMIT <= CHAIN_LINE`). (changed
+  before wave 5: the limits are now 50,000 per day each way and the bound is the inbound delay; that test now pins the
+  delay's bounds on the launch values. See the next section.)
+- **A hold only helps a message still waiting at the endpoint.** `hold` binds a payload the endpoint stores at a nonce
+  that has not executed. A forged message that executes in the block it is verified (inside the limit, path open) is
+  minted before any hold; the inbound limit is then the bound. (changed before wave 5: only what fits the path's instant
+  cap mints in that call; the rest queues for the delay, where the Safe pauses or cancels.)
+- **A compromised DVN set** can still consume up to `2 x limit / MIN_AMOUNT` honest nonces per window (10,000 at the
+  50,000 limits; a forged execution spends the nonce even when its claim is later cancelled) and overwrite an
+  honest payload waiting at the same nonce, until the SOURCE path is paused; the user's burn on the source chain is then
+  lost. A held honest payload overwritten during the hold never auto-releases: it waits for the DVNs to verify it back
+  or for the timelock's RELEASE.
+- **Detection is off chain and cross-chain.** `netMinted()` cannot show a forgery (the supply equation holds after one);
+  the watcher matches `Received` nonces against the peer's `Sent` nonces. Paging the signers is off chain.
+- **An honest payload voided by mistake** waits for UNVOID (48 h); the endpoint keeps its proof, so no DVN signs again.
+  The timelocked `ENDPOINT_NILIFY` is a clean-up only: after an endpoint nilify every required DVN must sign again.
+- **Limits.** Lowering an inbound limit needs a paused path (operator procedure: lower the peer's outbound first and let
+  its in-flight land); the two chains are governed separately. Lowering to a tiny non-zero limit and raising it later
+  (two 48 h proposals) still frees room. Nothing stops a later `SET_CHAIN_LINE` lowering the 4663 line below 2 x the
+  live inbound limit. (changed before wave 5: the 2 x limit rule was replaced by the inbound delay's bounds; `tighten`
+  does not lower a limit, so lowering one still needs a paused path.)
+- **A library that rejects `setConfig`** (for example LayerZero's BlockedMessageLib) passes the proposal check and
+  reverts at application; no value moves. An endpoint act (burn, skip) accepted at proposal can still revert at
+  application if the endpoint state changed in the 48 h.
+- **20 confirmations from 4663 are seconds** of one sequencer's soft confirmations; a deeper reorg after the DVNs sign
+  leaves a mint on Ethereum whose burn is gone, bounded by Ethereum's inbound limit from 4663 (since the inbound delay,
+  a transfer above the instant cap waits the delay first).
+- **Native value** an executor forwards to `lzReceive` stays in the bridge (dust; `send` never spends it).
+
+Price design:
+- **The attested median lags a one-block fall** (a window median reads the pre-fall level for ~2 h): after a real fall
+  `low` reaches the market once a median whose window is mostly past the fall is attested and relayed.
+- **NHI moves one cap per day** (no wide step after a silence), which still moves mat by more than `skew` from some
+  levels (from NHI 0.85 a 20% step moves mat 1.70 -> 1.90); a compromised key reaches about mat 2.0 in two days.
+  The response is `lowerLine(ilk, 0)` and a re-point (48 h). (changed before wave 5: NHI is now bounded per window of
+  time, not per epoch; see the next section.)
+- **A prover chooses among the last 32 end-of-block prices** (`PROVE_WINDOW`), within `skew` of the median.
+- **Conservative traits:** a product over a composite of attester-free feeds reads not proven (median rule); a feed whose
+  fallback returns success with empty data reads as "absent".
+
+Stock tokens:
+- **The standing answer after 5 minutes.** From 09:35 New York a type with no in-session print (SGOV; SPY on quiet days)
+  is priced from the overnight or heartbeat answer, trusted only through the feed's deviation trigger. Up to 5 minutes
+  of each open are unpriced (no borrow, bite or take; repay and deposit unaffected).
+- **Stuck stock.** Stock sent to a `StockVault` outside a deposit (or a reissue above what was burned) is stuck; a
+  partial burn with no reissue closes deposits to that type for good (withdrawals, liquidation and write-off keep working).
+- **Auction clock bound.** Each span in which nobody could take costs at most `TICK_SPAN` (5 min) of descent; without
+  ticks the price falls only 5 min past the last read (the keeper ticks live stock auctions every 5 min).
+- **A multiplier step** freezes the type until someone calls `sync()` and the feed prints afterwards.
+- **Calendar:** an unscheduled closure needs the Safe on the day (`closeDay`, instant, close only).
+- **A real decimals change** of an aggregator leaves the type unpriced until the feed is redeployed.
+- **SGOV's 49 h max age:** a dead SGOV feed prices up to 24 h longer than the other types (a T-bill fund moves ~0.02% a day
+  against a 15% buffer).
+- **After-hours design (the judge's information item):** stock types freeze outside the regular session and every gap
+  is taken at the open; measured closed-market gaps Jun-Nov 2026 sit inside each type's buffer. No stricter ratio for
+  new debt before long closures is built.
+
+Robinhood configuration:
+- **The 4663 IMD type opens at line 0.** Both IMD price legs on 4663 are swarm-attested (no proven leg there); the Safe
+  raises the line to 3,000 (48 h) only after the 4663 IMD feeds have been seeded and compared with mainnet for some days.
+  The IMD OFT on 4663 is owned by an EOA that can set peers (mint IMD on 4663 with no delay).
+- **The 4663 governance Safe** is the mainnet Safe's address re-created on 4663 (`Safe4663.s.sol`); every 4663 deploy
+  path refuses a governor with no code. Anyone may send its creation transaction (the result is the same Safe).
+
+### Known issues of the changes made before this audit (since 67eadea)
+
+The bridge's inbound delay and the other changes listed under "What changed since 67eadea" below, with what we accept.
+Launch values per path: instant cap C 5,000 imdUSD per day, claim delay D 12 h, queue breaker B 50,000 over 4 UTC days,
+limits 50,000 per day each way, 4663 chain line 30,000.
+
+Bridge:
+- **No action over a weekend can lose more than the 4663 line (ACCEPTED).** With no human action, a forged stream makes
+  spendable on a path in any 72 h (`HOLD_TIME`) at most the instant part 4C plus B through claims: 20,000 + 50,000 =
+  70,000, above the 4663 chain line (30,000). This is a decision (B was raised from 10,000 to 50,000 so large honest
+  transfers are not tripped); `test/unit/AuditW4BridgeInLimitLine.t.sol` records it. The safety case is the Safe acting
+  within D of the first forged `Queued`: pause the path, or `tighten` the cap to 0 with a cutoff at or before that
+  `Queued`, cancels everything queued, leaving only the instant part C x (1 + D / 1 day) = 7,500. Paging the signers is
+  off chain.
+- **A pending loosening applies by anyone.** Every timelocked bridge act (SET_DELAY, UNPAUSE, RESET_BREAKER, UNCANCEL,
+  ...) may be applied by anyone once its 48 h has run. In an incident the Safe must also `cancel()` any pending proposal;
+  `tighten` bumps the path's settings version, so a SET_DELAY proposed before it is refused when applied, but other kinds
+  are not versioned.
+- **The delay is read at claim time.** A claim is claimable at `queuedAt` + the path's delay WHEN CLAIMED: an instant
+  lengthening applies to every pending claim, and a shortening (48 h, public) to claims already queued once it applies.
+  The `Queued` event carries the claimable time as of queueing only.
+- **The breaker window is 4 UTC days, not rolling.** More than B queued on a path within the current UTC day and the 3
+  before trips it; claims (honest ones included) then wait for a timelocked RESET_BREAKER naming that trip. Nothing
+  expires. Receipts, instant mints and queueing go on while tripped.
+- **Bulk cancel is a cutoff, not a list.** `tighten(..., cancelFrom)` refuses at claim time every claim queued at or
+  after the cutoff (honest ones too) until a timelocked SET_DELAY lifts or moves it; claims cancelled one by one stay
+  cancelled until each UNCANCEL (48 h). A cancelled honest claim drops out of `queued` while its burn on the source
+  stands, so the cross-chain sum is short until it is restored.
+- **Honest users above the instant cap wait.** A transfer that does not fit the path's remaining instant allowance (any
+  single transfer above C) waits D and someone must call `claim` (anyone may; the keeper claims matured, matched
+  claims). A pause holds every claim on the path until the 48 h UNPAUSE.
+- **Governable without a bound.** SET_DELAY (48 h) sets C and B to anything their 64-bit shared-decimals fields hold
+  (~1.8e13 imdUSD) and D within [1 h, 7 days]; `MAX_LIMIT` is 250,000,000 imdUSD per window (so a message always fits a
+  claim's 48-bit amount). A larger C or B, or a shorter D, widens both bounds above; that is the Safe's public decision
+  48 h ahead and is not bounded against the line.
+- **`SET_BRIDGE` trusts the candidate's views.** `ImdUSD.checkBridge` reads `token()`, `governor()`, `treasury()` and
+  `endpoint()` from the candidate itself; a contract written to report this wiring passes. Its code can only be compared
+  with an `ImdBridge` build during the 48 h before it applies. `SET_BRIDGE` is one-time.
+- **Enforced `lzReceive` gas 250,000** covers every path today on the real EndpointV2 with the real ImdUSD (worst
+  192,275: a path's first message on the token's first mint; `test/fork/AuditW4BridgeEndpoint.t.sol`). At the
+  Glamsterdam gas prices as published (not final) a path's first messages need about 466,000-653,000 and a steady path
+  about 262,000-270,000: the Safe raises it by SET_PATH (48 h) before that fork. A short message is not lost: it waits
+  at the endpoint and anyone retries it with more gas.
+
+Price:
+- **NHI is bounded per window of time.** Over any window of one maxAge (1 day) every NHI value stays within one cap of a
+  value held in the maxAge before it (an epoch opening less than maxAge after the last move also stays in the previous
+  anchor's band). Within one epoch a compromised key can still swing NHI up a cap and back down; honest hourly relays
+  after a gap follow at worst one cap per two epochs.
+- **The price legs keep wave 4's accepted sliding bound** (only NHI carries its anchor): over a closed maxAge a leg
+  moves at most (1+c)^2-1, after a silence (1+2c)(1+c)^2-1. Accepted because sIMD has the proven twin; 4663's IMD type
+  has no twin (line 0 at genesis, then 3,000).
+
+Robinhood Chain and stocks:
+- **Censorship that still lets a poke through is not detected (ACCEPTED).** The Pulse sees only silence. A sequencer
+  that censors borrowers or liquidators but includes one poke within every 15 min gap opens no grace, so borrowing,
+  seizure and redemption run normally. Robinhood Chain has no sequencer-uptime feed.
+- **New debt and write-offs wait out the grace.** A borrow refused in the first block after an outage reverts, so its
+  own poke does not persist; the next poke (or any non-reverting action) opens the grace.
+- **The USDG freeze stops the auction clock.** `StockJoin` reads USDG's `paused()` and `isFrozen` at the join and the
+  Treasury; if they cannot be read the clock stops and a `tick` reverts. If Paxos removed those views, every auction
+  clock would stop (takes only at the opening price until the auction lapses and is re-bitten): a halt, not a loss. A
+  frozen taker or borrower is not a hold.
+- **StockVault real shares.** A share is worth `totalAssets x shares / totalSupply` (no virtual shares), rounded against
+  the caller. After large forfeits a share can be worth so much that a tiny deposit rounds to few or zero shares: the
+  loss is the depositor's (at most one share's worth) and favours the holders who stay. The donation guard is
+  `managedAssets` alone; an emptied vault restarts its count at the next deposit.
+
+### What changed since the fourth public audit (67eadea)
+
+For the re-check: the fifth commit of this repository is the whole delta. Bridge (wave-4 bridge panel, 2 high, 1 medium,
+9 low, 2 info): a path carries value only while both libraries are pinned and hold this OApp's own floor-checked ULN
+config (`configured[lib][eid]`; SET_PATH and pins refused otherwise; `send`/`lzReceive` revert `Unconfigured`); a
+minimum transfer of 10 imdUSD (`MIN_AMOUNT`), every message metered at no less than it (at most 2 x limit / MIN_AMOUNT
+nonces per window); a void is the bridge's
+own (`voided[hash]`), never undone by a re-verify, lifted only by UNVOID; endpoint burn/skip checked against EndpointV2's
+rules at proposal and application; optional-DVN count NIL accepted and 0 refused; receive-library grace bounded and
+UNPAUSE refused while an old library can verify; one SET_PATH/pin per eid in a BATCH and a closed path keeps its
+in-flight; an inbound limit lowered only on a paused path; re-pinning the current library refused; `IN_LIMIT` into 4663
+10,000 (was 50,000; since back to 50,000 with the inbound delay, below); `Sent`/`Received` carry the path nonce. THE HOLD DESIGN: the guardian is removed (constructor
+`(endpoint, token, governor, treasury)`); the instant `nilify` is removed; new governor-instant `hold(srcEid, nonce)`
+(72 h, once per nonce) and `voidPayload(hash)`; new timelocked `RELEASE`; `UNPAUSE` may not share a BATCH with a path,
+library or config change for that eid. Enforced `lzReceive` gas 250,000 on both paths (`RobinhoodConfig.enforcedOptions`).
+Price (wave-4 price panel): the twin rule reads the median's ATTESTED value (`FeedTraits.attested`) when the median is
+clamped above it; NHI never widens after a silence (one cap per epoch); the P1 sliding-window bound corrected in
+`SwarmFeed`'s header; a trait read that fails below a composite reverts `TraitUnreadable`; `ProductFeed.proven()` needs
+one proven input and the other attester-free (and `DeployBase` mirrors it); `ProvenPoolPrice.prove` accepts only the last
+`PROVE_WINDOW` (32) blocks. Stocks (wave-4 stocks panel): `MarketHoursFeed` prices the session only from an in-session
+answer, or the standing one after `OPEN_GRACE` (5 min); `StockVault` counts `managedAssets` and closes deposits while
+impaired; `StockJoin.take` uses the Ledger's own bonus; the auction clock runs on takeable time (`tick`, `TICK_SPAN`);
+multiplier freeze keyed on the multiplier itself with `sync()`; `MarketCalendar.closeDay` (instant, close only) and
+weekend days refused at propose; `ChainlinkFeed` re-reads decimals; SGOV max age 49 h. 12-07 additions: the Redeemer
+respects the Pulse grace; the 4663 IMD line is 0 at genesis (`RobinhoodConfig.imdLineRaise` builds the Safe's raise);
+a governor with no code is refused on every 4663 deploy path (`StageCore`); `RobinhoodConfig.GOVERNANCE_SAFE` = the
+mainnet Safe's address; `StageChain` (Pulse, ImdBridge and the stock module as resumable deploy steps, shared by
+`DeployChain`); the bridge Safe batches (`BridgeBatch.s.sol`, `Safe4663.s.sol`). Each wave-4 fix has a test named
+`AuditW4*` (the judges' proofs, adapted, plus a property test that fails on 67eadea); the hold design is tested in
+`test/unit/BridgeHold.t.sol` (H1-H4) and `test/invariant/BridgeInvariants.t.sol`; the endpoint facts it relies on are
+proven on the real EndpointV2 in `test/fork/AuditW4BridgeEndpoint.t.sol`; the Pulse rule in
+`test/unit/RedeemSequencerGrace.t.sol`.
+
+Before this audit, after the wave-4 fixes. BRIDGE INBOUND DELAY (after Wormhole Governor's large-transfer delay): per
+path, an inbound transfer mints at once only within the path's INSTANT CAP (`instantIn`, decaying per day: C + C x t / 1
+day over any interval t); anything else is metered against the inbound limit and QUEUED as a claim keyed by its origin's
+GUID (`claims[srcEid][guid]`, event `Queued`), claimable by ANYONE for the recipient once the path's delay has run since
+it queued (read at claim time), forever (no expiry); `received` counts at claim, `queued` holds what is pending. The Safe
+cancels one claim instantly (`cancelClaim`; UNCANCEL restores it, 48 h) or every claim queued since a cutoff in one act
+(`tighten(srcEid, cap, delay, breaker, cancelFrom)`, instant, only tighter: lower cap or breaker, longer delay, earlier
+cutoff; it bumps the path's settings version); a paused path refuses claims. QUEUE BREAKER: more than B queued on a path
+within its 4-UTC-day window trips it (claims stop, nothing lost) until a timelocked RESET_BREAKER (kind 14) naming the
+trip; the Safe may also trip it instantly (`tripBreaker`). GOVERNABLE: C, D and B are per path, written at a path's first
+SET_PATH (`DEFAULT_INSTANT_CAP` 5,000, `DEFAULT_DELAY` 12 h, `DEFAULT_QUEUE_BREAKER` 50,000) and changed by SET_DELAY
+(kind 15, 48 h; names the settings version it was proposed on; also lifts or moves the cutoff); D within [`MIN_DELAY`
+1 h, `MAX_DELAY` 7 days]. `MAX_LIMIT` 10,000,000 -> 250,000,000 per window. Path limits 50,000 per day both ways
+(`RobinhoodConfig.IN_LIMIT` = `OUT_LIMIT`); the launch BATCH also sets the delay values explicitly
+(`RobinhoodConfig.INSTANT_CAP`, `CLAIM_DELAY`, `QUEUE_BREAKER`), and `BridgeBatch` builds its signer text from the
+payload. SET_BRIDGE: `ImdUSD.checkBridge` (at propose in `ParametersRules` and at apply in `setBridge`) refuses a
+candidate not wired to this chain's imdUSD, EndpointV2, Safe and Treasury. Gas: the enforced 250,000 re-measured with
+the real ImdUSD (worst 192,275). Price: NHI bounded per window of time (`SwarmFeed._carriesAnchor`, opted in by the NHI
+leaf only). Robinhood: new debt (`LedgerBase._quote` sets `borrowable` false in the grace) and `writeOff`'s seizure wait
+out the Pulse grace. Stocks: `StockJoin`'s auction clock runs only while USDG can settle (not paused, not frozen at the
+join or the Treasury; unreadable = stopped, `tick` reverts `SettlementUnreadable`); `StockVault` values shares with real
+shares only (no virtual offset), rounding against the caller, and an emptied vault restarts its count at the next deposit.
+Tests: `AuditW5NhiWindow`, `AuditW5StockUsdgFreeze`, `AuditW5SetBridge`, `AuditW5BorrowGrace`, `AuditW5WriteOffGrace`,
+`AuditW5BridgeInboundResponse`, `AuditW5BridgeDelayProps` (D1, D5, D6), `AuditW5BridgeDelayLine`,
+`AuditW5BridgeBreakerProps`, `AuditW5BridgeBulkCancel`, `AuditW5BridgeGovernableDelay`, `BridgeInboundDelay`,
+`BridgeBreaker`, the extended `test/invariant/BridgeInvariants.t.sol`, the StockVault regressions in
+`AuditW4StockVault`, and on the real EndpointV2 `test/fork/BridgeInboundDelayEndpoint.t.sol`; the real-USDG freeze in
+`test/fork/RobinhoodStocks.t.sol`. Each property test failed on the code before its change.
 
 ### What changed since the third public audit (c64ecee)
 

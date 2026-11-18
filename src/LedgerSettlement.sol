@@ -213,7 +213,8 @@ contract LedgerSettlement is LedgerBase {
     /// STICKY ZERO: two readings >= WRITEOFF_DELAY apart. The first call that sees the custody worthless only
     /// records the time; a call that sees it worth something again clears that record (and returns, so the clearing
     /// persists); a record older than WRITEOFF_WINDOW is re-armed rather than trusted. A reissue inside the delay writes
-    /// nothing off.
+    /// nothing off. SEQUENCER GRACE (wave 5): on a chain with a Pulse the seizing step reverts `SequencerGrace` while the chain
+    /// is down or inside the grace after it (`Pulse.inGrace`), like every other seizure.
     function writeOff(uint256 id) external onlyLedger nonReentrant {
         bytes32 ilk = _ilkOf(id);
         ParametersBase.Config memory c = _config(ilk);
@@ -230,7 +231,10 @@ contract LedgerSettlement is LedgerBase {
         if (block.timestamp < since + WRITEOFF_DELAY) revert WriteOffTooSoon(since + WRITEOFF_DELAY);
         Position storage p = _positions[id];
         IlkState storage s = ilkState[ilk];
-        _accrue(ilk, s);
+        _accrue(ilk, s); // pokes the Pulse
+        // wave 5: a seizure waits out the sequencer grace, as liquidation (Liquidator) and redemption (Redeemer) do; arming
+        // above seizes nothing and is not held
+        if (address(pulse) != address(0) && pulse.inGrace()) revert SequencerGrace();
         uint256 debt = _debtOf(p);
         if (debt == 0) revert NoDebt();
         uint256 oldDebt = p.debt;

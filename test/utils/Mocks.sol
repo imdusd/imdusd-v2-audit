@@ -22,6 +22,33 @@ contract MockERC20 is ERC20 {
     }
 }
 
+/// @notice USDG as Paxos ships it on Robinhood Chain (the live token answers `paused()` and
+/// `isFrozen(address)`): a paused token moves nothing, and a transfer reverts if the sender, the recipient or the caller is
+/// frozen (PaxosTokenV2). `setFrozen` / `setPaused` stand in for the asset-protection and pause roles.
+contract MockUSDG is MockERC20 {
+    bool public paused;
+    mapping(address => bool) public isFrozen;
+
+    error Frozen();
+    error Paused();
+
+    constructor() MockERC20("USDG", 6) {}
+
+    function setFrozen(address a, bool on) external {
+        isFrozen[a] = on;
+    }
+
+    function setPaused(bool on) external {
+        paused = on;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (paused) revert Paused();
+        if (isFrozen[from] || isFrozen[to] || isFrozen[msg.sender]) revert Frozen();
+        super._update(from, to, value);
+    }
+}
+
 /// @notice A settable feed. `set` stamps it now; `setStale` forces staleness; `setMaxAge` changes its life (1 hour
 /// by default; the seat median leaf lives 26 hours).
 contract MockFeed is IFeed {

@@ -36,10 +36,20 @@ contract ProductFeed is IFeed {
         return FeedTraits.converged(a) && FeedTraits.converged(b);
     }
 
-    /// @notice An input is a proven pool price. The deploy graph pairs one only with Chainlink ETH/USD (DeployConfig
-    /// F_IMD_USD_PROVEN, checked by DeployBase._feedIs), so the product has no attester in its path.
+    /// @notice An input is a proven pool price AND the other has no attester in its path (it is proven too, or answers no
+    /// `converged()`: FeedTraits.attesterFree). Audit wave 4, C5: `proven(a) || proven(b)` called a product of a proven
+    /// price and a swarm leaf proven, giving the Pricer's twin rule to a spot an attester can hold clamped. The deploy graph
+    /// pairs the proven price with Chainlink ETH/USD only (DeployConfig F_IMD_USD_PROVEN; DeployBase._provenAtDeploy mirrors
+    /// this rule). Conservative: a product over a composite of attester-free feeds reads not proven (median rule, safe side).
     function proven() external view returns (bool) {
-        return FeedTraits.proven(a) || FeedTraits.proven(b);
+        return (FeedTraits.proven(a) && FeedTraits.attesterFree(b)) || (FeedTraits.proven(b) && FeedTraits.attesterFree(a));
+    }
+
+    /// @notice `a * b / 1e18` of the inputs' attested values (FeedTraits.attested): what the product would read with no clamp.
+    function attested() external view returns (uint256) {
+        uint256 va = FeedTraits.attested(a);
+        uint256 vb = FeedTraits.attested(b);
+        return va * vb / 1e18;
     }
 
     function maxAge() external view returns (uint256) {

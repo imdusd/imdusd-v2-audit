@@ -23,9 +23,16 @@ import {DeployBase} from "./DeployBase.sol";
 abstract contract StageCore is DeployBase {
     function _stageCore(DeployTypes.Config memory cfg, Deployed memory d, address me) internal {
         if (cfg.chain.chainId != 0 && block.chainid != cfg.chain.chainId) revert WrongChain(cfg.chain.chainId, block.chainid);
+        // 12-07: on the real 4663 chain the governor must be a contract (the 4663 Safe). RobinhoodConfig.GOVERNANCE_SAFE stays
+        // address(0) until that Safe is created, so every 4663 path (DeployRobinhood, deployAs, the staged scripts)
+        // refuses it here, not only the DeployRobinhood entry. Offline suites (chain 31337) keep EOA governors.
+        if (block.chainid == 4663 && cfg.governor.code.length == 0) revert NoSafe(block.chainid, cfg.governor);
         uint256 g;
         // 0. The sequencer-outage grace, where the chain needs one: the Ledger pokes it on every accrual.
-        if (cfg.chain.pulse && !_has(address(d.pulse))) {
+        if (
+            cfg.chain.pulse
+                && !(_has(address(d.pulse)) && _ok(d.pulse.gap() == cfg.chain.pulseGap && d.pulse.grace() == cfg.chain.pulseGrace, "Pulse"))
+        ) {
             g = gasleft();
             d.pulse = _newPulse(cfg.chain.pulseGap, cfg.chain.pulseGrace);
             _rec("Pulse", g, type(Pulse).creationCode.length + 64);

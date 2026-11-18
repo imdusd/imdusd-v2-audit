@@ -128,8 +128,9 @@ contract PricerTwinTest is System {
 
     /// P4 (fuzzed): whatever the median leaf holds (a compromised or wrong target, clamped or not) and whatever the proven
     /// price, while the proven spot is fresh the liquidation price `low` is never more than `skew` below the proven price,
-    /// never more than `skew` below the median, and equals max(median, spot) whenever the legs do not agree. Borrowing only
-    /// when they agree AND both legs and NHI are converged.
+    /// never more than `skew` below min(median, attested median), and whenever the legs do not agree equals the spot when
+    /// it is the higher leg, else max(spot, min(median, attested median)) (audit wave 4: a median clamped above its target
+    /// counts at its target; AuditW4TwinLag.t.sol). Borrowing only when they agree AND both legs and NHI are converged.
     function testFuzz_P4_twinRule(uint256 mSeed, uint256 pSeed, uint256 tSeed, bool clampIt, bool spotStale) public {
         uint256 m = bound(mSeed, 1e13, 1e17);
         uint256 p = bound(pSeed, 1e13, 1e17);
@@ -142,12 +143,16 @@ contract PricerTwinTest is System {
         (uint256 mv,) = leaf.latestValue();
         uint256 mUsd = mv * ETHUSD / 1e18;
         uint256 pUsd = p * ETHUSD / 1e18;
+        uint256 aUsd = leaf.attested() * ETHUSD / 1e18;
+        uint256 mOrA = mUsd < aUsd ? mUsd : aUsd;
         Pricer.Quote memory q = pricer.quote(TWIN);
         assertTrue(q.priced, "a clamped or disagreeing leg still prices");
-        assertGe(q.low * 1e18, mUsd * (1e18 - SKEW), "never more than skew below the median");
         if (!spotStale) {
+            assertGe(q.low * 1e18, mOrA * (1e18 - SKEW), "never more than skew below what the median attested");
             assertGe(q.low * 1e18, pUsd * (1e18 - SKEW), "P4: never more than skew below the proven price");
-            if (!q.agree) assertEq(q.low, mUsd > pUsd ? mUsd : pUsd, "disagreeing legs: the higher leg");
+            if (!q.agree) {
+                assertEq(q.low, mUsd > pUsd ? (mOrA > pUsd ? mOrA : pUsd) : pUsd, "disagreeing legs: the twin rule");
+            }
         } else {
             assertEq(q.low, mUsd, "a stale proven spot: the median alone, as today");
             assertFalse(q.agree);

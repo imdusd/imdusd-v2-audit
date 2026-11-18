@@ -22,8 +22,9 @@ import {SecureMerkleTrie} from "../vendor/optimism/SecureMerkleTrie.sol";
 /// TRUST: none beyond Ethereum's own commitments. The trie code is OptimismPortal's (src/vendor/optimism, PROVENANCE.md).
 /// Every proof node must hash up to the header's state root and the header to `blockhash`, and the keys are hashes this
 /// contract computes (the PoolManager's address and the pool's slot), so a proof cannot name another account or slot.
-/// LIMITS: `blockhash` reaches 256 blocks back; a proven value is fresh for `maxAge` seconds from its block's timestamp and
-/// only a newer block replaces it. A future change of Ethereum's state trie (binary/Verkle) ends these proofs: the depth
+/// LIMITS: a NEW proof must be of one of the last PROVE_WINDOW (32) blocks (audit wave 4, low: with any of the last 256
+/// accepted, a prover picked the most favourable end-of-block price of ~51 minutes at no push cost); a proven value is fresh
+/// for `maxAge` seconds from its block's timestamp and only a newer block replaces it. A future change of Ethereum's state trie (binary/Verkle) ends these proofs: the depth
 /// sampler then reads stale (zero depth, fail closed) until the Safe swaps the samplers (REMOVE/ADD_DEPTH_SAMPLER).
 /// The sampler keeps its own check that the live pool is within `maxDeviationTicks` of this reference.
 contract ProvenPoolPrice is IFeed {
@@ -42,6 +43,10 @@ contract ProvenPoolPrice is IFeed {
     uint256 public immutable maxAge;
     /// @dev The storage key of `pools[poolId].slot0` in the PoolManager (v4 StateLibrary).
     bytes32 internal immutable slot0Key;
+    /// @notice How many blocks back from the head a NEW proof may reach (~6.4 min). The keeper proves the previous block in
+    /// the bundle that needs it; 32 also covers a private relay holding a bundle for its default 25 blocks. A prover still
+    /// chooses among the end-of-block prices of this window (the residual), no longer among 256.
+    uint256 public constant PROVE_WINDOW = 32;
 
     uint256 internal _value;
     /// @notice The block whose end-of-block price is held (0 before the first proof).
@@ -52,6 +57,7 @@ contract ProvenPoolPrice is IFeed {
     error BadHeader();
     error BadAccount();
     error EmptySlot();
+    error TooOld(uint256 blockNumber, uint256 head);
 
     event Proven(uint256 indexed blockNumber, uint160 sqrtPriceX96, uint256 value);
 
@@ -83,7 +89,8 @@ contract ProvenPoolPrice is IFeed {
     // ---------------------------------------------------------------- prove
 
     /// @notice Prove the pool's price at the end of the block `header` describes. Anyone; the block must be one of the last
-    /// 256. The keeper calls this right before `DepthSampler.sample()` in the same bundle.
+    /// PROVE_WINDOW (`TooOld` otherwise; checked after the no-op rule, so a held newer block still makes it a no-op). The
+    /// keeper calls this right before `DepthSampler.sample()` in the same bundle.
     /// A block no newer than the one held is a NO-OP that returns the held value (audit wave 3, info: it reverted `NotNewer`,
     /// so anyone proving the same block first made the keeper's atomic [prove, sample] bundle lose its hour). Nothing is
     /// written and the proof is not read: the held block is the same or newer, so the price can never move backwards.
@@ -99,6 +106,7 @@ contract ProvenPoolPrice is IFeed {
         bytes32 bh = blockhash(number);
         if (bh == bytes32(0) || bh != keccak256(h)) revert BadHeader();
         if (number <= provenBlock) return _value;
+        if (block.number - number > PROVE_WINDOW) revert TooOld(number, block.number);
         bytes32 stateRoot = _toBytes32(RLPReader.readBytes(fields[H_STATE_ROOT]));
         uint256 timestamp = _toUint(RLPReader.readBytes(fields[H_TIMESTAMP]));
 

@@ -42,6 +42,11 @@ contract ChainlinkFeed is IFeed {
         if (!ok || data.length < 160) return (0, 0);
         (, int256 answer,, uint256 at,) = abi.decode(data, (uint80, int256, uint256, uint256, uint80));
         if (answer <= 0 || at == 0 || at > block.timestamp) return (0, 0);
+        // Audit wave 4 (stocks), low: the decimals are re-read with every answer. Robinhood's SPY and USO feeds went from 18
+        // to 8 decimals inside one phase (2026-06-23); scaled with the cached value such an answer is off by 1e10. A change
+        // from the decimals this feed was built with reads unpriced (redeploy the feed to follow it).
+        (bool okD, bytes memory dd) = aggregator.staticcall(abi.encodeWithSignature("decimals()"));
+        if (!okD || dd.length < 32 || abi.decode(dd, (uint256)) != aggregatorDecimals) return (0, 0);
         // Garbage, not a price: above the sanity cap (10^(18+dec) raw units = MAX_PER_TOKEN; the product below
         // would overflow long before), or sitting on the aggregator's own minAnswer/maxAnswer clamp (a market outside
         // the aggregator's accepted range is reported AS the bound, the LUNA failure).

@@ -28,7 +28,8 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///   - an epoch opens at the first acceptance after the previous one has run maxAge, and is anchored at the STORED value
 ///     then (never at a remembered or attested one); it lasts maxAge;
 ///   - its allowance is maxDeviationBps, or STALE_DEVIATION_MULTIPLE (2) x that when the stored value has been silent for
-///     maxAge plus a whole STALE_GROWTH_PERIOD (an hour) when the epoch opens (`_allowanceNow`); never wider;
+///     maxAge plus a whole STALE_GROWTH_PERIOD (an hour) when the epoch opens (`_allowanceNow`); never wider (the NHI leaf
+///     never widens: `_staleMultiple`, audit wave 4);
 ///   - stored = clamp(target, anchor x (1 - allowance), anchor x (1 + allowance)). `attested()` is the last target and
 ///     `converged()` says whether the stored value is it. `latestValue()` returns the stored value, dated by the
 ///     attestation that moved it (consumers that must not act at a value nobody attested read `converged()`: the Pricer
@@ -36,8 +37,16 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// The feed remembers nothing beyond the live epoch's anchor and the last target, so what it does next depends only on
 /// the stored value, the clock and the next attestation. What that guarantees (test/unit/SwarmFeedProperties.t.sol):
 ///   P1 STEP BOUND. Within one epoch the stored value stays within the epoch's allowance of its anchor, whoever relays
-///      what in whatever order: the stored value moves at most one allowance per epoch (two moves can straddle a
-///      boundary a block apart, so over a sliding maxAge it can reach (1 + allowance)^2 - 1 once).
+///      what in whatever order: the stored value moves at most one allowance per epoch, except the epoch that opens on a
+///      silence, which moves at most (1 + 2c)(1 + c) - 1 up / 1 - (1 - 2c)(1 - c) down (the wide step, then a cap c from
+///      where it landed). Over any CLOSED window of one maxAge two epochs can meet (the next one opens exactly maxAge
+///      after the last), so the stored value moves at most (1 + c)^2 - 1 / 1 - (1 - c)^2, and after a silence at most
+///      (1 + 2c)(1 + c)^2 - 1 up / 1 - (1 - 2c)(1 - c)^2 down: +101.6% / -61.6% at c = 20% (audit wave 4 corrected the
+///      earlier "(1 + allowance)^2 - 1"; test/unit/AuditW4SlidingBound.t.sol). A leaf that CARRIES THE ANCHOR (NHI,
+///      `_carriesAnchor`, fixed before audit wave 5) bounds every window of one maxAge, not only each epoch: an epoch opened less
+///      than maxAge after the stored value last moved also stays within one cap of the previous anchor, so the values
+///      held in any window [t, t + maxAge) lie within one cap of a value held in the maxAge before it
+///      (test/unit/AuditW5NhiWindow.t.sol). The price legs keep the per-epoch rule and the bound above.
 ///   P2 LIVENESS. Every accepted attestation leaves the stored value as close to its target as the epoch allows (the
 ///      closest point of the band), and each new epoch moves it a full allowance toward the target or onto it. So once
 ///      honest attestations of a level H are the only ones relayed, at least one per epoch, the stored value reaches H
@@ -149,7 +158,8 @@ abstract contract SwarmFeed is IFeed {
     /// to add an eighth of the cap per further hour, up to 100x).
     uint256 public constant STALE_DEVIATION_MULTIPLE = 2;
     /// @notice A value must have been stale for a whole period (an hour, whatever the feed's lifetime) past its
-    /// lifetime before an epoch opens on the stale base; the one-day NHI feed earns it an hour after its lifetime
+    /// lifetime before an epoch opens on the stale base; the one-day NHI feed (which no longer widens: SwarmNhiPolicy
+    /// overrides `_staleMultiple`, audit wave 4) earned it an hour after its lifetime
     /// too, so a gap in the index is followed within hours rather than days (review of cc4103f, 2026-10-07).
     uint256 public constant STALE_GROWTH_PERIOD = 1 hours;
     /// @notice The widest allowance the epoch rule can give: STALE_DEVIATION_MULTIPLE x the widest cap the constructor
@@ -187,11 +197,17 @@ abstract contract SwarmFeed is IFeed {
     /// maxAge, and measured from the signature a held value arrived already old, so the next epoch earned the stale base
     /// early (final panel audit, oracle, medium). Freshness for consumers still runs from the signature (`isStale`).
     uint40 private _acceptedAt;
+    /// @dev The block time the stored value last CHANGED (an acceptance that left it equal does not count). Read only by a
+    /// leaf that carries the previous anchor (`_carriesAnchor`, the NHI leaf; fixed before audit wave 5). Same slot as `_acceptedAt`.
+    uint40 private _movedAt;
     /// @dev The live epoch's anchor (the stored value when it opened) and the last attested target, one slot. A feed with
     /// magnitude refuses a target above 2^128 (`InvalidAnswer`; the shipped figures are below 1e24), so both fit, and the
     /// stored value, always between an anchor and a target, does too. Unused by a feed without magnitude.
     uint128 private _anchorValue;
     uint128 private _attested;
+    /// @dev A leaf that carries the anchor (`_carriesAnchor`): the PREVIOUS epoch's anchor while the live epoch must also stay
+    /// inside its band (it opened less than maxAge after the stored value last moved), else 0. Never written by other leaves.
+    uint128 private _carryAnchor;
 
     /// @notice A data chain on which `block.number` here reports its blocks (see the port note), 0 if none.
     uint256 public immutable blockClockChainId;
@@ -520,9 +536,32 @@ abstract contract SwarmFeed is IFeed {
     /// @notice The anchor the next value is measured against and the move it may make from it, in bps.
     /// @dev The live epoch while it lasts; otherwise the epoch the next acceptance will open: anchored at the stored value,
     /// with the stale allowance if that value has been silent long enough. Read publicly through `epoch()`.
-    function _epoch() private view returns (uint256 anchor, uint256 bound) {
-        if (block.timestamp - uint256(_anchorAt) < maxAge) return (_anchorValue, _anchorBound);
-        return (_value, _allowanceNow());
+    function _epoch() private view returns (uint256 anchor, uint256 bound, uint256 carry) {
+        if (block.timestamp - uint256(_anchorAt) < maxAge) {
+            return (_anchorValue, _anchorBound, _carriesAnchor() ? _carryAnchor : 0);
+        }
+        return (_value, _allowanceNow(), _carryNow());
+    }
+
+    /// @dev The anchor an epoch opened now must ALSO stay within one band of (0 = none): for a leaf that carries the anchor,
+    /// the live (ending) epoch's anchor if the stored value moved less than maxAge ago. Why: epochs abut, so without it two
+    /// attestations one second apart, at the last second of one epoch and the first of the next, moved the value two caps
+    /// (fixed before audit wave 5). With it, every window of one maxAge stays within one cap of a value held in the maxAge before
+    /// it: a window that holds a move of the old epoch and the new epoch's values sees both inside the old anchor's band,
+    /// and a window that holds no move of the old epoch starts at the new anchor. Liveness: an epoch that opens within
+    /// maxAge of a move may be held at the old band's edge, so a gap is followed at one cap per one or two epochs (a
+    /// delivery spaced a full maxAge after the last move takes the whole cap).
+    function _carryNow() private view returns (uint256) {
+        if (!_carriesAnchor() || block.timestamp - uint256(_movedAt) >= maxAge) return 0;
+        return _anchorValue;
+    }
+
+    /// @dev Whether this leaf bounds each window of one maxAge, not only each epoch (`_carryNow`). False by default: the price
+    /// legs keep design C's per-epoch rule and its documented sliding bound (they have the proven twin); the NHI leaf,
+    /// which sets mat with no twin, overrides it to true (fixed before audit wave 5). A leaf that carries must not widen
+    /// (`_staleMultiple` 1): the wide step re-anchors mid-epoch and carries nothing.
+    function _carriesAnchor() internal pure virtual returns (bool) {
+        return false;
     }
 
     /// @dev The allowance an epoch opened now would carry: the cap on a fresh value, and on one stale for less than a whole
@@ -537,7 +576,13 @@ abstract contract SwarmFeed is IFeed {
         // audit, oracle, medium). Before the first value there is no relay time and the signature rules.
         uint256 since = _acceptedAt > _updatedAt ? _acceptedAt : _updatedAt;
         if (block.timestamp < since + maxAge + STALE_GROWTH_PERIOD) return maxDeviationBps;
-        return maxDeviationBps * STALE_DEVIATION_MULTIPLE;
+        return maxDeviationBps * _staleMultiple();
+    }
+
+    /// @dev The stale allowance's multiple: STALE_DEVIATION_MULTIPLE, or 1 for a leaf whose ONE step must stay one cap
+    /// whatever the silence before it (SwarmNhiPolicy: NHI sets liquidation mat directly and has no twin; audit wave 4).
+    function _staleMultiple() internal pure virtual returns (uint256) {
+        return STALE_DEVIATION_MULTIPLE;
     }
 
     /// @notice Whether this feed takes `value` as a target now: any nonzero value (and, with magnitude, one below 2^128).
@@ -550,8 +595,9 @@ abstract contract SwarmFeed is IFeed {
     /// it would land in (`epoch()`). For a feed without magnitude, or before the first value, the target itself.
     function followOf(uint256 target) external view returns (uint256) {
         if (!_hasMagnitude() || !_hasValue) return target;
-        (uint256 anchor, uint256 bound) = _epoch();
-        return _clamp(target, anchor, bound);
+        (uint256 anchor, uint256 bound, uint256 carry) = _epoch();
+        uint256 v = _clamp(target, anchor, bound);
+        return carry == 0 ? v : _clamp(v, carry, maxDeviationBps);
     }
 
     /// @notice The last attested value taken as a target (the signed answer), as opposed to `latestValue`, the stored one.
@@ -569,7 +615,7 @@ abstract contract SwarmFeed is IFeed {
     /// stays within until maxAge after that. An expired epoch is reported as the one the next acceptance would open, so
     /// the figures are always the ones the next delivery is clamped by.
     function epoch() external view returns (uint256 anchor, uint64 openedAt, uint256 allowanceBps) {
-        (anchor, allowanceBps) = _epoch();
+        (anchor, allowanceBps,) = _epoch();
         openedAt = block.timestamp - uint256(_anchorAt) < maxAge ? uint64(_anchorAt) : uint64(block.timestamp);
     }
 
@@ -590,6 +636,7 @@ abstract contract SwarmFeed is IFeed {
     function _accept(uint256 target, uint64 updatedAt) internal {
         _checkValue(target);
         uint256 value = _hasMagnitude() ? _follow(target) : target;
+        if (!_hasValue || value != _value) _movedAt = uint40(block.timestamp);
         _value = value;
         _updatedAt = updatedAt;
         _acceptedAt = uint40(block.timestamp);
@@ -617,6 +664,7 @@ abstract contract SwarmFeed is IFeed {
         }
         uint256 anchor;
         uint256 bound;
+        uint256 carry;
         if (block.timestamp - uint256(_anchorAt) >= maxAge) {
             (anchor, bound) = (_value, _allowanceNow());
             if (bound > maxDeviationBps) {
@@ -628,14 +676,23 @@ abstract contract SwarmFeed is IFeed {
                 uint256 first = _clamp(target, anchor, bound);
                 (_anchorValue, _attested, _anchorAt, _anchorBound) =
                     (uint128(first), uint128(target), uint40(block.timestamp), uint24(maxDeviationBps));
+                if (_carriesAnchor()) _carryAnchor = 0; // unreachable for a shipped leaf (a carrying leaf never widens)
                 return first;
             }
             (_anchorAt, _anchorBound) = (uint40(block.timestamp), uint24(bound));
+            if (_carriesAnchor()) {
+                carry = _carryNow(); // the ending epoch's anchor (read before it is overwritten below)
+                _carryAnchor = uint128(carry);
+            }
         } else {
             (anchor, bound) = (_anchorValue, _anchorBound);
+            if (_carriesAnchor()) carry = _carryAnchor;
         }
         (_anchorValue, _attested) = (uint128(anchor), uint128(target));
-        return _clamp(target, anchor, bound);
+        uint256 v = _clamp(target, anchor, bound);
+        // Clamping into the carried band after the epoch's own is clamping into their intersection: it is never empty,
+        // since the anchor (the stored value when the epoch opened) lies in the carried band.
+        return carry == 0 ? v : _clamp(v, carry, maxDeviationBps);
     }
 
     function _tooOld(uint64 timestamp) private view returns (bool) {
