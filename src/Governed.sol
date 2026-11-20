@@ -49,9 +49,11 @@ abstract contract Governed {
         emit Proposed(payload, block.timestamp + TIMELOCK);
     }
 
-    /// @notice Withdraw the pending change: the only action with no delay.
+    /// @notice Withdraw the pending change: the only action with no delay. With nothing pending it does nothing (audit wave 5):
+    /// `applyPending` is permissionless, so a stranger can apply a matured proposal just before the governor's
+    /// incident batch [cancel(), pause()/tighten()]; a revert here would revert the governor's instant act with it.
     function cancel() external onlyGovernor {
-        if (pendingEta == 0) revert NothingPending();
+        if (pendingEta == 0) return;
         bytes memory payload = pending;
         delete pending;
         pendingEta = 0;

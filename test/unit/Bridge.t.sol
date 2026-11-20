@@ -184,6 +184,7 @@ contract BridgeTest is TwoChains {
         rh.bridge.propose(abi.encode(uint8(5), HOME_EID));
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         rh.bridge.applyPending();
+        vm.warp(vm.getBlockTimestamp() + 1 days); // audit wave 5: a reopened path's instant allowance refills over a day
         deal(address(home.usd), alice, 2_000e18, true); // test-only supply on home (no supply equation asserted here)
         _send(home.bridge, RH_EID, alice, 800e18);
         _send(home.bridge, RH_EID, alice, 800e18);
@@ -231,7 +232,11 @@ contract BridgeTest is TwoChains {
         rh.bridge.propose(abi.encode(uint8(5), HOME_EID));
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         rh.bridge.applyPending();
+        // audit wave 5: a reopened path's instant allowance starts empty, so what runs at the reopening queues for D
         assertTrue(homeEp.deliver(0));
+        assertEq(rh.usd.balanceOf(alice), 5_000e18);
+        assertEq(rh.bridge.queued(), 1_000e18);
+        _claimAfterDelay(homeEp, 0, rh.bridge);
         assertEq(rh.usd.balanceOf(alice), 6_000e18);
     }
 

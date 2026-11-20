@@ -278,8 +278,10 @@ contract Backstop is ERC20, TransientReentrancyGuard, IBackstop {
         if (msg.sender != params) revert Unauthorized();
         if (!isToken[token]) revert UnknownIlk();
         if (on) {
-            (, uint256 high, bool good) = oracle.priceOf(token);
-            if (good && high != 0) revert StillPriced();
+            // Refused while the type has ANY price, good or refused as a one-leg value (PricerOracle reports a refused quote's
+            // prices with ok = false): a pushed-up proof must not open a window to retire a priced token (a review of the wave-5 fixes).
+            (, uint256 high,) = oracle.priceOf(token);
+            if (high != 0) revert StillPriced();
         }
         retired[token] = on;
         retiredAt[token] = on ? block.timestamp : 0;

@@ -3,6 +3,18 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {DoorLeaf} from "./PricerTwin.t.sol";
+import {SwarmFeed} from "../../src/feeds/SwarmFeed.sol";
+import {SwarmSpotPolicy} from "../../src/feeds/SwarmFeeds.sol";
+
+/// @dev The BASE stale rule (2x after a silence), which the spot and seat leaves keep. Since a review of the wave-5 fixes: the PRICE
+/// leaf (DoorLeaf) no longer widens, so the silence half of this property is pinned on a base-rule leaf.
+contract WideDoorLeaf is SwarmSpotPolicy {
+    constructor() SwarmFeed(address(1), address(0), 1, 3, 1 hours, 2000) {}
+
+    function set(uint256 target) external {
+        _accept(target, uint64(block.timestamp));
+    }
+}
 
 /// @notice AUDIT WAVE 4 (price design, low P1: the sliding-window bound was understated). PROPERTY, as now documented in
 /// SwarmFeed's header (P1) and the README: over any closed window of one maxAge, the stored value moves at most
@@ -12,13 +24,13 @@ import {DoorLeaf} from "./PricerTwin.t.sol";
 /// Production price policy: 1 h, 2,000 bps.
 contract AuditW4SlidingBoundTest is Test {
     uint256 constant C = 2000;
-    DoorLeaf leaf;
+    WideDoorLeaf leaf;
 
     function setUp() public {
         vm.chainId(1);
         vm.warp(1_800_000_000);
         vm.roll(26_000_000);
-        leaf = new DoorLeaf();
+        leaf = new WideDoorLeaf();
         leaf.set(1e18);
     }
 
@@ -31,7 +43,7 @@ contract AuditW4SlidingBoundTest is Test {
     /// measured values, which the corrected bound admits exactly.
     function test_judgeSequence_reachesTheCorrectedBoundExactly() public {
         for (uint256 up; up < 2; ++up) {
-            leaf = new DoorLeaf();
+            leaf = new WideDoorLeaf();
             leaf.set(1e18);
             vm.warp(vm.getBlockTimestamp() + 2 hours + 1);
             uint256 t = vm.getBlockTimestamp();
@@ -64,6 +76,24 @@ contract AuditW4SlidingBoundTest is Test {
             uint256 v = _stored();
             assertLe(v, hi + 2, "above the closed-window bound");
             assertGe(v + 2, lo, "below the closed-window bound");
+        }
+    }
+
+    /// The shipped PRICE leaf after the same silence: never wide, so a closed maxAge moves it at most (1 + c)^2 - 1 / 1 - (1 - c)^2.
+    function test_priceLeafAfterSilenceKeepsTheFreshBound() public {
+        for (uint256 up; up < 2; ++up) {
+            DoorLeaf p = new DoorLeaf();
+            p.set(1e18);
+            vm.warp(vm.getBlockTimestamp() + 2 hours + 1);
+            uint256 t = vm.getBlockTimestamp();
+            uint256 target = up == 1 ? 100e18 : 1;
+            p.set(target);
+            vm.warp(t + 1 hours - 1);
+            p.set(target);
+            vm.warp(t + 1 hours);
+            p.set(target);
+            (uint256 v,) = p.latestValue();
+            assertEq(v, up == 1 ? 1.44e18 : 0.64e18);
         }
     }
 }

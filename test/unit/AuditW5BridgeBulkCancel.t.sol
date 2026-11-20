@@ -13,8 +13,8 @@ import {Governed} from "../../src/Governed.sol";
 ///  K2 Claims queued before F are untouched; no claim is lost: they all stay pending, and a timelocked SET_DELAY (48h)
 ///     lifts the cutoff or moves it later; the honest ones then claim, the forged ones the Safe cancelled one by one never
 ///     do.
-///  K3 Only the governor cuts; the instant route only moves the cutoff earlier (never lifts or delays it); a cut bumps the
-///     settings version, so a restore proposed before it is refused when applied.
+///  K3 Only the governor cuts; the instant route only moves the cutoff earlier (never lifts or delays it: since audit wave 5
+///     a later or zero argument is clamped to the cutoff that stands); a cut bumps the settings version, so a restore proposed before it is refused when applied.
 contract AuditW5BridgeBulkCancelTest is W4Bridge {
     uint256 constant L = 50_000e18;
     uint256 C;
@@ -138,10 +138,13 @@ contract AuditW5BridgeBulkCancelTest is W4Bridge {
         uint40 t = uint40(vm.getBlockTimestamp());
         _cancelFrom(t);
         vm.startPrank(safe);
-        vm.expectRevert(ImdBridge.NotTighter.selector);
-        rh.tighten(HOME, 0, D, B, t + 5); // later: a loosening
-        vm.expectRevert(ImdBridge.NotTighter.selector);
-        rh.tighten(HOME, 0, D, B, 0); // lifting: a loosening
+        // audit wave 5: a later cutoff or none is clamped to the one that stands (never a revert, never a loosening)
+        rh.tighten(HOME, 0, D, B, t + 5); // later
+        (uint40 c1,) = _cut();
+        assertEq(c1, t);
+        rh.tighten(HOME, 0, D, B, 0); // lifting
+        (c1,) = _cut();
+        assertEq(c1, t);
         rh.tighten(HOME, 0, D, B, t); // the same: allowed (no change)
         rh.tighten(HOME, 0, D, B, t - 5); // earlier: tighter
         vm.stopPrank();

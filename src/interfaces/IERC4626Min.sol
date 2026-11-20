@@ -9,3 +9,8 @@ interface IERC4626Min {
     function convertToAssets(uint256 shares) external view returns (uint256 assets);
     function maxRedeem(address owner) external view returns (uint256 shares);
 }
+
+/// @notice A stock type's custody (StockVault): whether what its shares claim is gone (Ledger.writeOff, audit wave 5).
+interface IStockCustody {
+    function worthless() external view returns (bool);
+}

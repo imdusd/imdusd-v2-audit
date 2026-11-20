@@ -29,6 +29,9 @@ contract MarketCalendar is Governed {
 
     /// @notice Status of a day, by its UTC day number (`timestamp / 1 days`; the session never crosses UTC midnight).
     mapping(uint256 day => uint8) public dayStatus;
+    /// @notice keccak256(abi.encode(closed, early)) of the constructor's lists (audit wave 5, low): what a staged deploy's
+    /// resume compares with its config, so a calendar seeded from any other list is rebuilt, not adopted.
+    bytes32 public immutable seed;
 
     error BadDay(uint256 day);
     error BadStatus(uint8 status);
@@ -36,6 +39,7 @@ contract MarketCalendar is Governed {
     event DaySet(uint256 indexed day, uint8 status);
 
     constructor(address governor_, uint32[] memory closed, uint32[] memory early) Governed(governor_) {
+        seed = keccak256(abi.encode(closed, early));
         for (uint256 i; i < closed.length; ++i) _set(closed[i], CLOSED);
         for (uint256 i; i < early.length; ++i) _set(early[i], EARLY_CLOSE);
     }

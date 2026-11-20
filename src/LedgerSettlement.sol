@@ -11,7 +11,7 @@ import {Parameters} from "./Parameters.sol";
 import {Pricer} from "./Pricer.sol";
 import {Join} from "./Join.sol";
 import {SortedPositions} from "./SortedPositions.sol";
-import {IERC4626Min} from "./interfaces/IERC4626Min.sol";
+import {IStockCustody} from "./interfaces/IERC4626Min.sol";
 import {PositionNFT} from "./PositionNFT.sol";
 import {Adjust, IHolderJoin} from "./interfaces/IPositions.sol";
 import {LedgerBase, IPulse, IRateSource, ISavingsAssets, IRevenueMeter} from "./LedgerBase.sol";
@@ -204,31 +204,38 @@ contract LedgerSettlement is LedgerBase {
         }
     }
 
-    /// @notice Realise a position whose collateral its issuer has destroyed: permissionless, only while one whole
-    /// share of the type's ERC-4626 custody redeems for nothing (`convertToAssets(1e18) == 0`, e.g. the issuer `adminBurn`ed
-    /// the vault's stock). No price is needed, or available: such a type reads unpriced. The debt becomes the type's bad debt
+    /// @notice Realise a position whose collateral its issuer has destroyed: permissionless, only while the type's
+    /// custody (a StockVault) reads `worthless()`: it holds under 10^-6 of the stock its shares claim (e.g. the issuer
+    /// `adminBurn`ed the vault's stock). Audit wave 5 (low): judged against that material threshold, not `convertToAssets ==
+    /// 0`, so a dust donation into the hollow vault neither blocks nor clears a write-off. No price is needed, or available: such a type reads unpriced. The debt becomes the type's bad debt
     /// (covered by the Treasury's `coverBadDebt`, the type's own surplus first) and the seized shares go to the Treasury:
     /// if the issuer reissues (burn-then-reissue for a migration or corporate action), the value is governable,
     /// not stranded in the Join. A type whose custody keeps any value is liquidated instead, at a price.
-    /// STICKY ZERO: two readings >= WRITEOFF_DELAY apart. The first call that sees the custody worthless only
-    /// records the time; a call that sees it worth something again clears that record (and returns, so the clearing
-    /// persists); a record older than WRITEOFF_WINDOW is re-armed rather than trusted. A reissue inside the delay writes
-    /// nothing off. SEQUENCER GRACE (wave 5): on a chain with a Pulse the seizing step reverts `SequencerGrace` while the chain
+    /// STICKY ZERO: worthless readings spanning WRITEOFF_DELAY. The first call that sees the custody worthless
+    /// only records the time (arms); a call that sees it worth something again clears that record (and returns, so the
+    /// clearing persists); a record older than WRITEOFF_WINDOW is re-armed rather than trusted. CHAINED READINGS (audit wave
+    /// 5, medium): every worthless reading is recorded, and one more than WRITEOFF_STEP after the previous re-arms, so a
+    /// reissue nobody reported (and a second burn after it) cannot ride an old record: a seizure needs readings no more than
+    /// WRITEOFF_STEP apart from the arming, WRITEOFF_DELAY or more before, up to now. A reading inside the delay records
+    /// itself and returns. A reissue that lasts under WRITEOFF_STEP between two readings stays unseen (keepers read at a
+    /// shorter cadence). SEQUENCER GRACE (wave 5): on a chain with a Pulse the seizing step reverts `SequencerGrace` while the chain
     /// is down or inside the grace after it (`Pulse.inGrace`), like every other seizure.
     function writeOff(uint256 id) external onlyLedger nonReentrant {
         bytes32 ilk = _ilkOf(id);
         ParametersBase.Config memory c = _config(ilk);
         uint256 since = worthlessSince[ilk];
-        if (IERC4626Min(c.token).convertToAssets(1e18) != 0) {
+        if (!IStockCustody(c.token).worthless()) {
             if (since == 0) revert NotWorthless();
             delete worthlessSince[ilk];
             return;
         }
-        if (since == 0 || block.timestamp > since + WRITEOFF_WINDOW) {
+        uint256 last = worthlessLast[ilk];
+        worthlessLast[ilk] = block.timestamp;
+        if (since == 0 || block.timestamp > since + WRITEOFF_WINDOW || block.timestamp > last + WRITEOFF_STEP) {
             worthlessSince[ilk] = block.timestamp;
             return;
         }
-        if (block.timestamp < since + WRITEOFF_DELAY) revert WriteOffTooSoon(since + WRITEOFF_DELAY);
+        if (block.timestamp < since + WRITEOFF_DELAY) return; // a reading inside the delay: recorded, nothing seized
         Position storage p = _positions[id];
         IlkState storage s = ilkState[ilk];
         _accrue(ilk, s); // pokes the Pulse

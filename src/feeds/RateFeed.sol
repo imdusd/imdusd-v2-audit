@@ -23,6 +23,11 @@ contract RateFeed is IFeed {
     bool public immutable passOneE18;
     IFeed public immutable underlying;
     uint256 public immutable maxGrowthPerSecond;
+    /// @notice `maxGrowthPerSecond` meaning NO growth cap: the rate is the live rate (audit wave 5, medium). For a source
+    /// whose rate cannot be lifted without real value behind it (StockVault: donations are not counted unless they refill an
+    /// impairment, dead shares bound rounding, a reissue is the issuer's), where a cap only withheld value the shares redeem
+    /// for (a reissue forfeited to the holders who stayed through a burn).
+    uint256 public constant UNCAPPED = type(uint256).max;
 
     uint192 public checkpointRate;
     uint64 public checkpointAt;
@@ -59,10 +64,12 @@ contract RateFeed is IFeed {
         return (abi.decode(data, (uint256)), true);
     }
 
-    /// @notice min(live rate, max(checkpoint grown at the cap, highest rate accepted)). Zero if the source stops answering.
+    /// @notice min(live rate, max(checkpoint grown at the cap, highest rate accepted)); the live rate when UNCAPPED. Zero if
+    /// the source stops answering.
     function rate() public view returns (uint256) {
         (uint256 live, bool ok) = liveRate();
         if (!ok) return 0;
+        if (maxGrowthPerSecond == UNCAPPED) return live;
         uint256 ck = checkpointRate;
         uint256 ceiling = ck + ck * maxGrowthPerSecond * (block.timestamp - checkpointAt) / 1e18;
         uint256 high = highRate;
@@ -95,14 +102,18 @@ contract RateFeed is IFeed {
         return underlying.isStale() || rate() == 0;
     }
 
-    /// @notice The underlying holds the value its source attested (the rate is read live, never clamped by an attester).
+    /// @notice Both inputs hold what their sources attested: the underlying, and the rate source (an ERC-4626 vault or wstETH
+    /// answers no `converged()` and counts as converged: nothing clamps it). Audit wave 5, low: a swarm leaf read as the rate
+    /// source (its `latestValue`) was invisible here, so a clamped rate read as converged.
     function converged() external view returns (bool) {
-        return FeedTraits.converged(underlying);
+        return FeedTraits.converged(underlying) && FeedTraits.converged(IFeed(rateSource));
     }
 
-    /// @notice The underlying is a proven pool price (or a product over one).
+    /// @notice The underlying is a proven pool price (or a product over one) AND the rate source has no attester in its path
+    /// (FeedTraits.attesterFree: a vault, wstETH, a proven price). Audit wave 5, low: as ProductFeed requires of its other
+    /// input since wave 4 (C5); a swarm leaf as the rate source makes the feed not proven, so the Pricer uses the median rule.
     function proven() external view returns (bool) {
-        return FeedTraits.proven(underlying);
+        return FeedTraits.proven(underlying) && FeedTraits.attesterFree(IFeed(rateSource));
     }
 
     /// @notice The capped rate times the underlying's attested value (FeedTraits.attested): what this feed would read with

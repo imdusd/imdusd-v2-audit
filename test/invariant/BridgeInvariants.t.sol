@@ -347,9 +347,15 @@ contract BridgeAttackHandler is Test {
     // queue breaker
     uint256 public trippedClaimed; // B1: a claim minted while the path's breaker was tripped
     uint256 public ok_trip;
+    uint256 public ok_tightenB;
     uint256 public ok_reset;
     uint256 public staleReset; // B3: a RESET_BREAKER naming an earlier trip applied
     uint256[] internal ghostQueueAt; // queue times since the last reset (with amounts)
+    // a review of the wave-5 fixes: every reopening (UNPAUSE, a cap raise, an inbound-limit raise) and what minted at once since the last one
+    uint256 public reopenAt;
+    uint256 public mintedSinceReopen;
+    uint256 public reopenings;
+    uint256 public ok_tightenC;
     uint256[] internal ghostQueueAmt;
 
     mapping(bytes32 => bool) public ghostVoided;
@@ -435,6 +441,7 @@ contract BridgeAttackHandler is Test {
             ghostQueueAt.push(vm.getBlockTimestamp());
             ghostQueueAmt.push(amount);
         } else {
+            mintedSinceReopen += rhTok.totalSupply() - b0;
             instantMinted += rhTok.totalSupply() - b0;
             if (forged[idx]) forgedSpendable += amount;
         }
@@ -468,13 +475,30 @@ contract BridgeAttackHandler is Test {
         bytes32 k = claimKeys[i % claimKeys.length];
         uint8 st = ghostClaimState[k];
         vm.prank(safe);
-        try rh.cancelClaim(HOME, k) {
-            ok_cancel++;
-            if (st != 1) badCancel++;
-            else ghostQueued -= ghostClaimAmount[k];
-            ghostClaimState[k] = 3;
-            cancelledKeys.push(k);
-        } catch {}
+        rh.cancelClaim(HOME, k); // a review of the wave-5 fixes: never reverts; a claim not pending is left as it is
+        (,,, uint8 now_) = rh.claims(HOME, k);
+        if (st != 1) {
+            if (now_ != st) badCancel++;
+            return;
+        }
+        ok_cancel++;
+        ghostQueued -= ghostClaimAmount[k];
+        ghostClaimState[k] = 3;
+        cancelledKeys.push(k);
+    }
+
+    /// The Safe lowers the instant cap (instant `tighten`), every other field as it stands (clamped).
+    function tightenCap(uint256 c) external {
+        vm.prank(safe);
+        rh.tighten(HOME, bound(c, 0, 5_000) * 1e18, 0, type(uint256).max, 0);
+        ok_tightenC++;
+    }
+
+    /// The Safe lowers the queue breaker (instant `tighten`; audit wave 5): every other field as it stands (clamped).
+    function tightenBreaker(uint256 b) external {
+        vm.prank(safe);
+        rh.tighten(HOME, type(uint256).max, 0, bound(b, 0, 60_000) * 1e18, 0);
+        ok_tightenB++;
     }
 
     /// The Safe trips the queue breaker (instant).
@@ -488,7 +512,7 @@ contract BridgeAttackHandler is Test {
     function ghostWindowQueued() external view returns (uint256 sum) {
         uint256 day = vm.getBlockTimestamp() / 1 days;
         for (uint256 i; i < ghostQueueAt.length; ++i) {
-            if (ghostQueueAt[i] / 1 days + rh.BREAKER_DAYS() > day) sum += ghostQueueAmt[i];
+            if (ghostQueueAt[i] / 1 days + uint256(4) > day) sum += ghostQueueAmt[i];
         }
     }
 
@@ -517,14 +541,17 @@ contract BridgeAttackHandler is Test {
         if (n == 0) return;
         (,, bytes32 sender, uint64 nonce,,,,) = homeEp.packets(idx % n);
         bytes32 stored = rhEp.inboundPayloadHash(address(rh), HOME, sender, nonce);
+        (, uint64 before) = rh.holds(HOME, sender, nonce);
         vm.prank(safe);
-        try rh.hold(HOME, nonce) {
-            if (ghostHoldAt[nonce] != 0) holdRenewed++;
-            ok_hold++;
-            ghostHoldAt[nonce] = vm.getBlockTimestamp();
-            ghostHoldHash[nonce] = stored;
-            heldNonces.push(nonce);
-        } catch {}
+        rh.hold(HOME, nonce); // a review of the wave-5 fixes: never reverts; a no-op when held before or nothing executable is stored
+        (bytes32 boundHash, uint64 after_) = rh.holds(HOME, sender, nonce);
+        if (after_ == before) return; // nothing placed
+        if (ghostHoldAt[nonce] != 0 || before != 0) holdRenewed++;
+        ok_hold++;
+        ghostHoldAt[nonce] = vm.getBlockTimestamp();
+        ghostHoldHash[nonce] = stored;
+        if (boundHash != stored) holdRenewed++;
+        heldNonces.push(nonce);
     }
 
     /// H2 as a liveness check: an honest packet whose hold has ended runs for anyone when nothing else stops it (path open,
@@ -580,8 +607,10 @@ contract BridgeAttackHandler is Test {
     /// 0 bare SET_PATH (same limits), 1 bare receive pin, 2 pin + config, 3 config change, 4 UNPAUSE, 5 [config, UNPAUSE],
     /// 6 UNVOID of an honest payload voided by mistake, 7 RELEASE (early) of the last hold, with the hash it binds,
     /// 8 UNCANCEL of the last cancelled claim, 9 RESET_BREAKER of the current trip, 10 RESET_BREAKER of an earlier trip
+    /// 11 SET_DELAY restoring the launch cap (D and B as they stand), 12 SET_PATH closing the inbound side (limit 0, on a
+    /// paused path), 13 SET_PATH reopening it (a review of the wave-5 fixes: both reopening routes under the invariant)
     function govern(uint256 what) external {
-        what %= 11;
+        what %= 14;
         bytes32 unc;
         uint64 relNonce;
         bytes memory p;
@@ -605,7 +634,24 @@ contract BridgeAttackHandler is Test {
         } else if (what == 9 || what == 10) {
             (, uint16 trips,,,,,) = rh.breakers(HOME);
             if (what == 10 && trips < 2) return;
-            p = abi.encode(uint8(14), HOME, uint256(what == 9 ? trips : trips - 1));
+            // audit wave 5: a reset only on a paused path: the Safe pauses, then resets and reopens in one BATCH; a review of
+            // the wave-5 fixes: pause only for a reset that is proposable (the current trip), so a refused one leaves the path as it was
+            (,, bool tripped,,,,) = rh.breakers(HOME);
+            if (what == 9 && tripped) {
+                vm.prank(safe);
+                rh.pause(HOME);
+            }
+            p = _two(abi.encode(uint8(14), HOME, uint256(what == 9 ? trips : trips - 1)), abi.encode(uint8(5), HOME));
+        } else if (what == 11) {
+            (,,,, uint32 d,, uint16 v) = rh.breakers(HOME);
+            (,,, uint64 bSD,,,) = rh.breakers(HOME);
+            p = abi.encode(uint8(15), HOME, rh.DEFAULT_INSTANT_CAP(), uint256(d), uint256(bSD) * 1e12, uint40(0), uint256(v));
+        } else if (what == 12) {
+            vm.prank(safe);
+            rh.pause(HOME);
+            p = abi.encode(uint8(1), HOME, _b32(address(t.homeAddr())), L, uint256(1 days), uint256(0), uint256(1 days), bytes(""));
+        } else if (what == 13) {
+            p = abi.encode(uint8(1), HOME, _b32(address(t.homeAddr())), L, uint256(1 days), L, uint256(1 days), bytes(""));
         } else if (what == 8) {
             if (cancelledKeys.length == 0) return;
             unc = cancelledKeys[cancelledKeys.length - 1];
@@ -622,8 +668,14 @@ contract BridgeAttackHandler is Test {
             return;
         }
         vm.warp(vm.getBlockTimestamp() + 48 hours);
+        (bool p0, uint256 in0, uint64 cap0) = _openState();
         try rh.applyPending() {
             ok_govern++;
+            (bool p1, uint256 in1, uint64 cap1) = _openState();
+            if ((p0 && !p1) || in1 > in0 || cap1 > cap0) {
+                (reopenAt, mintedSinceReopen) = (vm.getBlockTimestamp(), 0);
+                reopenings++;
+            }
             if (what == 2) ghostConfigured[newLib] = true;
             if (what == 6) {
                 ghostVoided[voidedHonest[voidedHonest.length - 1]] = false;
@@ -650,6 +702,13 @@ contract BridgeAttackHandler is Test {
             vm.prank(safe);
             rh.cancel();
         }
+    }
+
+    function _openState() internal view returns (bool paused_, uint256 inLimit, uint64 capSD) {
+        paused_ = rh.paused(HOME);
+        (uint128 lim,,,) = rh.inbound(HOME);
+        inLimit = lim;
+        (,, capSD) = rh.instantIn(HOME);
     }
 
     function _two(bytes memory a, bytes memory b) internal pure returns (bytes memory) {
@@ -763,8 +822,9 @@ contract BridgeAttackInvariantsTest is W4Bridge {
     function invariant_breakerHolds() public view {
         assertEq(handler.trippedClaimed(), 0, "a claim minted on a tripped path");
         assertEq(handler.staleReset(), 0, "B3: a reset released a trip it does not name");
-        (,, bool tripped,,,,) = rh.breakers(HOME);
-        if (handler.ghostWindowQueued() > rh.DEFAULT_QUEUE_BREAKER()) assertTrue(tripped, "over QUEUE_BREAKER queued, not tripped");
+        (,, bool tripped, uint64 breakerSD,,,) = rh.breakers(HOME);
+        // audit wave 5: against the path's CURRENT breaker, which the Safe may have lowered since the queue grew
+        if (handler.ghostWindowQueued() > uint256(breakerSD) * 1e12) assertTrue(tripped, "over the breaker queued, not tripped");
     }
 
     /// D5: what mints at once (honest or forged, however split) stays within C + C x t / 1 day (C = DELAY_THRESHOLD).
@@ -772,8 +832,16 @@ contract BridgeAttackInvariantsTest is W4Bridge {
         uint256 t = vm.getBlockTimestamp() - handler.start();
         uint256 thr = rh.DEFAULT_INSTANT_CAP();
         assertLe(
-            handler.instantMinted(), thr + thr * t / rh.INSTANT_WINDOW(), "instant mints over the per-path allowance"
+            handler.instantMinted(), thr + thr * t / (1 days), "instant mints over the per-path allowance"
         );
+    }
+
+    /// The empty allowance on every route (a review of the wave-5 fixes): from the last reopening (UNPAUSE, a cap raise, an inbound-limit raise) what mints
+    /// at once is at most C x t / 1 day: the allowance restarts empty, so a stockpile cannot mint a fresh C at once.
+    function invariant_reopeningStartsEmpty() public view {
+        if (handler.reopenAt() == 0) return;
+        uint256 t = vm.getBlockTimestamp() - handler.reopenAt();
+        assertLe(handler.mintedSinceReopen(), rh.DEFAULT_INSTANT_CAP() * t / 1 days, "a reopening minted a fresh cap at once");
     }
 
     /// D7: queued == Σ pending claims, and supply == received - sent (token-only harness: no ledger terms).
@@ -879,7 +947,7 @@ contract BridgeAttackInvariantsTest is W4Bridge {
         handler.deliver(0); // refused: held
         handler.forge(2, 700e18, 0); // packet 1, nonce 2
         handler.hold(1);
-        handler.hold(1); // refused: no renewal
+        handler.hold(1); // a no-op: no renewal (a review of the wave-5 fixes)
         handler.govern(7); // RELEASE of the last hold (nonce 2), 48h
         handler.deliver(1);
         handler.passTime(36 hours);
@@ -891,6 +959,32 @@ contract BridgeAttackInvariantsTest is W4Bridge {
         invariant_heldNeverExecutesEarly();
         invariant_holdNeverRenewed();
         invariant_heldHonestNeverLost();
+        invariant_acceptedApplies();
+    }
+
+    /// Non-hollow for the reopening routes (a review of the wave-5 fixes): a cap restore, an inbound close + UNPAUSE, an inbound reopen, each
+    /// a reopening, with a stockpile run after each; the invariant holds.
+    function test_reopenRoutesHandlerActionsSucceed() public {
+        handler.tightenCap(0);
+        handler.forge(2, 2_000e18, 0); // packet 0, stockpiled
+        handler.forge(2, 2_000e18, 0); // packet 1
+        handler.forge(2, 2_000e18, 0); // packet 2
+        handler.passTime(1 days);
+        handler.govern(11); // C restored: reopening 1
+        assertEq(handler.reopenings(), 1);
+        handler.deliver(0);
+        invariant_reopeningStartsEmpty();
+        handler.govern(12); // pause + inbound closed
+        handler.govern(4); // UNPAUSE: reopening 2
+        assertEq(handler.reopenings(), 2);
+        handler.passTime(1 days);
+        handler.govern(13); // inbound reopened: reopening 3
+        assertEq(handler.reopenings(), 3);
+        handler.deliver(1);
+        handler.deliver(2);
+        assertGt(handler.ok_deliver(), 2);
+        invariant_reopeningStartsEmpty();
+        invariant_queuedAccounting();
         invariant_acceptedApplies();
     }
 }

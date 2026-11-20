@@ -75,6 +75,9 @@ interface IMintableBurnable {
 ///    Kelp sequence: pause; void every forged payload (both instant, one Safe signature round each); fix the DVN config
 ///    (48h); then unpause (48h, its own proposal: UNPAUSE may not share a BATCH with a path, library or config change for
 ///    that eid, so nothing verified under the old DVNs can run in the block the path reopens), without changing the peer.
+///    Before the UNPAUSE, void every payload the endpoint stores for the path above the last nonce matched to a peer
+///    `Sent` (audit wave 5: a stockpile verified but not executed outlasts the pause and the DVN fix; the reopened instant
+///    allowance starts empty, so what is missed queues and needs the Safe's answer within D again).
 ///
 /// LIMITS. Per path, an outbound and an inbound limit in LayerZero RateLimiter's form: the amount in flight
 /// decays linearly at limit/window, so at most `limit` passes at once and at most limit + limit x t / window in ANY interval
@@ -121,7 +124,16 @@ interface IMintableBurnable {
 /// B, lengthen D) also instantly by the governor (`tighten`), which bumps the path's settings version: a SET_DELAY
 /// names the version it was proposed against, so one proposed before a tightening is refused when applied. A claim is claimable at queuedAt + the path's D AT CLAIM TIME: a
 /// lengthening applies to claims already queued (it never shortens a wait), and a shortening, being timelocked, applies
-/// to them only after 48h. A lowered C stops instant mints at once (what was used still counts).
+/// to them only after 48h. A lowered C stops instant mints at once (what was used still counts). Nothing LOOSENS the
+/// instant allowance at once (audit wave 5): after an UNPAUSE, and after a SET_DELAY raising C, the allowance restarts empty
+/// and refills at C per day, so packets verified but not executed while it was closed (a forged stockpile) queue when they
+/// run. `tighten` never reverts on a set path (audit wave 5): each field lands at the tighter of its argument and what stands,
+/// so no one can make the Safe's signed act fail by applying a matured SET_DELAY first; a breaker lowered below what its
+/// window holds trips the path (audit wave 5). The window counts what QUEUED, cancelled claims included (a cancel refunds
+/// nothing, like the inbound limit), so a lowered B may trip on claims the Safe already cancelled (a review of the wave-5 fixes).
+/// INCIDENT ACTS NEVER REVERT ON A STRANGER (a review of the wave-5 fixes): `pause`, `tighten`, `tripBreaker`, `voidPayload`, `cancel`
+/// (nothing pending), `cancelClaim` (claim no longer pending) and `hold` (nonce executed, empty or held before) all land
+/// whatever another account did first, so the Safe may batch them in one MultiSend; read the events to see what each did.
 /// BULK CANCEL. A compromised DVN set signs any number of forged messages; cancelling them one by one
 /// costs the Safe a transaction per claim. A per-path cutoff (`breakers.cancelledFrom`, set by `tighten`, instant) cancels
 /// in O(1) every pending claim queued at or after it, and every claim queued later (checked at claim time). Nothing is
@@ -193,38 +205,42 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         uint64 lastUpdated;
     }
 
-    uint8 public constant SET_PATH = 1; // (eid, peer, outLimit, outWindow, inLimit, inWindow, enforcedOptions)
-    uint8 public constant SET_CONFIG = 2; // (lib, SetConfigParam[])
-    uint8 public constant SET_SEND_LIBRARY = 3; // (eid, lib)
-    uint8 public constant SET_RECEIVE_LIBRARY = 4; // (eid, lib, gracePeriod)
-    uint8 public constant UNPAUSE = 5; // (eid)
-    uint8 public constant BATCH = 6; // (bytes[] payloads), none of them a BATCH
-    uint8 public constant SET_FEE = 7; // (eid, bps)
+    uint8 internal constant SET_PATH = 1; // (eid, peer, outLimit, outWindow, inLimit, inWindow, enforcedOptions)
+    uint8 internal constant SET_CONFIG = 2; // (lib, SetConfigParam[])
+    uint8 internal constant SET_SEND_LIBRARY = 3; // (eid, lib)
+    uint8 internal constant SET_RECEIVE_LIBRARY = 4; // (eid, lib, gracePeriod)
+    uint8 internal constant UNPAUSE = 5; // (eid): a paused path only (a review of the wave-5 fixes)
+    uint8 internal constant BATCH = 6; // (bytes[] payloads), none of them a BATCH
+    uint8 internal constant SET_FEE = 7; // (eid, bps)
     /// @notice Endpoint channel acts for a PAUSED path: drop a verified inbound payload so it can never execute.
     /// Validated against EndpointV2's state at proposal and at application (audit wave 4): SKIP only the first nonce with no
     /// payload; BURN only a stored payload at or below lazyInboundNonce (the head nonce of a paused path is NOT burnable:
     /// `voidPayload` refuses it here for good instead), and a NIL one also on an open path.
-    uint8 public constant ENDPOINT_SKIP = 8; // (srcEid, sender, nonce): skip a nonce that was never verified
+    uint8 internal constant ENDPOINT_SKIP = 8; // (srcEid, sender, nonce): skip a nonce that was never verified
     /// Never needed to stop a forgery (`hold`/`voidPayload` do, keeping the endpoint's proof): clean-ups only.
-    uint8 public constant ENDPOINT_NILIFY = 9; // (srcEid, sender, nonce, payloadHash): void a verified payload (re-verifiable)
-    uint8 public constant ENDPOINT_BURN = 10; // (srcEid, sender, nonce, payloadHash): void it for good
+    uint8 internal constant ENDPOINT_NILIFY = 9; // (srcEid, sender, nonce, payloadHash): void a verified payload (re-verifiable)
+    uint8 internal constant ENDPOINT_BURN = 10; // (srcEid, sender, nonce, payloadHash): void it for good
     /// @notice Lift the bridge's void on a payload hash (audit wave 4): an honest payload voided by mistake.
-    uint8 public constant UNVOID = 11; // (payloadHash)
+    uint8 internal constant UNVOID = 11; // (payloadHash)
     /// @notice End a hold before HOLD_TIME, or let through a payload other than the one held: the held
     /// nonce then runs only with `payloadHash` (and never anything else), at once.
-    uint8 public constant RELEASE = 12; // (srcEid, sender, nonce, payloadHash)
+    uint8 internal constant RELEASE = 12; // (srcEid, sender, nonce, payloadHash)
     /// @notice Restore a claim the governor cancelled: pending again, claimable at queuedAt + the path's
-    /// delay (usually long run). No early release exists: a claim waits its delay or this 48h timelock.
-    uint8 public constant UNCANCEL = 13; // (srcEid, guid)
+    /// delay (usually long run). No early release exists: a claim waits its delay or this 48h timelock. Applied only to a
+    /// claim still cancelled (a repeat in one BATCH does nothing; audit wave 5).
+    uint8 internal constant UNCANCEL = 13; // (srcEid, guid)
     /// @notice Release a tripped queue breaker: claims on the path run again and its day buckets restart
     /// at zero. Names the trip (`trips` when it tripped), so a reset proposed before a trip can never release a later one.
-    uint8 public constant RESET_BREAKER = 14; // (srcEid, trip)
+    /// Accepted only on a PAUSED path, at proposal and at application (audit wave 5): nothing queues unseen between the
+    /// Safe's last cancelClaim and the reset, and what runs after the reopening counts in the fresh window. Procedure:
+    /// pause, cancel the forged claims, propose BATCH[RESET_BREAKER, UNPAUSE] (one 48h wait).
+    uint8 internal constant RESET_BREAKER = 14; // (srcEid, trip)
     /// @notice Set a path's inbound delay settings (governable per path, no bound on the cap or the
     /// breaker, the delay within [MIN_DELAY, MAX_DELAY]) and its bulk-cancel cutoff (0 = none): any direction, through the
     /// 48h timelock, naming the settings version it was proposed against. Tightening also has an instant governor route,
     /// `tighten`. Amounts in 18 decimals, whole multiples of 1e12 (shared decimals). Lifting or moving the cutoff later
     /// RESTORES the claims it held (claims the governor cancelled one by one stay cancelled: UNCANCEL each).
-    uint8 public constant SET_DELAY = 15; // (srcEid, instantCap, delay, queueBreaker, cancelFrom, version)
+    uint8 internal constant SET_DELAY = 15; // (srcEid, instantCap, delay, queueBreaker, cancelFrom, version)
 
     /// @notice Highest per-path limit (for millions a day): 250,000,000 imdUSD per window, so a message
     /// (<= the inbound limit) always fits a claim's 48-bit shared-decimals amount (2^48 / 1e6 ~ 281,474,976 imdUSD).
@@ -237,7 +253,7 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// Instant cap: most imdUSD a path mints at once per INSTANT_WINDOW (decaying), so the largest single message that can
     /// (Wormhole Governor); the rest waits the delay as a claim.
     uint256 public constant DEFAULT_INSTANT_CAP = 5_000e18;
-    uint256 public constant INSTANT_WINDOW = 1 days;
+    uint256 internal constant INSTANT_WINDOW = 1 days;
     /// @notice Claim delay: how long a queued inbound transfer waits before anyone may claim it, the Safe's window to pause
     /// the path or cancel a forgery before it is spendable.
     uint256 public constant DEFAULT_DELAY = 12 hours;
@@ -252,23 +268,23 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     uint256 public constant MIN_DELAY = 1 hours;
     uint256 public constant MAX_DELAY = 7 days;
     /// @notice The breaker window in UTC days: any HOLD_TIME (72 h) span of queue times falls inside BREAKER_DAYS days.
-    uint256 public constant BREAKER_DAYS = 4;
+    uint256 internal constant BREAKER_DAYS = 4;
     uint8 internal constant CLAIM_PENDING = 1;
     uint8 internal constant CLAIM_CLAIMED = 2;
     uint8 internal constant CLAIM_CANCELLED = 3;
-    uint256 public constant MIN_WINDOW = 1 hours;
-    uint256 public constant MAX_WINDOW = 7 days;
+    uint256 internal constant MIN_WINDOW = 1 hours;
+    uint256 internal constant MAX_WINDOW = 7 days;
     /// @notice The least a send delivers and an inbound message may carry (audit wave 4): a forged dust packet
     /// reverts instead of consuming an honest nonce, and at most 2 x limit / MIN_AMOUNT nonces per window can be consumed.
-    uint256 public constant MIN_AMOUNT = 10e18;
+    uint256 internal constant MIN_AMOUNT = 10e18;
     /// @notice Most blocks the OLD receive library keeps verifying after a SET_RECEIVE_LIBRARY (audit wave 4): ~7 days of
     /// Ethereum blocks (far less on a fast chain, which only shortens it).
-    uint256 public constant MAX_RECEIVE_GRACE = 50_400;
-    uint8 public constant SHARED_DECIMALS = 6;
-    uint256 public constant CONVERSION = 1e12; // 18 local decimals -> 6 shared
+    uint256 internal constant MAX_RECEIVE_GRACE = 50_400;
+    uint8 internal constant SHARED_DECIMALS = 6;
+    uint256 internal constant CONVERSION = 1e12; // 18 local decimals -> 6 shared
     /// @notice Highest per-destination fee: 0.25%, the peg pools' no-surcharge band. A larger fee would let one chain's
     /// price sit outside the band before moving imdUSD between chains pays, so the bridge would stop tying the pegs together.
-    uint256 public constant MAX_FEE_BPS = 25;
+    uint256 internal constant MAX_FEE_BPS = 25;
     /// @notice Least required DVNs on any ULN config (3, following LayerZero's post-Kelp
     /// guidance): the launch set is LayerZero Labs + Twinstake + P2P, so no single operator (LayerZero's own included) is
     /// one of only two. Raising it is a redeploy of the bridge.
@@ -277,12 +293,12 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// the IMD OFT's mainnet -> 4663 value (~3 min; a deeper reorg is bounded by the 4663 inbound limit). Any other source
     /// (4663, an Arbitrum Orbit chain with one sequencer): 20 = LayerZero's default for Arbitrum-family sources; the IMD OFT's
     /// 5 is ~1-2 s of soft confirmations.
-    uint64 public constant MIN_CONFIRMATIONS_FROM_ETHEREUM = 15;
+    uint64 internal constant MIN_CONFIRMATIONS_FROM_ETHEREUM = 15;
     /// @dev A block count, not time (audit wave 4, info): on 4663 (~0.1-0.25 s blocks, one sequencer) 20 is a few seconds of soft
     /// confirmations before batch posting; a sequencer reorg deeper than that after the DVNs sign leaves a mint on Ethereum
     /// whose burn is gone, bounded by Ethereum's inbound limit from 4663 (2 x 10,000 per window).
-    uint64 public constant MIN_CONFIRMATIONS_FROM_OTHER = 20;
-    uint32 public constant ETHEREUM_EID = 30101;
+    uint64 internal constant MIN_CONFIRMATIONS_FROM_OTHER = 20;
+    uint32 internal constant ETHEREUM_EID = 30101;
     uint32 internal constant CONFIG_TYPE_EXECUTOR = 1;
     uint32 internal constant CONFIG_TYPE_ULN = 2;
     uint8 internal constant NIL_DVN_COUNT = 255;
@@ -369,16 +385,11 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     error SameLibrary(uint32 eid, address lib);
     /// @notice The message at (srcEid, nonce) is held until `until` (or for good, if the endpoint's payload changed).
     error OnHold(uint32 srcEid, uint64 nonce, uint256 until);
-    /// @notice That nonce was held once already: a hold cannot be renewed.
-    error AlreadyHeld(uint32 srcEid, uint64 nonce);
-    /// @notice Nothing executable is stored at that nonce (empty, NIL, executed, or no peer).
-    error NotHoldable(uint32 srcEid, uint64 nonce, bytes32 stored);
     /// @notice No pending claim there (none, claimed or cancelled), or not yet claimable (`claimableAt` in the future).
     error NotClaimable(uint32 srcEid, bytes32 guid, uint256 claimableAt);
     /// @notice The path's queue breaker is tripped: claims wait for RESET_BREAKER.
     error Tripped(uint32 srcEid);
-    /// @notice `tighten` with a value that loosens (a higher cap or breaker, a shorter delay, a later or no cutoff) or a
-    /// delay past MAX_DELAY.
+    /// @notice `tighten` on a path whose settings were never set (audit wave 5); otherwise it clamps, never reverts (audit wave 5).
     error NotTighter();
     /// @notice The claim was queued at or after the path's bulk-cancel cutoff: it waits for a timelocked SET_DELAY that
     /// lifts the cutoff or moves it later.
@@ -403,7 +414,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// @dev Not `Cancelled`: Governed's proposal event has that name.
     event ClaimCancelled(bytes32 indexed guid, uint32 indexed srcEid);
     event ClaimRestored(bytes32 indexed guid, uint32 indexed srcEid);
-    /// @dev `by` = this bridge when the queue tripped it, the governor otherwise; `trip` names it for RESET_BREAKER.
+    /// @dev `by` = this bridge when the queue (or a breaker lowered below it, audit wave 5) tripped it, the governor otherwise;
+    /// `trip` names it for RESET_BREAKER.
     event BreakerTripped(uint32 indexed srcEid, uint256 trip, address by);
     event BreakerReset(uint32 indexed srcEid, uint256 trip);
     /// @dev A path's delay settings changed (SET_DELAY, `tighten`, or the launch values at its first SET_PATH). `cancelFrom`
@@ -570,9 +582,11 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     }
 
     /// @notice Refuse a pending claim (governor, instant): it never mints until the timelock's UNCANCEL.
+    /// A claim that is not pending (claimed by anyone, already cancelled, or none) is left as it is, without a revert
+    /// (a review of the wave-5 fixes): a stranger's claim just before cannot revert the Safe's incident batch [cancelClaim, pause].
     function cancelClaim(uint32 srcEid, bytes32 guid) external onlyGovernor {
         Claim storage c = claims[srcEid][guid];
-        if (c.state != CLAIM_PENDING) revert NotClaimable(srcEid, guid, 0);
+        if (c.state != CLAIM_PENDING) return;
         c.state = CLAIM_CANCELLED;
         queued -= uint256(c.amountSD) * CONVERSION;
         emit ClaimCancelled(guid, srcEid);
@@ -591,23 +605,33 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         return cap > used ? cap - used : 0;
     }
 
-    /// @notice Tighten a path's delay settings now (governor, instant, like pause/hold): a cap and a breaker
-    /// at or below the current ones, a delay at or above the current one (up to MAX_DELAY), a bulk-cancel cutoff at or
-    /// before the current one (or the first). A longer delay applies to the claims already queued too (they become
-    /// claimable at queuedAt + the new delay). BULK CANCEL: `cancelFrom` = T cancels, in O(1), EVERY pending claim on the
-    /// path queued at or after T and every claim queued later (checked at claim time; they stay pending and in `queued`,
-    /// never lost, until a SET_DELAY lifts the cutoff or moves it later). Bumps the path's settings version, so a SET_DELAY
-    /// proposed before (naming the old version) is refused when applied: it cannot undo the tightening.
+    /// @notice Tighten a path's delay settings now (governor, instant, like pause/hold). Each field lands at
+    /// the TIGHTER of what it names and what stands (audit wave 5): the lower cap and breaker, the longer delay (at most
+    /// MAX_DELAY), the earlier non-zero bulk-cancel cutoff. It never reverts on a path whose settings exist, so nobody can
+    /// make the Safe's signed act fail by applying a matured SET_DELAY just before it (applyPending is permissionless).
+    /// A longer delay applies to the claims already queued too (they become claimable at queuedAt + the new delay).
+    /// BULK CANCEL: `cancelFrom` = T cancels, in O(1), EVERY pending claim on the path queued at or after T and every claim
+    /// queued later (checked at claim time; they stay pending and in `queued`, never lost, until a SET_DELAY lifts the
+    /// cutoff or moves it later). Bumps the path's settings version, so a SET_DELAY proposed before (naming the old
+    /// version) is refused when applied: it cannot undo the tightening. Refused (NotTighter) only on a path whose settings
+    /// were never set (audit wave 5): an instant act never writes settings a timelocked one could not. The clamp is SILENT
+    /// (a review of the wave-5 fixes): an argument looser than what stands (a wrong one too) is replaced without a revert, so read the
+    /// values that landed back from the `DelaySet` event (or `instantIn` / `breakers`).
     function tighten(uint32 srcEid, uint256 instantCap, uint256 delay, uint256 queueBreaker, uint40 cancelFrom)
         external
         onlyGovernor
     {
         Breaker storage b = breakers[srcEid];
-        uint256 cut = b.cancelledFrom;
-        if (
-            instantCap > uint256(instantIn[srcEid].capSD) * CONVERSION || queueBreaker > uint256(b.breakerSD) * CONVERSION
-                || delay < b.delay || delay > MAX_DELAY || (cancelFrom != cut && (cancelFrom == 0 || (cut != 0 && cancelFrom > cut)))
-        ) revert NotTighter();
+        // audit wave 5: a path never set has no settings to tighten (its first SET_PATH writes the launch values)
+        if (b.delay == 0) revert NotTighter();
+        uint256 v = uint256(instantIn[srcEid].capSD) * CONVERSION;
+        if (instantCap > v) instantCap = v;
+        v = uint256(b.breakerSD) * CONVERSION;
+        if (queueBreaker > v) queueBreaker = v;
+        if (delay > MAX_DELAY) delay = MAX_DELAY;
+        if (delay < b.delay) delay = b.delay;
+        uint40 cut = b.cancelledFrom;
+        if (cut != 0 && (cancelFrom == 0 || cancelFrom > cut)) cancelFrom = cut;
         ++b.version;
         _setDelay(srcEid, instantCap, delay, queueBreaker, cancelFrom);
     }
@@ -643,11 +667,12 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     function hold(uint32 srcEid, uint64 nonce) external onlyGovernor {
         bytes32 sender = peers[srcEid];
         HoldRecord storage h = holds[srcEid][sender][nonce];
-        if (h.until != 0) revert AlreadyHeld(srcEid, nonce);
+        // a review of the wave-5 fixes: a nonce held before, or with nothing executable stored (executed by anyone, empty, NIL, no peer),
+        // is left as it is without a revert, so a stranger's execute cannot revert the Safe's batch [hold, pause]; the
+        // HoldPlaced event is the Safe's confirmation that a hold was placed
+        if (h.until != 0) return;
         bytes32 stored = endpoint.inboundPayloadHash(address(this), srcEid, sender, nonce);
-        if (sender == bytes32(0) || stored == bytes32(0) || stored == NIL_PAYLOAD_HASH) {
-            revert NotHoldable(srcEid, nonce, stored);
-        }
+        if (sender == bytes32(0) || stored == bytes32(0) || stored == NIL_PAYLOAD_HASH) return;
         uint64 until = uint64(block.timestamp + HOLD_TIME);
         (h.payloadHash, h.until) = (stored, until);
         emit HoldPlaced(srcEid, sender, nonce, stored, until);
@@ -655,6 +680,11 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
 
     /// @notice Refuse `payloadHash` here for good (governor, instant), whatever the endpoint or the DVNs
     /// hold later. Only the timelock's UNVOID lifts it; the endpoint keeps the packet, so an honest one then runs as it is.
+    /// The void is by hash on every path and nonce (audit wave 5): a forged REPLAY of an honest (guid, message) at another
+    /// nonce has the honest message's hash, so voiding it refuses the honest one too. For a replay use the nonce-scoped
+    /// route instead: `hold(srcEid, forgedNonce)`, then RELEASE that nonce naming a hash nothing has: that nonce never runs
+    /// and the honest one is untouched. TIMING (a review of the wave-5 fixes): the RELEASE must be PROPOSED within 24 h of the hold (72 h hold
+    /// - 48 h timelock), or the hold ends first and the replay runs; and the proposal slot must be free then.
     function voidPayload(bytes32 payloadHash) external onlyGovernor {
         voided[payloadHash] = true;
         emit Voided(0, 0, bytes32(0), 0, payloadHash);
@@ -717,19 +747,24 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         emit Queued(guid, origin.srcEid, to, amount, origin.nonce, block.timestamp + b.delay);
         // the breaker: add to today's bucket (buckets of days that fell out of the window restart at zero) and sum the window
         uint256 day = block.timestamp / 1 days;
-        uint256 bk = breakerBuckets[origin.srcEid];
+        (uint256 bk, uint256 sum) = _window(b, origin.srcEid, day);
+        bk += (amount / CONVERSION) << (63 * (day % BREAKER_DAYS)); // a day's queue < 2^63 units (see breakerBuckets)
+        breakerBuckets[origin.srcEid] = bk;
+        b.day = uint40(day);
+        if (sum + amount / CONVERSION > b.breakerSD && !b.tripped) _trip(b, origin.srcEid, address(this));
+    }
+
+    /// @dev The path's breaker buckets as of UTC `day` (the buckets of days that fell out of the window since `b.day`
+    /// cleared) and their sum, in shared decimals.
+    function _window(Breaker storage b, uint32 srcEid, uint256 day) private view returns (uint256 bk, uint256 sum) {
+        bk = breakerBuckets[srcEid];
         uint256 mask = (1 << 63) - 1;
         for (uint256 d = uint256(b.day) + 1; d <= day && d <= uint256(b.day) + BREAKER_DAYS; ++d) {
             bk &= ~(mask << (63 * (d % BREAKER_DAYS)));
         }
-        bk += (amount / CONVERSION) << (63 * (day % BREAKER_DAYS)); // a day's queue < 2^63 units (see breakerBuckets)
-        breakerBuckets[origin.srcEid] = bk;
-        uint256 sum;
         for (uint256 i; i < BREAKER_DAYS; ++i) {
             sum += (bk >> (63 * i)) & mask;
         }
-        b.day = uint40(day);
-        if (sum > b.breakerSD && !b.tripped) _trip(b, origin.srcEid, address(this));
     }
 
     function _trip(Breaker storage b, uint32 srcEid, address by) private {
@@ -874,6 +909,9 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
             // checked again at application: only the trip it names, and only while that trip stands
             Breaker storage b = breakers[eid];
             if (!b.tripped || trip != b.trips) revert BadPayload();
+            // audit wave 5: only on a PAUSED path, so nothing can queue between the Safe's last look and the reset (a claim
+            // queued in the reset's block would be released uncounted); reopen in the same BATCH (UNPAUSE) or after
+            if (!paused[eid]) revert PathOpen(eid);
         } else if (kind == SET_DELAY) {
             (, uint32 eid, uint256 cap, uint256 delay, uint256 breaker,, uint256 version) =
                 abi.decode(payload, (uint8, uint32, uint256, uint256, uint256, uint40, uint256));
@@ -885,6 +923,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
             ) revert OutOfBounds();
         } else if (kind == UNPAUSE) {
             (, uint32 eid) = abi.decode(payload, (uint8, uint32));
+            // a review of the wave-5 fixes: only a paused path (an UNPAUSE of an open one reopens nothing and would empty its allowance)
+            if (!paused[eid]) revert PathOpen(eid);
             if (block.number < receiveGraceUntil[eid]) revert GraceRunning(eid, receiveGraceUntil[eid]);
             for (uint256 i; i < batch.length; ++i) {
                 if (_changesPath(batch[i], eid)) revert UnpauseWithChange(eid);
@@ -976,6 +1016,9 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else if (kind == SET_PATH) {
             (, uint32 eid, bytes32 peer, uint256 outLimit, uint256 outWindow, uint256 inLimit, uint256 inWindow, bytes memory opts) =
                 abi.decode(payload, (uint8, uint32, bytes32, uint256, uint256, uint256, uint256, bytes));
+            // a review of the wave-5 fixes: a new peer or a raised inbound limit lets packets run that could not before (verified while
+            // the path was closed to them), so on a set path the instant allowance restarts empty, as at UNPAUSE
+            bool reopens = peer != peers[eid] || inLimit > inbound[eid].limit;
             peers[eid] = peer;
             enforcedOptions[eid] = opts;
             _setLimit(outbound[eid], outLimit, outWindow);
@@ -987,6 +1030,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
                 b.day = uint40(block.timestamp / 1 days);
                 breakerBuckets[eid] = 1 << 255;
                 _setDelay(eid, DEFAULT_INSTANT_CAP, DEFAULT_DELAY, DEFAULT_QUEUE_BREAKER, 0);
+            } else if (reopens) {
+                _meter(eid, instantIn[eid].capSD, true);
             }
             emit PathSet(eid, peer, outLimit, outWindow, inLimit, inWindow);
         } else if (kind == SET_CONFIG) {
@@ -1032,9 +1077,13 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else if (kind == UNCANCEL) {
             (, uint32 eid, bytes32 guid) = abi.decode(payload, (uint8, uint32, bytes32));
             Claim storage c = claims[eid][guid];
-            c.state = CLAIM_PENDING;
-            queued += uint256(c.amountSD) * CONVERSION;
-            emit ClaimRestored(guid, eid);
+            // audit wave 5: restored once (a BATCH may name a claim twice: the second item is a no-op, so `queued` counts it
+            // once and the proposal still applies)
+            if (c.state == CLAIM_CANCELLED) {
+                c.state = CLAIM_PENDING;
+                queued += uint256(c.amountSD) * CONVERSION;
+                emit ClaimRestored(guid, eid);
+            }
         } else if (kind == RESET_BREAKER) {
             (, uint32 eid, uint256 trip) = abi.decode(payload, (uint8, uint32, uint256));
             breakers[eid].tripped = false;
@@ -1049,17 +1098,39 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else {
             (, uint32 eid) = abi.decode(payload, (uint8, uint32));
             paused[eid] = false;
+            // audit wave 5: a reopened path's instant allowance starts EMPTY and refills at its cap per INSTANT_WINDOW, so
+            // packets verified but not executed while it was closed (a forged stockpile) queue as visible claims when
+            // they run at the reopening instead of minting a fresh cap at once
+            _meter(eid, instantIn[eid].capSD, true);
             emit Unpaused(eid);
         }
     }
 
-    /// @dev Write a path's delay settings (validated by the caller). The instant meter's `used` is kept, so a lowered cap
-    /// takes effect at once and a raised one adds only its headroom.
+    /// @dev Write a path's delay settings (validated by the caller). The instant meter is CHECKPOINTED first (audit wave 5): what
+    /// was used decays to now at the cap that held until now, so the time before a change never decays at the new cap. A
+    /// lowered cap then takes effect at once; a RAISED one frees nothing at once (audit wave 5): the allowance restarts EMPTY
+    /// and refills at the new cap's rate over INSTANT_WINDOW, like a reopened path (a C restored after the Safe's C = 0,
+    /// and a forged stockpile run at that moment, queues instead of minting). Not at a path's first settings (the launch
+    /// values): nothing was ever open there.
     function _setDelay(uint32 eid, uint256 cap, uint256 delay, uint256 breaker, uint40 cancelFrom) private {
-        instantIn[eid].capSD = uint64(cap / CONVERSION);
+        uint256 capSD = cap / CONVERSION;
         Breaker storage b = breakers[eid];
+        _meter(eid, capSD, capSD > instantIn[eid].capSD && b.delay != 0);
         (b.breakerSD, b.delay, b.cancelledFrom) = (uint64(breaker / CONVERSION), uint32(delay), cancelFrom);
+        // audit wave 5: a breaker lowered below what the window already holds trips the path now (the queued claims wait for
+        // RESET_BREAKER), as if the queue had grown past it
+        (, uint256 sum) = _window(b, eid, block.timestamp / 1 days);
+        if (sum > breaker / CONVERSION && !b.tripped) _trip(b, eid, address(this));
         emit DelaySet(eid, cap, delay, breaker, cancelFrom);
+    }
+
+    /// @dev Checkpoint a path's instant meter at `capSD` (what was used decays to now at the cap that held); `empty` restarts
+    /// the allowance empty (used at least the cap), so it refills at the cap's rate (audit wave 5).
+    function _meter(uint32 eid, uint256 capSD, bool empty) private {
+        Meter storage m = instantIn[eid];
+        (uint256 used,) = _instantUsed(m);
+        if (empty && used < capSD * CONVERSION) used = capSD * CONVERSION;
+        (m.used, m.lastUpdated, m.capSD) = (uint128(used), uint64(block.timestamp), uint64(capSD));
     }
 
     /// @dev A new limit keeps what is in flight (decayed to now), so changing a limit cannot reset the window. LOWERING it

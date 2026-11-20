@@ -180,20 +180,21 @@ contract BridgeHoldTest is W4Bridge {
 
     // ---------------------------------------------------------------- H4
 
+    /// Since a review of the wave-5 fixes: a second hold is a no-op (never a revert, never a renewal).
     function test_H4_aHoldCannotBeRenewed() public {
         uint256 h = _send(alice, 100e18);
         uint64 n = _hold(h);
+        (, uint64 until) = rh.holds(HOME, _b32(address(home)), n);
         vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.AlreadyHeld.selector, HOME, n));
         rh.hold(HOME, n);
         vm.warp(vm.getBlockTimestamp() + T - 1);
         vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.AlreadyHeld.selector, HOME, n));
         rh.hold(HOME, n);
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.AlreadyHeld.selector, HOME, n));
         rh.hold(HOME, n);
+        (, uint64 until2) = rh.holds(HOME, _b32(address(home)), n);
+        assertEq(until2, until, "renewed");
         assertTrue(homeEp.deliver(h));
     }
 
@@ -202,25 +203,30 @@ contract BridgeHoldTest is W4Bridge {
         uint64 n = _hold(h);
         _release(h, homeEp.payloadHashOf(h)); // 48h: still inside the 72h hold
         vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.AlreadyHeld.selector, HOME, n));
-        rh.hold(HOME, n);
+        rh.hold(HOME, n); // a no-op (a review of the wave-5 fixes): the released record stands
+        (, uint64 u) = rh.holds(HOME, _b32(address(home)), n);
+        assertEq(u, 1, "a released hold was renewed");
         assertTrue(homeEp.deliver(h));
     }
 
     /// Only a payload the endpoint stores can be held: not an unverified, executed or NIL nonce, nor a path with no peer.
+    /// Since a review of the wave-5 fixes: such a hold is a no-op (nothing recorded, no event), not a revert.
     function test_holdOnlyAStoredPayload() public {
         vm.startPrank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.NotHoldable.selector, HOME, uint64(1), bytes32(0)));
         rh.hold(HOME, 1);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.NotHoldable.selector, uint32(7), uint64(1), bytes32(0)));
         rh.hold(7, 1);
         vm.stopPrank();
+        (, uint64 u) = rh.holds(HOME, _b32(address(home)), 1);
+        assertEq(u, 0);
+        (, u) = rh.holds(7, bytes32(0), 1);
+        assertEq(u, 0);
         uint256 h = _send(alice, 100e18);
         assertTrue(homeEp.deliver(h));
         (uint64 n,) = _origin(h);
         vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.NotHoldable.selector, HOME, n, bytes32(0)));
         rh.hold(HOME, n);
+        (, u) = rh.holds(HOME, _b32(address(home)), n);
+        assertEq(u, 0, "a hold recorded on an executed nonce");
     }
 
     function test_holdRecordsAndEmits() public {

@@ -174,7 +174,7 @@ contract StockLendingTest is StockSystem {
         uint256 bonus = debt * 0.1e18 / 80e12;
         uint256 toTreasuryUsdg = (debt + 1e12 - 1) / 1e12;
         assertEq(ledger.debtOf(_pid(STK, alice)), 0);
-        assertEq(units, 100e24 - bonus, "the taker buys every unit but the penalty");
+        assertEq(units, 100e24 - vault.DEAD_SHARES() - bonus, "the taker buys every unit but the penalty");
         assertEq(paid, (units * 80e12 / 1e18 + 1e12 - 1) / 1e12, "~92.5 tokens x $80, rounded up");
         assertApproxEqAbs(paid, 7_400e6, 1e6); // the debt includes the upfront fee: a few units' cents less
         assertApproxEqAbs(stock.balanceOf(taker), units / 1e6, 1, "redeemed to stock");

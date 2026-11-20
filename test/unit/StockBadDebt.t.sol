@@ -75,11 +75,12 @@ contract StockBadDebtTest is StockSystem {
         ledger.writeOff(_pid(STK, alice));
         stock.adminBurn(address(vault), 100e18); // the issuer seizes the whole custody
         assertTrue(price.isStale(), "a share worth nothing reads unpriced");
-        // permissionless: two worthless readings >= 1 h apart; the first only arms
+        // permissionless: worthless readings spanning 1 h, at most WRITEOFF_STEP apart (wave 5); the first arms
         ledger.writeOff(_pid(STK, alice));
         assertEq(ledger.worthlessSince(STK), vm.getBlockTimestamp());
         assertGt(ledger.debtOf(_pid(STK, alice)), 0, "armed, nothing written off yet");
-        vm.warp(vm.getBlockTimestamp() + ledger.WRITEOFF_DELAY());
+        _readOver(_pid(STK, alice), ledger.WRITEOFF_DELAY() - 10 minutes); // chained readings (wave 5)
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
         uint256 debt = ledger.debtOf(_pid(STK, alice));
         uint256 shares = ledger.position(_pid(STK, alice)).collateral;
         ledger.writeOff(_pid(STK, alice));
@@ -134,11 +135,11 @@ contract StockBadDebtTest is StockSystem {
         vm.stopPrank();
     }
 
-    /// @dev The first worthless reading arms, the second (>= WRITEOFF_DELAY later) writes off.
+    /// @dev The first worthless reading arms; readings chained at most WRITEOFF_STEP apart (wave 5) write off
+    /// WRITEOFF_DELAY later.
     function _writeOff(address who) internal {
         ledger.writeOff(_pid(STK, who));
-        vm.warp(vm.getBlockTimestamp() + ledger.WRITEOFF_DELAY());
-        ledger.writeOff(_pid(STK, who));
+        _readOver(_pid(STK, who), ledger.WRITEOFF_DELAY());
     }
 
     function _bad() internal view returns (uint128 bad) {

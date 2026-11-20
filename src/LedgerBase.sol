@@ -138,6 +138,9 @@ abstract contract LedgerBase is TransientReentrancyGuard {
     /// inside the 4663 Pulse grace; the debt keeps accruing on a worthless type meanwhile, which is all the delay costs.
     uint256 public constant WRITEOFF_DELAY = 1 hours;
     uint256 public constant WRITEOFF_WINDOW = 7 days;
+    /// @notice The longest gap between two worthless readings that `writeOff` still treats as one stretch (audit wave 5,
+    /// medium): a longer gap re-arms, because the custody may have been reissued and burned again unseen in it.
+    uint256 public constant WRITEOFF_STEP = 15 minutes;
     /// @notice The least of each accrual savers get while there are any: the effective share scales with uptake
     /// between this floor and `Parameters.savingsShare`.
     uint256 public constant SAVINGS_FLOOR = 0.05e18;
@@ -169,6 +172,10 @@ abstract contract LedgerBase is TransientReentrancyGuard {
     uint256 public totalBadDebt;
     /// @notice When `writeOff` first saw `ilk`'s custody worth nothing (0 = not seen, or seen worth something since).
     mapping(bytes32 ilk => uint256) public worthlessSince;
+    /// @notice The latest reading at which `writeOff` saw `ilk`'s custody worth nothing (wave 5; appended: storage layout).
+    /// A keeper's next reading must land within WRITEOFF_STEP of it, or it re-arms; the write-off lands at the first reading
+    /// at or after `worthlessSince + WRITEOFF_DELAY`.
+    mapping(bytes32 ilk => uint256) public worthlessLast;
 
     error Unauthorized();
     /// @notice Unbacked supply (`unbacked()`) is past `Parameters.unbackedBrake` of the circulating supply: no new debt on

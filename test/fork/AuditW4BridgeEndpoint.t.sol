@@ -385,6 +385,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         assertEq(_stored(1), p.hash, "hash kept after the revert");
         assertEq(EP.lazyInboundNonce(address(bridge), RH, peer), 0, "lazy nonce not moved by the revert");
         _govern(abi.encode(uint8(5), RH));
+        vm.warp(vm.getBlockTimestamp() + 1 days); // audit wave 5: a reopened path's instant allowance refills over a day
         vm.prank(makeAddr("anyone"));
         EP.lzReceive(Origin(RH, peer, 1), address(bridge), p.guid, p.message, "");
         assertEq(tok.balanceOf(alice), 100e18);

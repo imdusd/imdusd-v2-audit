@@ -109,6 +109,17 @@ abstract contract StockSystem is System {
         ledger.open(STK, 0, Adjust(int256(amount), int256(debt), 0.05e18, 0, 0, true, type(uint256).max, address(0)));
     }
 
+    /// @dev Wave 5: what a keeper does on a worthless type: a `writeOff` reading every 10 min (inside WRITEOFF_STEP) until
+    /// `span` has passed, the last reading at the end (it seizes once the record is WRITEOFF_DELAY old).
+    function _readOver(uint256 id, uint256 span) internal {
+        uint256 end = vm.getBlockTimestamp() + span;
+        while (vm.getBlockTimestamp() < end) {
+            uint256 s = end - vm.getBlockTimestamp();
+            vm.warp(vm.getBlockTimestamp() + (s > 10 minutes ? 10 minutes : s));
+            ledger.writeOff(id);
+        }
+    }
+
     /// @dev The feed publishes `usd8` now (a Chainlink round).
     function _price(int256 usd8) internal {
         agg.set(usd8);

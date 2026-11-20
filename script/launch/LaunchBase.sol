@@ -439,6 +439,9 @@ abstract contract LaunchBase is DeployBase {
         if (n == 0) return;
         _code(address(d.calendar), "stage 3 MarketCalendar");
         require(d.calendar.governor() == cfg.governor, "stage 3: calendar governor");
+        require(
+            d.calendar.seed() == keccak256(abi.encode(s.closedDays, s.earlyDays)), "stage 3: calendar seed"
+        ); // audit wave 5 (low)
         uint256 first = cfg.ilks.length + (cfg.seats.enabled ? 1 : 0);
         for (uint256 i; i < n; ++i) {
             DeployTypes.StockSpec memory t = s.types[i];

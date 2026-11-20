@@ -17,7 +17,7 @@ import {FeedTraits} from "./feeds/FeedTraits.sol";
 ///    price is read in this call, so a rally between attested updates is not paid to the redeemer. Pushing
 ///    the pool only raises the payout price, which only shrinks what a redeemer receives. An unreadable live
 ///    leg on such a type sets `payout = 0`: redemption against it waits (fail closed).
-///  - When the legs diverge past `skew`, `low` and `high` collapse to the median (a twin type: to the higher leg, below).
+///  - When the legs diverge past `skew`, `low` and `high` collapse to the median (a twin type: the twin rule, below).
 ///    Borrowing stops (`borrowable = false`); liquidation continues on the median. The redemption `payout` on a
 ///    type WITHOUT a live leg keeps `max(median, spot)` while the spot is fresh: both legs are
 ///    oracles there (cbBTC/USD vs BTC/USD), and a stalled median in a rally must not hand the redeemer collateral
@@ -32,12 +32,17 @@ import {FeedTraits} from "./feeds/FeedTraits.sol";
 ///    it. An NHI leaf that is not converged also stops borrowing (its mat is one nobody attested), not liquidation.
 ///  - TWIN RULE (price design C): a type whose spot leg is derived from a pool price PROVEN from Ethereum state
 ///    (`FeedTraits.proven`: ProvenPoolPrice x ETH/USD x rate for sIMD) has a trustless twin of its swarm median. While the
-///    legs disagree and that spot is fresh, `low = high = max(spot, min(median, attestedMedian))` instead of the median
-///    alone: a wrong or compromised median (attester key, wrong majority) cannot liquidate below the proven price, and a
-///    pushed proven price cannot lower `low` below what the median attested. `attestedMedian` (FeedTraits.attested, through
-///    the composites) is the median leaf's last target: a median CLAMPED above it holds a level nobody attested, so after a
-///    genuine fall the proven spot shows and the median attests, `low` follows at once instead of one allowance per epoch
-///    (audit wave 4; it was `max(median, spot)`). Borrowing still needs agreement. Other types keep the median rule.
+///    legs disagree and that spot is fresh, `low = high = max(spot, min(median, max(attestedMedian, median x (1 - TWIN_STEP))))`
+///    when the median is the higher leg, else the spot, instead of the median alone: a wrong or compromised median (attester
+///    key, wrong majority) cannot liquidate below the proven price, and a pushed proven price cannot lower `low` below what
+///    the median attested. `attestedMedian` (FeedTraits.attested, through the composites) is the median leaf's last target: a
+///    median CLAMPED above it holds a level nobody attested, so after a genuine fall the proven spot shows and the median
+///    attests, `low` follows ahead of the clamp (audit wave 4; it was `max(median, spot)`), but at most ONE allowance
+///    (TWIN_STEP) below the stored median (audit wave 5, high: honest attestations of PUSHED pool reads plus one pushed proof,
+///    no key, set `low` to the pushed price at once). So `low` stays within one allowance of a median that moves one allowance
+///    per epoch, and leads it by one epoch after a genuine fall. Borrowing still needs agreement. Other types keep the median
+///    rule. A proven spot ABOVE the median sets `low = high` with no bound (it only shelters, until a newer block is proved);
+///    a value reader must not take that as a price (PricerOracle refuses it, audit wave 5).
 ///  - `borrow = min(low, cap)`: the price new debt, withdrawals and a charged rate change are measured
 ///    at. `Parameters.cap` is a governed ceiling (0 = none). Only `borrow` is capped: liquidation health and liquidation
 ///    prices use the uncapped `low`, and redemption the uncapped `payout`, so a ceiling below market can only refuse new
@@ -60,6 +65,12 @@ contract Pricer {
     }
 
     Parameters public immutable params;
+
+    /// @notice How far below the STORED median the twin rule's `low` may follow an attested median that the leaf clamped
+    /// (audit wave 5, high): one allowance, the median leaf's per-epoch cap (2,000 bps on every shipped price leaf,
+    /// DeployConfig). It bounds what honestly attested reads of a pushed pool plus one pushed proof can do to `low` (no key
+    /// needed) to the allowance the README states, while a genuine fall is still followed one allowance AHEAD of the median.
+    uint256 public constant TWIN_STEP = 0.2e18;
 
     constructor(Parameters params_) {
         params = params_;
@@ -94,9 +105,16 @@ contract Pricer {
             (q.low, q.high) = (Math.min(m, s), Math.max(m, s));
         } else if (spotOk && !same && FeedTraits.proven(c.spot)) {
             // The twin rule: neither leg alone can set the liquidation price below the other. A median above the spot counts
-            // at most at its ATTESTED value (audit wave 4): one clamped above its target holds a level nobody attested, so a
-            // fall the proven spot shows and the median attests is followed at once, not one allowance per epoch.
-            q.low = q.high = m > s ? Math.max(s, Math.min(m, FeedTraits.attested(c.median))) : s;
+            // at its ATTESTED value (audit wave 4: a median clamped above its target holds a level nobody attested), but never
+            // more than TWIN_STEP below the stored median (audit wave 5, high: honest reads of a PUSHED pool attest the pushed
+            // price, and one pushed proof matched it, with no key). So a fall both legs show is followed one allowance ahead
+            // of the median, and a pusher moves `low` at most one allowance under a median that itself moves one per epoch.
+            if (m > s) {
+                uint256 a = Math.max(FeedTraits.attested(c.median), m - Math.mulDiv(m, TWIN_STEP, 1e18));
+                q.low = q.high = Math.max(s, Math.min(m, a));
+            } else {
+                q.low = q.high = s;
+            }
         } else {
             q.low = q.high = m;
         }

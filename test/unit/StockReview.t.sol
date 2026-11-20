@@ -22,16 +22,16 @@ contract StockReviewTest is StockSystem {
         _open(alice, 100e18, 6_000e18);
         stock.adminBurn(address(vault), 100e18); // a migration: burn ...
         ledger.writeOff(_pid(STK, alice)); // a watcher calls at once: only arms
-        assertEq(ledger.position(_pid(STK, alice)).collateral, 100e24, "nothing written off");
+        assertEq(ledger.position(_pid(STK, alice)).collateral, 100e24 - vault.DEAD_SHARES(), "nothing written off");
         assertEq(_bad(), 0);
-        vm.warp(vm.getBlockTimestamp() + 30 minutes);
-        vm.expectRevert(abi.encodeWithSelector(LedgerBase.WriteOffTooSoon.selector, vm.getBlockTimestamp() + 30 minutes));
-        ledger.writeOff(_pid(STK, alice));
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        ledger.writeOff(_pid(STK, alice)); // inside the delay (wave 5: recorded, nothing seized)
+        assertEq(_bad(), 0, "too soon: nothing written off");
         stock.mint(address(vault), 100e18); // ... then reissue to the same holder
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         ledger.writeOff(_pid(STK, alice)); // sees value again: clears the record instead of writing off
         assertEq(ledger.worthlessSince(STK), 0);
-        assertEq(ledger.position(_pid(STK, alice)).collateral, 100e24);
+        assertEq(ledger.position(_pid(STK, alice)).collateral, 100e24 - vault.DEAD_SHARES()); // the first depositor pays the dead shares (wave 5)
         assertEq(_bad(), 0);
         vm.expectRevert(LedgerBase.NotWorthless.selector);
         ledger.writeOff(_pid(STK, alice));
@@ -54,8 +54,7 @@ contract StockReviewTest is StockSystem {
         ledger.writeOff(_pid(STK, alice)); // older than the window: re-armed now
         assertEq(ledger.worthlessSince(STK), vm.getBlockTimestamp());
         assertGt(ledger.debtOf(_pid(STK, alice)), 0);
-        vm.warp(vm.getBlockTimestamp() + ledger.WRITEOFF_DELAY());
-        ledger.writeOff(_pid(STK, alice));
+        _readOver(_pid(STK, alice), ledger.WRITEOFF_DELAY()); // readings chained inside WRITEOFF_STEP (wave 5)
         assertEq(ledger.debtOf(_pid(STK, alice)), 0);
     }
 
@@ -63,10 +62,9 @@ contract StockReviewTest is StockSystem {
         _open(alice, 100e18, 6_000e18);
         stock.adminBurn(address(vault), 100e18);
         ledger.writeOff(_pid(STK, alice));
-        vm.warp(vm.getBlockTimestamp() + ledger.WRITEOFF_DELAY());
-        ledger.writeOff(_pid(STK, alice));
+        _readOver(_pid(STK, alice), ledger.WRITEOFF_DELAY());
         assertEq(vault.balanceOf(address(sjoin)), 0, "nothing stranded in the join");
-        assertEq(vault.balanceOf(address(treasury)), 100e24);
+        assertEq(vault.balanceOf(address(treasury)), 100e24 - vault.DEAD_SHARES());
         // the hollow vault refuses a dust deposit that would have captured the reissue
         assertEq(vault.maxDeposit(mallory), 0);
         stock.mint(mallory, 1);
@@ -77,14 +75,14 @@ contract StockReviewTest is StockSystem {
         vm.stopPrank();
         // the issuer reissues: the Treasury's shares hold it all (governable by the Safe), deposits reopen
         stock.mint(address(vault), 100e18);
-        assertApproxEqAbs(vault.convertToAssets(vault.balanceOf(address(treasury))), 100e18, 1);
+        assertApproxEqAbs(vault.convertToAssets(vault.balanceOf(address(treasury))), 100e18, 1e6 + 1); // less the dead shares' part (wave 5)
         assertGt(vault.maxDeposit(mallory), 0);
     }
 
     function test_reviewF5_vaultSharesCarrySixMoreDecimalsAndValuesAreUnchanged() public {
         assertEq(vault.decimals(), stock.decimals() + 6);
         _open(alice, 100e18, 5_000e18);
-        assertEq(ledger.position(_pid(STK, alice)).collateral, 100e24);
+        assertEq(ledger.position(_pid(STK, alice)).collateral, 100e24 - vault.DEAD_SHARES()); // the first depositor pays the dead shares (wave 5)
         (uint256 v,) = price.latestValue();
         assertApproxEqRel(v, 100e12, 1e9, "per 1e18 shares = 1e-6 of a $100 token");
         (bool ok,) = ledger.healthy(_pid(STK, alice));

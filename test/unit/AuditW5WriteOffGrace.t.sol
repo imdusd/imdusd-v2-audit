@@ -38,47 +38,66 @@ contract AuditW5WriteOffGraceTest is StockSystem {
         assertEq(ledger.worthlessSince(STK), vm.getBlockTimestamp());
     }
 
-    /// @dev The chain stays alive (a poke every 10 min) for `len`.
+    /// @dev The chain stays alive (a poke every 10 min) for `len`, a keeper reading the worthless type each time (wave 5:
+    /// a seizure needs readings chained inside WRITEOFF_STEP); a reading that reverts (SequencerGrace) records nothing.
     function _alive(uint256 len) internal {
         while (len != 0) {
             uint256 s = len < 10 minutes ? len : 10 minutes;
             vm.warp(vm.getBlockTimestamp() + s);
             pulse.poke();
+            _read();
             len -= s;
         }
+    }
+
+    /// @dev One reading; whatever it does, it never seizes while the Pulse reads `inGrace`.
+    function _read() internal {
+        bool held = pulse.inGrace();
+        bool had = ledger.debtOf(id) != 0;
+        (bool ok,) = address(ledger).call(abi.encodeWithSignature("writeOff(uint256)", id));
+        ok;
+        if (held && had) assertGt(ledger.debtOf(id), 0, "a write-off seized in the grace");
     }
 
     /// Outside any grace the write-off runs as before.
     function test_liveChainWritesOff() public {
         _alive(ledger.WRITEOFF_DELAY());
-        ledger.writeOff(id);
         assertEq(ledger.debtOf(id), 0);
     }
 
-    /// An outage (silence > gap) before the second reading: held while the chain is down and through the grace after the
-    /// first poke; it runs once the grace is over.
+    /// An outage (silence > gap) before the second reading: the silence is longer than WRITEOFF_STEP, so the first reading
+    /// after it re-arms (wave 5; nothing seized, nothing held); the readings through the grace after the first poke seize
+    /// nothing; it runs once both the grace and the delay from the re-arm are over.
     function test_writeOffWaitsOutTheGrace() public {
         vm.warp(vm.getBlockTimestamp() + ledger.WRITEOFF_DELAY()); // silent for an hour: the chain is down
-        vm.expectRevert(ISequencerGrace.SequencerGrace.selector);
-        ledger.writeOff(id);
+        ledger.writeOff(id); // re-arms: the custody went unread longer than WRITEOFF_STEP
+        assertEq(ledger.worthlessSince(STK), vm.getBlockTimestamp());
+        assertGt(ledger.debtOf(id), 0, "nothing seized at the re-arm");
         pulse.poke(); // the chain is back: the grace runs GRACE from now
         _alive(GRACE - 10 minutes);
-        vm.expectRevert(ISequencerGrace.SequencerGrace.selector);
-        ledger.writeOff(id);
+        assertTrue(pulse.inGrace());
         assertGt(ledger.debtOf(id), 0, "nothing seized in the grace");
         _alive(10 minutes);
-        ledger.writeOff(id);
         assertEq(ledger.debtOf(id), 0);
+    }
+
+    /// A record older than the delay meeting the grace: the seizing step reverts SequencerGrace and records nothing.
+    function test_seizingStepInTheGraceReverts() public {
+        _alive(ledger.WRITEOFF_DELAY() - 10 minutes); // chained readings: the record is 50 min old
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        vm.mockCall(address(pulse), abi.encodeWithSignature("inGrace()"), abi.encode(true));
+        vm.expectRevert(ISequencerGrace.SequencerGrace.selector);
+        ledger.writeOff(id);
+        vm.clearMockedCalls();
+        assertGt(ledger.debtOf(id), 0);
     }
 
     /// Fuzzed: whatever the outage, no write-off lands while `inGrace()` reads true.
     function testFuzz_noWriteOffInTheGrace(uint256 lead, uint256 len, uint256 after_) public {
-        _alive(bound(lead, ledger.WRITEOFF_DELAY(), 2 hours));
+        _alive(bound(lead, 0, 2 hours)); // every reading on the way is checked too (_read)
         vm.warp(vm.getBlockTimestamp() + bound(len, 1, 4 hours));
+        _read();
         _alive(bound(after_, 0, 2 hours));
-        bool held = pulse.inGrace();
-        (bool ok,) = address(ledger).call(abi.encodeWithSignature("writeOff(uint256)", id));
-        ok; // a re-arm (record older than WRITEOFF_WINDOW) returns without seizing
-        if (held) assertGt(ledger.debtOf(id), 0, "a write-off seized in the grace");
+        _read();
     }
 }

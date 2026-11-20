@@ -30,9 +30,27 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// donation cannot inflate the price) is done by `managedAssets`; the 10^6 share scale stays (first deposit: 10^6 shares per
 /// unit). An EMPTY vault's leftover (a reissue every holder forfeited) restarts as uncounted, like a donation: the first
 /// deposit into it sets `managedAssets` to that deposit, so the next depositor never takes it.
+/// DEAD SHARES (audit wave 5, medium). With no virtual offset, one rounding step on a vault with no shares moved its share rate
+/// by any factor: mint(1) into the empty vault cost 1 wei for 1 share (10^6 x the opening rate), as did deposit(1) then
+/// redeem(999,999) (paying 0); the type's capped RateFeed, built over the empty vault, then valued every later deposit at a
+/// millionth. Now the first deposit into a never-used vault also mints `DEAD_SHARES` (10^12, i.e. 10^6 wei of stock at the
+/// opening rate) to `DEAD`, paid by that depositor (it receives 10^12 fewer shares, or pays 10^6 wei more for a mint). The
+/// supply never falls below `DEAD_SHARES` again, so no single deposit, mint, withdraw or redeem moves the rate by more than
+/// about 1 wei over the >= 10^6 wei the dead shares stand for. A vault whose only shares are the dead ones is EMPTY in every
+/// rule above (never impaired; the next deposit restarts `managedAssets` at the opening rate and mints no more dead shares).
+/// Cost: the dead shares are a holder like any other, so they keep DEAD_SHARES / supply of a reissue forfeited to the
+/// stayers (10^-14 at 100 tokens; a real share of it only when the stayers are themselves dust) and ~10^6 wei of a restart.
 contract StockVault is ERC4626 {
+    /// @notice Shares minted to `DEAD` by the first deposit into a never-used vault; nobody can move them.
+    uint256 public constant DEAD_SHARES = 1e12;
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    /// @notice `worthless()` below 1 / WORTHLESS_DIVISOR of the claimed stock.
+    uint256 public constant WORTHLESS_DIVISOR = 1e6;
+
     /// @notice The stock the vault's shares claim: deposits in, withdrawals out. Never raised by a transfer in.
     uint256 public managedAssets;
+
+    error NoShares();
 
     constructor(IERC20Metadata stock_)
         ERC20(string.concat("imdUSD custody ", stock_.symbol()), string.concat("c", stock_.symbol()))
@@ -72,7 +90,16 @@ contract StockVault is ERC4626 {
     /// @notice True while burned custody is not yet reissued to the shares it hit: deposits and mints are closed. An empty
     /// vault is never impaired (the hole is nobody's: the first deposit restarts `managedAssets`), so it never stays closed.
     function impaired() public view returns (bool) {
-        return totalSupply() != 0 && IERC20(asset()).balanceOf(address(this)) < managedAssets;
+        return totalSupply() > DEAD_SHARES && IERC20(asset()).balanceOf(address(this)) < managedAssets;
+    }
+
+    /// @notice What `Ledger.writeOff` reads (audit wave 5, low): the vault holds under 1 / WORTHLESS_DIVISOR of the stock its
+    /// shares claim. A material threshold rather than a zero share rate: while the vault is impaired a donation counts in
+    /// full, so dust (totalSupply / 1e18 wei) lifted the rate off zero, blocking or clearing a write-off and leaving the type
+    /// to a near-zero liquidation whose shares (and any reissue) went to the taker. A write-off at this threshold seizes at
+    /// most 10^-6 of what the positions' custody was worth.
+    function worthless() external view returns (bool) {
+        return impaired() && IERC20(asset()).balanceOf(address(this)) * WORTHLESS_DIVISOR < managedAssets;
     }
 
     function maxDeposit(address) public view override returns (uint256) {
@@ -83,10 +110,31 @@ contract StockVault is ERC4626 {
         return impaired() ? 0 : type(uint256).max;
     }
 
+    /// @notice Into a never-used vault: the opening rate less the `DEAD_SHARES` the deposit also pays for; into an empty one
+    /// (dead shares only): the opening rate.
+    function previewDeposit(uint256 assets) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply > DEAD_SHARES) return super.previewDeposit(assets);
+        uint256 shares = assets * 10 ** _decimalsOffset();
+        if (supply != 0) return shares;
+        return shares > DEAD_SHARES ? shares - DEAD_SHARES : 0;
+    }
+
+    /// @notice Into a never-used vault: the opening rate for `shares` plus the `DEAD_SHARES`, rounded up; into an empty one:
+    /// the opening rate.
+    function previewMint(uint256 shares) public view override returns (uint256) {
+        uint256 supply = totalSupply();
+        if (supply > DEAD_SHARES) return super.previewMint(shares);
+        return Math.ceilDiv(supply == 0 ? shares + DEAD_SHARES : shares, 10 ** _decimalsOffset());
+    }
+
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
+        uint256 supply = totalSupply();
+        if (shares == 0) revert NoShares(); // a deposit that mints nothing is a counted donation
         // into an empty vault: whatever `managedAssets` still counts (a reissue every holder forfeited) is nobody's
-        uint256 managed = totalSupply() == 0 ? 0 : managedAssets;
+        uint256 managed = supply <= DEAD_SHARES ? 0 : managedAssets;
         super._deposit(caller, receiver, assets, shares);
+        if (supply == 0) _mint(DEAD, DEAD_SHARES);
         managedAssets = managed + assets;
     }
 

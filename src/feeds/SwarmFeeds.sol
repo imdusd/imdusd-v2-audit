@@ -56,6 +56,18 @@ abstract contract SwarmPricePolicy is SwarmFeed {
     function questionPolicy() internal pure override returns (bytes memory, uint64, uint64) {
         return (SwarmQuestions.PRICE, SwarmQuestions.PRICE_MIN_SPAN, SwarmQuestions.PRICE_MAX_SPAN);
     }
+
+    /// @dev NO STALE WIDENING (a review of the wave-5 fixes). This leaf is sIMD's median, the leg the Pricer's twin rule
+    /// lets `low` lead by one allowance (Pricer.TWIN_STEP, measured from the STORED median). With the 2x band, the first
+    /// delivery after a >= 2 h silence (the legs' resting state) moved the stored median 2c, and `low` then sat (1-2c)(1-c) =
+    /// 0.48x under the median held before it: honest reads of a pushed pool plus one pushed proof set `low` to the pushed price
+    /// at once again. Now every epoch, silent or not, moves the median at most one cap from the value held, so `low` stays
+    /// >= held x (1 - c)^2 (test/unit/AuditW5PriceTwinPush.t.sol, T2'). Cost: a genuine gap after a silence is followed at one
+    /// cap per epoch (low still leads by one allowance: 0.64x of the held level at the first delivery instead of 0.48x). Also
+    /// Robinhood Chain's IMD/ETH leg (same leaf; no twin there): its after-silence step is one cap too, the tighter bound.
+    function _staleMultiple() internal pure override returns (uint256) {
+        return 1;
+    }
 }
 
 abstract contract SwarmSpotPolicy is SwarmFeed {

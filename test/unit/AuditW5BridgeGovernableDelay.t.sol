@@ -72,19 +72,20 @@ contract AuditW5BridgeGovernableDelayTest is W4Bridge {
         vm.expectRevert(Governed.NotGovernor.selector);
         rh.tighten(HOME, 1_000e18, 1 days, 10_000e18, 0);
         vm.startPrank(safe);
-        vm.expectRevert(ImdBridge.NotTighter.selector);
-        rh.tighten(HOME, 5_001e18, 12 hours, 50_000e18, 0); // higher cap
-        vm.expectRevert(ImdBridge.NotTighter.selector);
-        rh.tighten(HOME, 5_000e18, 12 hours, 50_001e18, 0); // higher breaker
-        vm.expectRevert(ImdBridge.NotTighter.selector);
-        rh.tighten(HOME, 5_000e18, 12 hours - 1, 50_000e18, 0); // shorter delay
-        vm.expectRevert(ImdBridge.NotTighter.selector);
-        rh.tighten(HOME, 5_000e18, 7 days + 1, 50_000e18, 0); // past MAX_DELAY
-        rh.tighten(HOME, 1_000e18, 1 days, 10_000e18, 0);
-        vm.stopPrank();
+        // audit wave 5: a loosening argument is clamped to what stands (never a revert, never a loosening)
+        rh.tighten(HOME, 5_001e18, 12 hours - 1, 50_001e18, 0); // higher cap and breaker, shorter delay: no change
         (uint256 cap, uint256 delay, uint256 breaker) = _settings();
+        assertEq(cap, 5_000e18);
+        assertEq(delay, 12 hours);
+        assertEq(breaker, 50_000e18);
+        rh.tighten(HOME, 5_000e18, 7 days + 1, 50_000e18, 0); // past MAX_DELAY: MAX_DELAY
+        (, delay,) = _settings();
+        assertEq(delay, 7 days);
+        rh.tighten(HOME, 1_000e18, 1 days, 10_000e18, 0); // a shorter delay than 7 days: stays 7 days
+        vm.stopPrank();
+        (cap, delay, breaker) = _settings();
         assertEq(cap, 1_000e18);
-        assertEq(delay, 1 days);
+        assertEq(delay, 7 days);
         assertEq(breaker, 10_000e18);
         // a loosening needs 48h
         bytes memory loosen = _setDelay(5_000e18, 12 hours, 50_000e18);
@@ -158,6 +159,7 @@ contract AuditW5BridgeGovernableDelayTest is W4Bridge {
         uint256 big = 200_000_000e18;
         _govern(rh, _path(HOME, _b32(address(home)), big, big));
         _govern(rh, _setDelay(2_000_000e18, 12 hours, 50_000_000e18));
+        vm.warp(vm.getBlockTimestamp() + 1 days); // audit wave 5: a raise's headroom opens at the new rate over a day
         uint256 i = _forge(1_500_000e18);
         assertTrue(homeEp.deliver(i));
         assertEq(rhTok.balanceOf(attacker), 1_500_000e18, "minted at once under a 2,000,000 cap");

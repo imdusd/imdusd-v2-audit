@@ -75,7 +75,7 @@ contract AuditW4StockVaultTest is Test {
         uint16 bobOutBps,
         bool useMint
     ) public {
-        a = uint96(bound(a, 1e6, 1e27));
+        a = uint96(bound(a, 2e6, 1e27)); // wave 5: the opening deposit also pays the 10^6-wei dead shares
         b = uint96(bound(b, 0, 1e27));
         burnBps = uint16(bound(burnBps, 1, 10_000));
         reissueBps = uint16(bound(reissueBps, 0, 10_000));
@@ -125,7 +125,9 @@ contract AuditW4StockVaultTest is Test {
         assertLe(eveGets, paidIn + 1, "P2: the depositor took value it did not bring");
         // The holders the burn hit keep at least their share of what the custody now holds for them: what they had, minus
         // the part still burned (pro rata), minus what Bob already took out.
-        uint256 holders = v.previewRedeem(v.balanceOf(alice)) + v.previewRedeem(v.balanceOf(bob));
+        // (wave 5) the dead shares are a holder the burn hit too: they keep DEAD_SHARES / supply of what the others forfeit
+        uint256 holders =
+            v.previewRedeem(v.balanceOf(alice)) + v.previewRedeem(v.balanceOf(bob)) + v.previewRedeem(v.balanceOf(v.DEAD()));
         uint256 owed = held - (burned - reissue);
         // Bob's exit at the impaired rate forfeits his claim on the reissue to the holders who stayed, so what he took plus
         // what the holders hold covers it.
@@ -149,7 +151,7 @@ contract AuditW4StockVaultTest is Test {
     function testFuzz_P2_orphanedReissueNotTakenByTheNextDepositor(uint96 a, uint16 burnBps, uint16 reissueBps, uint96 x)
         public
     {
-        a = uint96(bound(a, 1e6, 1e27));
+        a = uint96(bound(a, 2e6, 1e27)); // wave 5: the opening deposit also pays the 10^6-wei dead shares
         burnBps = uint16(bound(burnBps, 1, 10_000));
         reissueBps = uint16(bound(reissueBps, 1, 10_000));
         x = uint96(bound(x, 1, 1e27));
@@ -160,7 +162,7 @@ contract AuditW4StockVaultTest is Test {
         uint256 sh = v.balanceOf(alice);
         vm.prank(alice);
         v.redeem(sh, alice, alice);
-        assertEq(v.totalSupply(), 0);
+        assertEq(v.totalSupply(), v.DEAD_SHARES(), "only the dead shares are left (wave 5): the vault is empty");
         t.mint(address(v), burned * reissueBps / 10_000 == 0 ? 1 : burned * reissueBps / 10_000);
         t.mint(eve, x);
         assertFalse(v.impaired(), "an empty vault is never closed");

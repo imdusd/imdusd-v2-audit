@@ -146,12 +146,12 @@ abstract contract StageChain is DeployBase {
         }
     }
 
+    /// @dev Audit wave 5 (low): the recorded calendar must have been SEEDED from exactly the config's lists (`seed`), not only
+    /// list the config's days: one seeded from another list (an earlier revision, a rehearsal) could close a day the config
+    /// leaves open and was adopted. Days the governor has set since (SET_DAYS, closeDay) are its acts and are kept.
     function _calendarIs(MarketCalendar c, DeployTypes.Config memory cfg) internal view returns (bool) {
         DeployTypes.StocksSpec memory s = cfg.stocks;
-        if (c.governor() != cfg.governor) return false;
-        for (uint256 i; i < s.closedDays.length; ++i) if (c.dayStatus(s.closedDays[i]) != c.CLOSED()) return false;
-        for (uint256 i; i < s.earlyDays.length; ++i) if (c.dayStatus(s.earlyDays[i]) != c.EARLY_CLOSE()) return false;
-        return true;
+        return c.governor() == cfg.governor && c.seed() == keccak256(abi.encode(s.closedDays, s.earlyDays));
     }
 
     function _hoursFeedIs(MarketHoursFeed f, DeployTypes.StockSpec memory t, address vault, MarketCalendar cal)

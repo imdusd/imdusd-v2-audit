@@ -4,10 +4,12 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {SwarmFeed} from "../../src/feeds/SwarmFeed.sol";
-import {SwarmPricePolicy} from "../../src/feeds/SwarmFeeds.sol";
+import {SwarmSpotPolicy} from "../../src/feeds/SwarmFeeds.sol";
 
-/// @dev The production PRICE question binding, a test signer, the beta's 1 h lifetime and the cap under test.
-contract PropLeaf is SwarmPricePolicy {
+/// @dev The BASE rule (the 2x stale band) under test: the production SPOT question binding (the spot and seat leaves keep the
+/// base rule; the PRICE and NHI leaves override it to never widen, audit wave 4 / a review of the wave-5 fixes), a test signer, the beta's 1 h
+/// lifetime and the cap under test.
+contract PropLeaf is SwarmSpotPolicy {
     constructor(address att, uint256 cap) SwarmFeed(att, address(0), 1, 3, 1 hours, cap) {}
 }
 
@@ -84,6 +86,10 @@ contract LegHandler is Relayer {
     uint256 public openAt;
     uint256 public lastSignedAt;
     uint256 public lastRelayAt;
+    // the lowest and highest value stored in the live epoch, anchor included (audit wave 5: a delivery also stays within one
+    // cap of every value held in the epoch)
+    uint256 public rangeLo;
+    uint256 public rangeHi;
 
     uint256 public accepted;
     uint256 public refused; // P3/P2: a valid attestation must never be refused
@@ -204,14 +210,26 @@ contract LegHandler is Relayer {
         if (f.attested() != target || f.converged() != (v == target)) ++traitViolations;
         if (!hadValue) {
             if (v != target) ++traitViolations;
+            (rangeLo, rangeHi) = (v, v);
             return;
         }
         uint256 d = anchor * bps / 10_000;
         uint256 lo = d >= anchor ? 0 : anchor - d;
         uint256 hi = anchor + d;
         if (v > hi || v < lo) ++p1Violations;
+        if (opens) (rangeLo, rangeHi) = (anchor, anchor);
+        if (!wideOpen) {
+            // the epoch's range: within one cap of its lowest and highest stored value
+            uint256 rlo = rangeHi - rangeHi * cap / 10_000;
+            uint256 rhi = rangeLo + rangeLo * cap / 10_000;
+            if (rlo > lo) lo = rlo;
+            if (rhi < hi) hi = rhi;
+        }
         uint256 closest = target > hi ? hi : (target < lo ? lo : target);
         if (v != closest) ++notClosest;
+        if (wideOpen) (rangeLo, rangeHi) = (v, v);
+        if (v < rangeLo) rangeLo = v;
+        if (v > rangeHi) rangeHi = v;
         if (_dist(v, target) > _dist(before, target)) ++awayMoves;
         (uint256 a1, uint64 o1, uint256 b1) = f.epoch();
         // The wide band is one step: an epoch opened wide re-anchors at what its first delivery stored, at the cap.
@@ -368,7 +386,9 @@ contract SwarmFeedPropertyFuzz is Relayer {
     }
 
     /// The residual, pinned: an attacker relaying LAST in every epoch (after the honest relay of that epoch) moves the stored
-    /// value exactly one allowance per epoch while the attack lasts; k epochs of attack take at most k epochs to undo.
+    /// value at most one allowance per epoch while the attack lasts; k epochs of attack take at most k epochs to undo. Since
+    /// audit wave 5 (the epoch range) it is tighter: the honest relay that lands first in the epoch holds the attacker to one
+    /// cap above the HONEST level (h x 1.2 every epoch, it no longer compounds); the old exact 1.2^k is the upper bound.
     function testFuzz_residual_lastRelayerMovesOneAllowancePerEpoch(uint8 kSeed) public {
         f = new PropLeaf(vm.addr(KEY), 2000);
         uint256 h = 4e15;
@@ -381,7 +401,8 @@ contract SwarmFeedPropertyFuzz is Relayer {
             _advance(50 minutes);
             _relay(h * 100); // pushed far up
             expected = expected * 12_000 / 10_000;
-            assertApproxEqAbs(_value(), expected, k, "one allowance per epoch, no more");
+            assertLe(_value(), expected + k, "one allowance per epoch, no more");
+            assertApproxEqAbs(_value(), h * 12_000 / 10_000, 1, "one cap above the honest level relayed this epoch");
         }
         uint256 epochs;
         while (_value() != h) {

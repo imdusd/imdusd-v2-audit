@@ -78,8 +78,7 @@ contract BridgeBreakerTest is W4Bridge {
         // 10,000 -> 50,000 so whales' large transfers flow; the no-action 72 h bound is then
         // 4C + 50,000 = 70,000 > the 4663 line (30,000), accepted: the line holds when the Safe acts within DELAY
         assertEq(B, 50_000e18, "50,000 (whales; Safe within DELAY holds the line)");
-        assertEq(rh.BREAKER_DAYS(), 4);
-        assertLe(rh.HOLD_TIME(), (rh.BREAKER_DAYS() - 1) * 1 days, "a HOLD_TIME span of queue times fits the window");
+        assertLe(rh.HOLD_TIME(), (uint256(4) - 1) * 1 days, "a HOLD_TIME span of queue times fits the window");
     }
 
     /// Exactly QUEUE_BREAKER queued does not trip (normal use below it is unchanged); one unit more does, by the bridge.
@@ -141,13 +140,19 @@ contract BridgeBreakerTest is W4Bridge {
         vm.prank(safe);
         rh.cancelClaim(HOME, fk);
         _cancel(f2);
-        vm.prank(safe);
+        // audit wave 5: a reset only on a paused path; reopened in the same BATCH
+        vm.startPrank(safe);
+        vm.expectRevert(abi.encodeWithSelector(ImdBridge.PathOpen.selector, HOME));
         rh.propose(_reset(1));
+        rh.pause(HOME);
+        rh.propose(_b(_reset(1), abi.encode(uint8(5), HOME)));
+        vm.stopPrank();
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         vm.expectEmit(address(rh));
         emit BreakerReset(HOME, 1);
         rh.applyPending();
         assertFalse(_tripped());
+        assertFalse(rh.paused(HOME));
         assertEq(rh.breakerBuckets(HOME), 1 << 255, "the window restarts at zero (the sentinel bit kept)");
         vm.warp(vm.getBlockTimestamp() + 365 days);
         _claim(h);
@@ -162,6 +167,8 @@ contract BridgeBreakerTest is W4Bridge {
         vm.prank(attacker);
         vm.expectRevert(Governed.NotGovernor.selector);
         rh.tripBreaker(HOME);
+        vm.prank(safe);
+        rh.pause(HOME); // audit wave 5: a reset is proposed (and applied) only on a paused path
         vm.prank(safe);
         vm.expectRevert(ImdBridge.BadPayload.selector); // not tripped: nothing to reset
         rh.propose(_reset(0));
@@ -189,7 +196,11 @@ contract BridgeBreakerTest is W4Bridge {
         vm.expectRevert(ImdBridge.BadPayload.selector);
         rh.propose(_reset(1));
         // trip 2 by the queue; a stale reset(1) is refused; only reset(2) passes
+        _govern(rh, abi.encode(uint8(5), HOME)); // reopened to queue
+        vm.warp(vm.getBlockTimestamp() + 1 days); // the reopened path's limits and allowance refill
         _queuePast(0);
+        vm.prank(safe);
+        rh.pause(HOME);
         assertEq(_trips(), 2);
         vm.prank(safe);
         vm.expectRevert(ImdBridge.BadPayload.selector);

@@ -29,18 +29,24 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///     then (never at a remembered or attested one); it lasts maxAge;
 ///   - its allowance is maxDeviationBps, or STALE_DEVIATION_MULTIPLE (2) x that when the stored value has been silent for
 ///     maxAge plus a whole STALE_GROWTH_PERIOD (an hour) when the epoch opens (`_allowanceNow`); never wider (the NHI leaf
-///     never widens: `_staleMultiple`, audit wave 4);
-///   - stored = clamp(target, anchor x (1 - allowance), anchor x (1 + allowance)). `attested()` is the last target and
+///     never widens: `_staleMultiple`, audit wave 4; nor the IMD PRICE leaf, sIMD's twin median: a review of the wave-5 fixes);
+///   - stored = clamp(target, anchor x (1 - allowance), anchor x (1 + allowance)), and within a live epoch also into
+///     [highest x (1 - cap), lowest x (1 + cap)] of the values stored in it (`epochRange()`). `attested()` is the last target and
 ///     `converged()` says whether the stored value is it. `latestValue()` returns the stored value, dated by the
 ///     attestation that moved it (consumers that must not act at a value nobody attested read `converged()`: the Pricer
 ///     does, so a clamped leg prices but does not agree, and lends nothing).
-/// The feed remembers nothing beyond the live epoch's anchor and the last target, so what it does next depends only on
+/// The feed remembers nothing beyond the live epoch's anchor, its range and the last target, so what it does next depends only on
 /// the stored value, the clock and the next attestation. What that guarantees (test/unit/SwarmFeedProperties.t.sol):
 ///   P1 STEP BOUND. Within one epoch the stored value stays within the epoch's allowance of its anchor, whoever relays
 ///      what in whatever order: the stored value moves at most one allowance per epoch, except the epoch that opens on a
 ///      silence, which moves at most (1 + 2c)(1 + c) - 1 up / 1 - (1 - 2c)(1 - c) down (the wide step, then a cap c from
-///      where it landed). Over any CLOSED window of one maxAge two epochs can meet (the next one opens exactly maxAge
-///      after the last), so the stored value moves at most (1 + c)^2 - 1 / 1 - (1 - c)^2, and after a silence at most
+///      where it landed). And within one epoch every stored value lies within ONE cap of every other value stored in it,
+///      the anchor included (`_epochLow`/`_epochHigh`, audit wave 5, medium: the band was the anchor's only, so after an
+///      honest move inside an epoch one attestation reached its opposite edge, +50% / -33% from the value held, and NHI
+///      0.85 -> 0.568 in one second; test/unit/AuditW5PriceEpochRange.t.sol): one attestation moves the stored value at
+///      most one cap from the value held. Over any CLOSED window of one maxAge two epochs can meet (the next one opens
+///      exactly maxAge after the last), so the stored value moves at most (1 + c)^2 - 1 / 1 - (1 - c)^2 from ANY value held
+///      in it (the second epoch opens at a value within one cap of every value of the first), and after a silence at most
 ///      (1 + 2c)(1 + c)^2 - 1 up / 1 - (1 - 2c)(1 - c)^2 down: +101.6% / -61.6% at c = 20% (audit wave 4 corrected the
 ///      earlier "(1 + allowance)^2 - 1"; test/unit/AuditW4SlidingBound.t.sol). A leaf that CARRIES THE ANCHOR (NHI,
 ///      `_carriesAnchor`, fixed before audit wave 5) bounds every window of one maxAge, not only each epoch: an epoch opened less
@@ -48,7 +54,9 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///      held in any window [t, t + maxAge) lie within one cap of a value held in the maxAge before it
 ///      (test/unit/AuditW5NhiWindow.t.sol). The price legs keep the per-epoch rule and the bound above.
 ///   P2 LIVENESS. Every accepted attestation leaves the stored value as close to its target as the epoch allows (the
-///      closest point of the band), and each new epoch moves it a full allowance toward the target or onto it. So once
+///      closest point of the band and the epoch's range), and each new epoch moves it a full allowance toward the target or
+///      onto it (an epoch opens with its range at the anchor, so the range costs nothing at an epoch's first delivery; an
+///      honest reversal of more than a cap from the epoch's extreme finishes in the next epoch). So once
 ///      honest attestations of a level H are the only ones relayed, at least one per epoch, the stored value reaches H
 ///      within ceil(ln(max(S, H) / min(S, H)) / ln(1 + cap)) epochs from any stored value S, sooner after a silence
 ///      (the 2x allowance). There is no lock-out: no sequence of earlier attestations can make a later one refused or
@@ -58,8 +66,13 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// THE RESIDUAL, stated plainly: an attack lasting k epochs (a compromised attester, a wrong majority, pushed pool reads
 /// attested honestly) moves the value at most one allowance per epoch and takes about k epochs of honest attestations to
 /// undo (the way back undid it in one step; that speed is what needed memory, and the memory is what broke). A relayer
-/// that always lands LAST in an epoch decides where the stored value ends that epoch, within the allowance, for as long
-/// as it keeps doing so. The response to a suspected attester compromise is `Parameters.lowerLine(ilk, 0)` (instant: no
+/// that always lands LAST in an epoch decides where the stored value ends that epoch, within the allowance and within one
+/// cap of every value stored earlier in the epoch (so an honest relay earlier in the same epoch holds it to one cap of the
+/// honest level), for as long as it keeps doing so. The range also gives a FIRST relayer that lever (a review of the
+/// wave-5 fixes): a value relayed first in an epoch holds later ones within a cap of it, so an adversary relaying once per
+/// epoch, first or last, holds a genuine move to (1 + c)(1 - c) = 0.96x per epoch (anchor-only, the LAST relayer reversed it
+/// at +20% per epoch). No rule on stored values can let an honest reversal of a first relay through while refusing the same
+/// reversal by a key after an honest move: the two sequences are identical (a review of the wave-5 fixes). The response to a suspected attester compromise is `Parameters.lowerLine(ilk, 0)` (instant: no
 /// new debt on the type, liquidations continue) and a re-point (an operator procedure). The first value ever has no bound on chain:
 /// whoever relays first sets it (the relay is permissionless), so the operator relays it first and checks it. A
 /// single-step market gap larger than the allowance is followed at the allowance per epoch (a gap is a delay, never a
@@ -205,6 +218,12 @@ abstract contract SwarmFeed is IFeed {
     /// stored value, always between an anchor and a target, does too. Unused by a feed without magnitude.
     uint128 private _anchorValue;
     uint128 private _attested;
+    /// @dev The lowest and highest value STORED in the live epoch (the anchor included), one slot (audit wave 5, medium): every
+    /// later value of the epoch is also clamped into [high x (1 - cap), low x (1 + cap)], so one attestation moves the stored
+    /// value at most one cap from ANY value held this epoch, not only from the anchor. Reset when an epoch opens. Unused by a
+    /// feed without magnitude.
+    uint128 private _epochLow;
+    uint128 private _epochHigh;
     /// @dev A leaf that carries the anchor (`_carriesAnchor`): the PREVIOUS epoch's anchor while the live epoch must also stay
     /// inside its band (it opened less than maxAge after the stored value last moved), else 0. Never written by other leaves.
     uint128 private _carryAnchor;
@@ -523,6 +542,16 @@ abstract contract SwarmFeed is IFeed {
         if (_hasMagnitude() && value > type(uint128).max) revert InvalidAnswer();
     }
 
+    /// @dev `v` clamped into [high x (1 - cap), low x (1 + cap)] (the live epoch's range, audit wave 5). Never empty: every value
+    /// of the epoch is within one cap of every other, so high x (1 - cap) <= low <= low x (1 + cap). Clamping into it after the
+    /// anchor's band stays inside that band (the range holds the anchor, so the clamp moves `v` toward it).
+    function _clampRange(uint256 v, uint256 low, uint256 high) private view returns (uint256) {
+        uint256 lo = high - Math.mulDiv(high, maxDeviationBps, 10_000);
+        uint256 hi = low + Math.mulDiv(low, maxDeviationBps, 10_000);
+        if (v > hi) return hi;
+        return v < lo ? lo : v;
+    }
+
     /// @dev `target` clamped into [anchor x (1 - bps), anchor x (1 + bps)]. The lower edge saturates at zero (a 5,000 bps
     /// cap is 10,000 bps after a silence), and a nonzero target never clamps to zero: below a zero edge it is inside.
     function _clamp(uint256 target, uint256 anchor, uint256 bps) private pure returns (uint256) {
@@ -597,7 +626,16 @@ abstract contract SwarmFeed is IFeed {
         if (!_hasMagnitude() || !_hasValue) return target;
         (uint256 anchor, uint256 bound, uint256 carry) = _epoch();
         uint256 v = _clamp(target, anchor, bound);
+        if (block.timestamp - uint256(_anchorAt) < maxAge) v = _clampRange(v, _epochLow, _epochHigh);
         return carry == 0 ? v : _clamp(v, carry, maxDeviationBps);
+    }
+
+    /// @notice The lowest and highest value stored in the live epoch (the anchor included): a delivery in it is stored within
+    /// [high x (1 - cap), low x (1 + cap)] as well as the anchor's band. An expired epoch reports the stored value twice (the
+    /// range the next acceptance opens with).
+    function epochRange() external view returns (uint256 low, uint256 high) {
+        if (block.timestamp - uint256(_anchorAt) < maxAge) return (_epochLow, _epochHigh);
+        return (_value, _value);
     }
 
     /// @notice The last attested value taken as a target (the signed answer), as opposed to `latestValue`, the stored one.
@@ -660,11 +698,14 @@ abstract contract SwarmFeed is IFeed {
         if (!_hasValue) {
             (_anchorValue, _attested, _anchorAt, _anchorBound) =
                 (uint128(target), uint128(target), uint40(block.timestamp), uint24(maxDeviationBps));
+            (_epochLow, _epochHigh) = (uint128(target), uint128(target));
             return target;
         }
         uint256 anchor;
         uint256 bound;
         uint256 carry;
+        uint256 low;
+        uint256 high;
         if (block.timestamp - uint256(_anchorAt) >= maxAge) {
             (anchor, bound) = (_value, _allowanceNow());
             if (bound > maxDeviationBps) {
@@ -676,6 +717,7 @@ abstract contract SwarmFeed is IFeed {
                 uint256 first = _clamp(target, anchor, bound);
                 (_anchorValue, _attested, _anchorAt, _anchorBound) =
                     (uint128(first), uint128(target), uint40(block.timestamp), uint24(maxDeviationBps));
+                (_epochLow, _epochHigh) = (uint128(first), uint128(first));
                 if (_carriesAnchor()) _carryAnchor = 0; // unreachable for a shipped leaf (a carrying leaf never widens)
                 return first;
             }
@@ -684,15 +726,20 @@ abstract contract SwarmFeed is IFeed {
                 carry = _carryNow(); // the ending epoch's anchor (read before it is overwritten below)
                 _carryAnchor = uint128(carry);
             }
+            (low, high) = (anchor, anchor); // a new epoch's range starts at its anchor
         } else {
             (anchor, bound) = (_anchorValue, _anchorBound);
             if (_carriesAnchor()) carry = _carryAnchor;
+            (low, high) = (_epochLow, _epochHigh);
         }
         (_anchorValue, _attested) = (uint128(anchor), uint128(target));
-        uint256 v = _clamp(target, anchor, bound);
-        // Clamping into the carried band after the epoch's own is clamping into their intersection: it is never empty,
-        // since the anchor (the stored value when the epoch opened) lies in the carried band.
-        return carry == 0 ? v : _clamp(v, carry, maxDeviationBps);
+        // The anchor's band, then the epoch's range (audit wave 5: one cap from every value held this epoch, not only the
+        // anchor), then the carried band. Each is an interval holding the anchor, so clamping into them in turn moves the
+        // value toward the anchor and lands in their intersection, which is never empty.
+        uint256 v = _clampRange(_clamp(target, anchor, bound), low, high);
+        if (carry != 0) v = _clamp(v, carry, maxDeviationBps);
+        (_epochLow, _epochHigh) = (uint128(v < low ? v : low), uint128(v > high ? v : high));
+        return v;
     }
 
     function _tooOld(uint64 timestamp) private view returns (bool) {

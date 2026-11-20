@@ -22,11 +22,15 @@ contract TlRate {
 }
 
 /// @notice AUDIT WAVE 4 (price design, medium: the twin follows the CLAMPED median for k epochs after a fall). PROPERTY:
-/// with the legs apart and the proven spot fresh, `low` is never above max(spot, attested median) when the median is
-/// clamped above its own attested target (a fall both legs show is followed at once, not one allowance per epoch), while
-/// P4 keeps: `low` is never below the proven spot, and never below min(median, attested median) (a pushed spot cannot lower
-/// it below what the median attested). Deploy-shaped graph: median = rate x (leaf x ETH/USD), spot = rate x (proven x
-/// ETH/USD), cap 2,000 bps, 1 h, skew 5%.
+/// with the legs apart and the proven spot fresh, `low` is never above max(spot, attested median, median x (1 - c)) when the
+/// median is clamped above its own attested target (a fall both legs show is followed AHEAD of the clamp, not at the clamp),
+/// while P4 keeps: `low` is never below the proven spot, and never below min(median, attested median) (a pushed spot cannot
+/// lower it below what the median attested). RESTATED IN AUDIT WAVE 5 (high, AuditW5PriceTwinPush.t.sol): wave 4 followed
+/// the attested median at ONCE (low <= max(spot, attested)), and honest attestations of a PUSHED pool plus one pushed proof
+/// then set `low` to the pushed price with no key. The attested median now counts at most one allowance (c =
+/// Pricer.TWIN_STEP) under the stored median: a fall within one allowance of the clamp is still followed at once, a larger
+/// one one allowance ahead of the median (k - 1 epochs where the median takes k). Deploy-shaped graph: median = rate x
+/// (leaf x ETH/USD), spot = rate x (proven x ETH/USD), cap 2,000 bps, 1 h, skew 5%.
 contract AuditW4TwinLagTest is System {
     bytes32 constant TWIN = "SIMD";
     uint256 constant SKEW = 0.05e18;
@@ -70,19 +74,21 @@ contract AuditW4TwinLagTest is System {
         return imdEth * 2000e18 / 1e18 * vault.r() / 1e18;
     }
 
-    /// The judge's sequence: a one-block fall of 60%, proved at once, honest medians once per epoch. Was: low / market =
-    /// 2.0, 1.6, 1.28, 1.024, 1.0 over five epochs. Now: at the market from the first honest median after the fall.
-    function test_judgeProof_fallFollowedAtTheFirstHonestMedian() public {
+    /// The judge's sequence: a one-block fall of 60%, proved at once, honest medians once per epoch. Wave 3: low / market =
+    /// 2.0, 1.6, 1.28, 1.024, 1.0 over five epochs (the clamp). Wave 4: 1.0 at the first honest median. Wave 5 (one allowance
+    /// ahead of the median): 1.6, 1.28, 1.024, 1.0: one epoch ahead of the clamp, never the pushed-or-genuine level at once.
+    function test_judgeProof_fallFollowedOneAllowanceAhead() public {
         uint256 market = 4e15 * 40 / 100;
-        proven.set(market);
-        vm.warp(vm.getBlockTimestamp() + 1 hours);
-        leaf.set(market);
-        (uint256 m,) = median.latestValue();
-        assertGt(m, _usd(market), "the median leaf is still clamped above the market");
-        Pricer.Quote memory q = pricer.quote(TWIN);
-        assertTrue(q.priced);
-        assertFalse(q.agree, "no borrowing at the clamped median");
-        assertEq(q.low, _usd(market), "low at the market both legs show");
+        uint256[4] memory ratio = [uint256(1.6e18), 1.28e18, 1.024e18, 1e18];
+        for (uint256 k; k < 4; ++k) {
+            proven.set(market);
+            vm.warp(vm.getBlockTimestamp() + 1 hours);
+            leaf.set(market);
+            Pricer.Quote memory q = pricer.quote(TWIN);
+            assertTrue(q.priced);
+            if (k < 3) assertFalse(q.agree, "no borrowing at the clamped median");
+            assertApproxEqRel(q.low, _usd(market) * ratio[k] / 1e18, 1e9, "low one allowance ahead of the clamped median");
+        }
     }
 
     /// PROPERTY (fuzzed over a history of up to 6 epochs of leaf targets, honest or pushed, clamped or not, a delivery late in
@@ -113,12 +119,14 @@ contract AuditW4TwinLagTest is System {
         if (q.agree || m == 0 || s == 0 || median.isStale()) return;
         assertGe(q.low, s, "P4: below the proven spot");
         assertGe(q.low, Math.min(m, a), "below what the median attested");
-        if (a < m) assertLe(q.low, Math.max(s, a), "waited for the clamp: above both legs' fall");
+        if (a < m) assertLe(q.low, Math.max(s, Math.max(a, m - m * 2 / 10)), "waited for the clamp: above both legs' fall");
+        assertGe(q.low, m - m * 2 / 10 - 1, "wave 5: more than one allowance under the stored median");
         assertLe(q.low, Math.max(m, s), "above the old rule");
     }
 
     /// P7 (fuzzed over a fall of 10-90% in one block): once the fall is proved and ONE honest median of the fallen level has
-    /// landed, low is the market; a lagging honest median (window not yet past the fall) holds low at what it attested.
+    /// landed, low is what it attested (the market, or a lagging window median's level) or, if that is more than one allowance
+    /// under the clamped median, one allowance under it (wave 5).
     function testFuzz_P7_oneMedianAfterTheProofEndsTheShelter(uint256 fSeed, uint256 lagSeed) public {
         uint256 market = 4e15 * bound(fSeed, 10, 90) / 100;
         proven.set(market);
@@ -127,7 +135,9 @@ contract AuditW4TwinLagTest is System {
         leaf.set(lagged);
         Pricer.Quote memory q = pricer.quote(TWIN);
         if (q.agree) return; // a small fall within skew: the agree branch
-        assertEq(q.low, _usd(lagged), "low = what the median attested (>= the proven market), not the clamped level");
+        (uint256 m,) = median.latestValue();
+        uint256 floor_ = m - m * 2 / 10;
+        assertApproxEqAbs(q.low, Math.min(m, Math.max(_usd(lagged), floor_)), 1, "low = what the median attested, within one allowance");
         assertEq(FeedTraits.attested(median), _usd(lagged));
     }
 

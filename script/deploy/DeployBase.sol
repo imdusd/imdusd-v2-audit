@@ -218,6 +218,9 @@ abstract contract DeployBase is Script {
             return (_provenAtDeploy(nodes, n.a) && _attesterFreeAtDeploy(nodes, n.b))
                 || (_provenAtDeploy(nodes, n.b) && _attesterFreeAtDeploy(nodes, n.a));
         }
+        // A RATE node's rate source is an address outside the graph (a vault); RateFeed.proven() also needs it attester-free
+        // (audit wave 5, low). The launch check compares this with the contract's own trait, so a rate source with an attester
+        // in it (a swarm leaf) reads proven here and not on chain, and the launch refuses the graph.
         if (n.kind == DeployTypes.RATE) return _provenAtDeploy(nodes, n.a);
         return false;
     }

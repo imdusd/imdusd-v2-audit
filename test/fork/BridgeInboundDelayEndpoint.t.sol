@@ -237,8 +237,13 @@ contract BridgeInboundDelayEndpointForkTest is Test {
         bridge.cancelClaim(RH, _guid(2));
         vm.prank(safe);
         bridge.cancelClaim(RH, _guid(3));
+        // audit wave 5: a reset only on a paused path, reopened in the same BATCH
         vm.prank(safe);
-        bridge.propose(abi.encode(uint8(14), RH, uint256(1)));
+        bridge.pause(RH);
+        bytes[] memory items = new bytes[](2);
+        (items[0], items[1]) = (abi.encode(uint8(14), RH, uint256(1)), abi.encode(uint8(5), RH));
+        vm.prank(safe);
+        bridge.propose(abi.encode(uint8(6), items));
         vm.warp(vm.getBlockTimestamp() + 48 hours - 1);
         vm.expectRevert();
         bridge.applyPending();

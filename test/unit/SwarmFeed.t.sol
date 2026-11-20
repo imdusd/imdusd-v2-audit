@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {SwarmFeed} from "../../src/feeds/SwarmFeed.sol";
 import {
     SwarmPricePolicy,
+    SwarmSpotPolicy,
     SwarmNhiPolicy,
     SwarmQuestions,
     SwarmPriceFeed,
@@ -17,6 +18,11 @@ import {
 
 /// @dev The production question binding with a test signer (the plane's key is not ours).
 contract TestPriceFeed is SwarmPricePolicy {
+    constructor(address attester_, uint256 maxAge_) SwarmFeed(attester_, address(0), 1, 3, maxAge_, 2000) {}
+}
+
+/// @dev A leaf on the BASE stale rule (2x after a silence): the spot policy keeps it; the price policy no longer widens.
+contract TestSpotFeed is SwarmSpotPolicy {
     constructor(address attester_, uint256 maxAge_) SwarmFeed(attester_, address(0), 1, 3, maxAge_, 2000) {}
 }
 
@@ -221,7 +227,7 @@ contract SwarmFeedTest is Test {
     /// first re-anchored the feed by that much. FAILED on dd776c7. Under design C a +45% target after ten hours is taken and
     /// stored at +40% (2x the cap), never at +45%.
     function test_staleAllowanceCapsAtTwiceTheCap() public {
-        TestPriceFeed f = new TestPriceFeed(attester, 1 hours);
+        TestSpotFeed f = new TestSpotFeed(attester, 1 hours);
         _submit(f, _att(f, 25_999_990, 3e15));
         // Ten hours of silence.
         vm.warp(vm.getBlockTimestamp() + 10 hours);
@@ -239,6 +245,20 @@ contract SwarmFeedTest is Test {
         assertEq(allowance, 2 * f.maxDeviationBps());
         assertEq(f.followOf(2 * v), v * 140 / 100, "a 2x target moves the value 2x the cap however long the silence");
         assertEq(f.followOf(v * 139 / 100), v * 139 / 100, "a target inside 2x the cap is stored as attested");
+    }
+
+    /// A review of the wave-5 fixes: the PRICE leaf (sIMD's median; 4663's IMD/ETH leg) never widens: after any silence its
+    /// epoch's allowance is the cap, so one delivery moves it at most one cap from the value held.
+    function test_priceLeafNeverWidens() public {
+        TestPriceFeed f = new TestPriceFeed(attester, 1 hours);
+        _submit(f, _att(f, 25_999_990, 3e15));
+        vm.warp(vm.getBlockTimestamp() + 10 hours);
+        vm.roll(26_003_000);
+        (,, uint256 allowance) = f.epoch();
+        assertEq(allowance, f.maxDeviationBps(), "the price leaf keeps the cap after a silence");
+        _submit(f, _att(f, 26_002_995, 3e15 * 145 / 100));
+        (uint256 v,) = f.latestValue();
+        assertEq(v, 3e15 * 120 / 100, "one cap from the value held");
     }
 
     /// @notice F6 (low): two attestations signed in the same second can only be relayed in WINDOW order: the later

@@ -23,6 +23,7 @@ import {MarketCalendar} from "./MarketCalendar.sol";
 ///  - the token is paused (`paused()`, which also reports the registry's global pause, checked again here), the issuer has
 ///    paused its oracle for a corporate action (`oraclePaused()`, a flag on the TOKEN), or the registry blocklists `holder`
 ///    (the vault that custodies every unit of the type: a blocked vault can move nothing, so nothing may be priced off it);
+///  - the custody is hollow (`holder.worthless()`: an issuer burn left it under 10^-6 of its claim): written off, not sold;
 ///  - a multiplier change is scheduled (`newUIMultiplier() != uiMultiplier()`), or took effect and either `sync` has not
 ///    recorded it yet or the feed has not printed since (it has not re-priced the token at its new multiplier: SGOV read 0.2%
 ///    low for 24h after its October dividend).
@@ -99,6 +100,12 @@ contract MarketHoursFeed is ChainlinkFeed {
                 || _flag(registry, abi.encodeWithSignature("paused()"))
                 || _flag(registry, abi.encodeWithSignature("isBlocked(address)", holder))
         ) return true;
+        // HOLLOW CUSTODY (a review of the wave-5 fixes): while the vault reads `worthless()` (impaired, under 10^-6 of its claim) the
+        // type is a write-off (Ledger.writeOff), not a sale at the dust rate: a take would redeem the shares and hand a later
+        // reissue to the remaining holders instead of the Treasury. Read only as a true answer: a holder without the view
+        // (not a StockVault) is not frozen by it.
+        (bool okW, uint256 hollow) = _word(holder, abi.encodeWithSignature("worthless()"));
+        if (okW && hollow != 0) return true;
         (bool ok1, uint256 current) = _word(stock, abi.encodeWithSignature("uiMultiplier()"));
         (bool ok2, uint256 next) = _word(stock, abi.encodeWithSignature("newUIMultiplier()"));
         // MULTIPLIER (audit wave 4, low): frozen while a change is scheduled, while the live multiplier is one `sync` has not

@@ -111,10 +111,13 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         uint256 owed = d.ledger.debtOf(_pid(SPY, alice));
         vm.prank(address(d.treasury));
         d.usd.transfer(alice, owed - 1_000e18);
+        // shares carry 6 more decimals than the stock (StockVault._decimalsOffset): 3 tokens = 3e24 shares, less
+        // the 10^12 dead shares the vault's opening deposit pays (wave 5)
+        int256 shares = int256(uint256(d.ledger.position(_pid(SPY, alice)).collateral));
+        assertEq(shares, 3e24 - 1e12);
         vm.prank(alice);
-        // shares carry 6 more decimals than the stock (StockVault._decimalsOffset): 3 tokens = 3e24 shares
-        d.ledger.open(SPY, 0, Adjust(-3e24, -int256(owed), 0, 0, 0, true, type(uint256).max, address(0)));
-        assertEq(IERC20(RobinhoodConfig.SPY).balanceOf(alice), 3e18, "the real token back");
+        d.ledger.open(SPY, 0, Adjust(-shares, -int256(owed), 0, 0, 0, true, type(uint256).max, address(0)));
+        assertApproxEqAbs(IERC20(RobinhoodConfig.SPY).balanceOf(alice), 3e18, 1e6, "the real token back, less the dead shares' 10^6 wei");
         assertEq(d.ledger.debtOf(_pid(SPY, alice)), 0);
     }
 
@@ -304,14 +307,20 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         assertTrue(d.stockPrices[spyIndex].isStale());
         d.ledger.writeOff(_pid(SPY, alice)); // the first worthless reading only arms
         // the chain stays alive over the hour (a Pulse poke every 10 min): a silence would open the sequencer grace, in
-        // which the write-off waits like every seizure (wave 5, AuditW5WriteOffGrace)
-        for (uint256 k; k < d.ledger.WRITEOFF_DELAY() / 10 minutes; ++k) {
+        // which the write-off waits like every seizure (wave 5, AuditW5WriteOffGrace); a keeper reads the worthless type at
+        // each poke (wave 5: readings chained inside WRITEOFF_STEP, AuditW5StockWriteOffChain)
+        uint256 n = d.ledger.WRITEOFF_DELAY() / 10 minutes;
+        for (uint256 k; k < n - 1; ++k) {
             vm.warp(vm.getBlockTimestamp() + 10 minutes);
             d.pulse.poke();
+            d.ledger.writeOff(_pid(SPY, alice));
         }
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        d.pulse.poke();
         uint256 debt = d.ledger.debtOf(_pid(SPY, alice));
+        uint256 shares = d.ledger.position(_pid(SPY, alice)).collateral;
         d.ledger.writeOff(_pid(SPY, alice));
-        assertEq(d.stockVaults[spyIndex].balanceOf(address(d.treasury)), 3e24, "seized shares to the Treasury");
+        assertEq(d.stockVaults[spyIndex].balanceOf(address(d.treasury)), shares, "seized shares to the Treasury");
         (,,,, uint128 bad) = d.ledger.ilkState(SPY);
         assertEq(bad, debt);
     }

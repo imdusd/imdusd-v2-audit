@@ -129,8 +129,9 @@ contract PricerTwinTest is System {
     /// P4 (fuzzed): whatever the median leaf holds (a compromised or wrong target, clamped or not) and whatever the proven
     /// price, while the proven spot is fresh the liquidation price `low` is never more than `skew` below the proven price,
     /// never more than `skew` below min(median, attested median), and whenever the legs do not agree equals the spot when
-    /// it is the higher leg, else max(spot, min(median, attested median)) (audit wave 4: a median clamped above its target
-    /// counts at its target; AuditW4TwinLag.t.sol). Borrowing only when they agree AND both legs and NHI are converged.
+    /// it is the higher leg, else max(spot, min(median, max(attested median, median x (1 - TWIN_STEP)))) (audit wave 4: a median
+    /// clamped above its target counts at its target; audit wave 5: but never more than one allowance under the stored median;
+    /// AuditW4TwinLag.t.sol, AuditW5PriceTwinPush.t.sol). Borrowing only when they agree AND both legs and NHI are converged.
     function testFuzz_P4_twinRule(uint256 mSeed, uint256 pSeed, uint256 tSeed, bool clampIt, bool spotStale) public {
         uint256 m = bound(mSeed, 1e13, 1e17);
         uint256 p = bound(pSeed, 1e13, 1e17);
@@ -151,7 +152,9 @@ contract PricerTwinTest is System {
             assertGe(q.low * 1e18, mOrA * (1e18 - SKEW), "never more than skew below what the median attested");
             assertGe(q.low * 1e18, pUsd * (1e18 - SKEW), "P4: never more than skew below the proven price");
             if (!q.agree) {
-                assertEq(q.low, mUsd > pUsd ? (mOrA > pUsd ? mOrA : pUsd) : pUsd, "disagreeing legs: the twin rule");
+                uint256 counted = aUsd > mUsd * 8 / 10 ? aUsd : mUsd - mUsd * 2 / 10; // max(a, m x (1 - TWIN_STEP))
+                if (counted > mUsd) counted = mUsd;
+                assertEq(q.low, mUsd > pUsd ? (counted > pUsd ? counted : pUsd) : pUsd, "disagreeing legs: the twin rule");
             }
         } else {
             assertEq(q.low, mUsd, "a stale proven spot: the median alone, as today");

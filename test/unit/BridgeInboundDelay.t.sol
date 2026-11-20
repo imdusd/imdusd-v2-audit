@@ -53,7 +53,6 @@ contract BridgeInboundDelayTest is W4Bridge {
 
     function test_constants() public view {
         assertEq(rh.DEFAULT_INSTANT_CAP(), 5_000e18, "the launch value");
-        assertEq(rh.INSTANT_WINDOW(), 1 days);
         assertEq(rh.DEFAULT_DELAY(), 12 hours, "the launch value");
         assertLt(rh.DEFAULT_DELAY(), rh.TIMELOCK(), "an early release would never beat waiting");
     }
@@ -131,8 +130,9 @@ contract BridgeInboundDelayTest is W4Bridge {
         }
         assertEq(rhTok.balanceOf(attacker), 0);
         vm.prank(safe);
-        vm.expectRevert(abi.encodeWithSelector(ImdBridge.NotClaimable.selector, HOME, k, 0));
-        rh.cancelClaim(HOME, k); // not pending any more
+        rh.cancelClaim(HOME, k); // not pending any more: a no-op (a review of the wave-5 fixes)
+        (,,, uint8 st) = rh.claims(HOME, k);
+        assertEq(st, 3, "still cancelled");
     }
 
     /// D3: cancelling even after DELAY works while nobody has claimed (the Safe was slow but the forger was slower).
@@ -326,7 +326,14 @@ contract BridgeInboundDelayTest is W4Bridge {
         vm.warp(vm.getBlockTimestamp() + D);
         // B2: past QUEUE_BREAKER the path tripped; the timelocked reset of that trip resumes every claim
         (, uint16 trips, bool tripped,,,,) = rh.breakers(HOME);
-        if (tripped) _govern(rh, abi.encode(uint8(14), HOME, uint256(trips)));
+        if (tripped) {
+            // audit wave 5: the reset is accepted on a paused path; UNPAUSE in the same BATCH
+            vm.prank(safe);
+            rh.pause(HOME);
+            bytes[] memory items = new bytes[](2);
+            (items[0], items[1]) = (abi.encode(uint8(14), HOME, uint256(trips)), abi.encode(uint8(5), HOME));
+            _govern(rh, abi.encode(uint8(6), items));
+        }
         for (uint256 k; k < 8; ++k) {
             if (idx[k] == type(uint256).max) continue;
             bytes32 kc = _key(idx[k]);

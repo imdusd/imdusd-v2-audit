@@ -171,7 +171,7 @@ library DeployTypes {
         uint32[] earlyDays; // NYSE 13:00 closes
         uint8 group; // Parameters debt-cap group shared by every stock / SGOV type
         uint256 groupLine; // that group's line
-        uint256 rateCap; // RateFeed growth cap on each vault's share rate (per second, 1e18)
+        uint256 rateCap; // RateFeed growth cap on each vault's share rate (per second, 1e18; type(uint256).max = none)
     }
 
     /// @notice One type a Backstop sleeve bids on. `genesisLine` = the edge bootstrap allowance (ignored on blue).
@@ -341,7 +341,8 @@ library MainnetConfig {
     uint8 internal constant F_IMD_PROVEN = 13;
     uint8 internal constant F_IMD_USD_PROVEN = 14;
     /// @dev sIMD's spot leg: the proven product x sIMD's share rate. ProvenPoolPrice reports `proven()`, so the Pricer
-    /// gives sIMD the twin rule (low = max(median, spot) while the legs disagree).
+    /// gives sIMD the twin rule while the legs disagree (Pricer: the spot, or the median's attested value within one
+    /// allowance of the stored median, never below the spot).
     uint8 internal constant F_SIMD_SPOT = 15;
     uint8 internal constant F_NHI = 16;
     uint8 internal constant F_IMD_LIVE = 17; // wei ETH per 1e18 IMD, this block
@@ -957,7 +958,10 @@ library RobinhoodConfig {
         s.usdg = USDG;
         s.group = STOCK_GROUP;
         s.groupLine = STOCK_GROUP_LINE;
-        s.rateCap = CAP;
+        // Audit wave 5 (medium): no growth cap on a StockVault's share rate. It rises only with real stock (a reissue the
+        // issuer makes after a burn, forfeited to the holders who stayed), and a 0.1%/day cap priced those holders' custody at
+        // 2/3 of what it redeems for for ~500 days while liquidation takers redeemed the difference. A fall is live as before.
+        s.rateCap = RATE_UNCAPPED;
         (s.closedDays, s.earlyDays) = nyse2026to2028();
         s.types = new DeployTypes.StockSpec[](9);
         s.types[0] = _stock("STOCK-SPY", SPY, CL_SPY, 1.4e18, 2_500e18);
@@ -978,10 +982,17 @@ library RobinhoodConfig {
         // session), so one skipped heartbeat left a live feed unpriced a whole session at 25 h. 49 h covers one missed
         // weekday heartbeat (Mon 20:00 -> Wed 16:00 = 44 h); two in a row still read stale. A T-bill fund moves ~0.02% a day,
         // so a dead feed priced 24 h longer is far inside its 15% buffer. The other types keep 25 h (they print in session).
+        // Audit wave 5 (low): the feed never prints Saturday or Sunday daytime (last print Thursday or Friday 20:0x, next
+        // Sunday 20:00, Monday 20:00 over a Monday holiday), so one skipped heartbeat after a weekend left Monday unpriced at
+        // 49 h. 5 days covers Thursday 20:00 -> Tuesday 16:00 (116 h: a weekend plus a Monday holiday with its heartbeat
+        // missed). Trade-off: two missed WEEKDAY heartbeats now still price (a dead feed is caught after 5 days, ~0.1% of
+        // T-bill drift against a 15% buffer).
         s.types[8].maxAge = SGOV_MAX_AGE;
     }
 
-    uint256 internal constant SGOV_MAX_AGE = 2 days + 1 hours;
+    uint256 internal constant SGOV_MAX_AGE = 5 days;
+    /// @notice RateFeed.UNCAPPED: the stock types' RateFeeds follow the vault's live rate.
+    uint256 internal constant RATE_UNCAPPED = type(uint256).max;
 
     function _stock(bytes32 ilk, address token, address agg, uint64 mat, uint128 line)
         private
