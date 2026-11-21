@@ -132,6 +132,7 @@ abstract contract TwoChains is Test {
         _warp(48 hours);
         home.bridge.applyPending();
         rh.bridge.applyPending();
+        _warp(1 days); // a review before wave 5b: the instant allowance starts empty at the path's opening; start from a full one
     }
 
     /// @dev The launch BATCH shape: path, both pins, a floor-checked ULN config (3 DVNs, 20 confirmations) on each.

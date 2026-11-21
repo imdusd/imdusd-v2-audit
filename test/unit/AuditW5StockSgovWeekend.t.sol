@@ -68,7 +68,7 @@ contract AuditW5StockSgovWeekendTest is Test {
         uint256 print = (cal.daysFromCivil(2026, 10, 22) + 1) * 1 days + 1 minutes;
         vm.warp(print);
         agg.set(100e8, print);
-        vm.warp(cal.daysFromCivil(2026, 10, 28) * 1 days + 14 hours);
+        vm.warp(cal.daysFromCivil(2026, 10, 29) * 1 days + 14 hours); // Thursday to Thursday: past STOCK_MAX_AGE (6 days)
         assertTrue(feed.isStale(), "a dead feed reads stale");
     }
 }

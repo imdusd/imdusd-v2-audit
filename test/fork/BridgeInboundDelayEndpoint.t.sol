@@ -77,6 +77,8 @@ contract BridgeInboundDelayEndpointForkTest is Test {
         r[0] = SetConfigParam(RH, 2, _uln(0xC000));
         items[4] = abi.encode(uint8(2), address(RECV_ULN), r);
         _govern(abi.encode(uint8(6), items));
+        // a review before wave 5b: the instant allowance starts EMPTY at the path's opening (token accepted); start from a day later (full)
+        vm.warp(vm.getBlockTimestamp() + 1 days);
     }
 
     function _govern(bytes memory payload) internal {

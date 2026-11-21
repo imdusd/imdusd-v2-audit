@@ -70,3 +70,29 @@ abstract contract W5Bridge is W4Bridge {
         vm.warp(vm.getBlockTimestamp() + dt);
     }
 }
+
+/// @notice ImdUSD's bridge-minter gate, for the launch-order tests (a review before wave 5b): mint and burn revert until `setBridge` names a
+/// minter (ImdUSD.setBridge, applied by Parameters' SET_BRIDGE), and `bridge()` reports it.
+contract GatedTok {
+    mapping(address => uint256) public balanceOf;
+    uint256 public totalSupply;
+    address public bridge;
+
+    function setBridge(address b) external {
+        bridge = b;
+    }
+
+    function mint(address to, uint256 a) external returns (bool) {
+        require(msg.sender == bridge, "Unauthorized");
+        balanceOf[to] += a;
+        totalSupply += a;
+        return true;
+    }
+
+    function burn(address from, uint256 a) external returns (bool) {
+        require(msg.sender == bridge, "Unauthorized");
+        balanceOf[from] -= a;
+        totalSupply -= a;
+        return true;
+    }
+}

@@ -184,9 +184,8 @@ contract BridgeHoldTest is W4Bridge {
         rh.propose(release);
         rh.hold(HOME, n);
         vm.expectRevert(ImdBridge.BadPayload.selector);
-        rh.propose(abi.encode(uint8(12), HOME, sender, n, bytes32(0)));
-        vm.expectRevert(ImdBridge.BadPayload.selector);
         rh.propose(abi.encode(uint8(12), HOME, sender, n, bytes32(type(uint256).max)));
+        rh.propose(abi.encode(uint8(12), HOME, sender, n, bytes32(0))); // a review before wave 5b: 0 = DROP the held payload, accepted
         vm.stopPrank();
     }
 
@@ -252,6 +251,5 @@ contract BridgeHoldTest is W4Bridge {
         (bytes32 held, uint64 until) = rh.holds(HOME, sender, n);
         assertEq(held, ph);
         assertEq(until, vm.getBlockTimestamp() + T);
-        assertEq(rh.HOLD_TIME(), T);
     }
 }

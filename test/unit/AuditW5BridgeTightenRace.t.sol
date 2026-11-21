@@ -70,7 +70,7 @@ contract AuditW5BridgeTightenRaceTest is W5Bridge {
     ) public {
         cap0 = bound(cap0, 0, 1e9) * 1e18;
         b0 = bound(b0, 0, 1e9) * 1e18;
-        d0 = bound(d0, rh.MIN_DELAY(), rh.MAX_DELAY());
+        d0 = bound(d0, uint256(1 hours), uint256(7 days));
         _governRh(_setDelayP(cap0, d0, b0, cut0));
         uint16 v0 = _version();
         vm.prank(safe);
@@ -79,7 +79,7 @@ contract AuditW5BridgeTightenRaceTest is W5Bridge {
         assertEq(v, v0 + 1, "version bumped");
         assertEq(_cap(), _min(capA / 1e12, cap0 / 1e12) * 1e12, "cap = the lower");
         assertEq(breaker, _min(bA / 1e12, b0 / 1e12) * 1e12, "breaker = the lower");
-        assertEq(delay, _max(_min(dA, rh.MAX_DELAY()), d0), "delay = the longer, within MAX_DELAY");
+        assertEq(delay, _max(_min(dA, uint256(7 days)), d0), "delay = the longer, within MAX_DELAY");
         uint40 want = cut0 == 0 ? cutA : (cutA == 0 || cutA > cut0 ? cut0 : cutA);
         assertEq(cut, want, "cutoff = the earlier non-zero one");
     }
@@ -88,7 +88,7 @@ contract AuditW5BridgeTightenRaceTest is W5Bridge {
     function testFuzz_noFrontRunRevertsTheTighten(uint256 capP, uint256 dP, uint256 bP, uint40 cutP) public {
         capP = bound(capP, 0, 1e9) * 1e18;
         bP = bound(bP, 0, 1e9) * 1e18;
-        dP = bound(dP, rh.MIN_DELAY(), rh.MAX_DELAY());
+        dP = bound(dP, uint256(1 hours), uint256(7 days));
         _proposeRh(_setDelayP(capP, dP, bP, cutP));
         _warp(48 hours);
         vm.prank(attacker);

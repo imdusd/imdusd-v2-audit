@@ -75,9 +75,13 @@ interface IMintableBurnable {
 ///    Kelp sequence: pause; void every forged payload (both instant, one Safe signature round each); fix the DVN config
 ///    (48h); then unpause (48h, its own proposal: UNPAUSE may not share a BATCH with a path, library or config change for
 ///    that eid, so nothing verified under the old DVNs can run in the block the path reopens), without changing the peer.
-///    INCIDENT RULE, THE VOID SWEEP (a review before wave 5b): before ANY reopening (UNPAUSE, a SET_PATH, a SET_DELAY raising C), and
-///    after the DVN fix has applied, `voidPayload` every payload the endpoint stores for the path that no peer `Sent`
-///    matches (the nonces above lazyInboundNonce, and any the watcher saw verified). The bridge cannot tell a stockpile
+///    INCIDENT RULE, THE VOID SWEEP (a review before wave 5b): before ANY reopening (UNPAUSE, a SET_PATH, a SET_DELAY raising C, and
+///    SET_BRIDGE: the launch opening), and
+///    after the DVN fix has applied, refuse every payload the endpoint stores for the path that does not equal the peer's
+///    `Sent` AT ITS NONCE (the nonces above lazyInboundNonce, and any the watcher saw verified). PER NONCE, two acts:
+///    a hash that equals no honest `Sent` at all -> `voidPayload` (by hash); a hash that equals an honest `Sent` at
+///    ANOTHER nonce (a replay of an honest payload) -> `hold` that nonce + RELEASE it with hash 0 (a DROP), never a void
+///    (it would refuse the honest twin). The bridge cannot tell a stockpile
 ///    verified while the path was closed from an honest packet; missed, it runs after the reopening in pieces that fit
 ///    the refilling allowance: instant Received, no Queued, at most C per day. A `hold` is only a delay: the held
 ///    payload queues when it runs, and that claim must be cancelled within D.
@@ -133,7 +137,11 @@ interface IMintableBurnable {
 /// (PathPaused), ANY SET_PATH on a set path (OnlyPeer; RateLimited at a closed, lowered or shortened limit), a SET_DELAY
 /// raising C (the cap); every payload-level block is a Safe act, and a payload the Safe held (at its expiry or RELEASE)
 /// or voided (after UNVOID) always QUEUES for D, never mints at once. So in the t after any change that unblocks a packet
-/// at most C x t / 1 day mints at once. Not a block: RateLimited at an unchanged limit (the limiter's own refill: the
+/// at most C x t / 1 day mints at once. The TOKEN's block (a review before wave 5b: ImdUSD.mint refuses the bridge until Parameters'
+/// SET_BRIDGE applies) is lifted by another contract's act, so the meter does not START until the token has accepted this
+/// bridge: a meter not started is EMPTY, and it starts empty at the first act or message after acceptance (until then a
+/// message queues, and claims revert in the mint), whatever the order of SET_BRIDGE and the path. Not a block:
+/// RateLimited at an unchanged limit (the limiter's own refill: the
 /// instant cap's normal rate applies); Unconfigured cannot return after launch; ZeroAmount/BelowMinimum never pass. `tighten` never reverts on a set path (audit wave 5): each field lands at the tighter of its argument and what stands,
 /// so no one can make the Safe's signed act fail by applying a matured SET_DELAY first; a breaker lowered below what its
 /// window holds trips the path (audit wave 5). The window counts what QUEUED, cancelled claims included (a cancel refunds
@@ -232,7 +240,9 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// @notice Lift the bridge's void on a payload hash (audit wave 4): an honest payload voided by mistake.
     uint8 internal constant UNVOID = 11; // (payloadHash)
     /// @notice End a hold before HOLD_TIME, or let through a payload other than the one held: the held
-    /// nonce then runs only with `payloadHash` (and never anything else), at once.
+    /// nonce then runs only with `payloadHash` (and never anything else), as a claim. `payloadHash` 0 DROPS the held payload
+    /// (a review before wave 5b): it never runs at that nonce, and any other payload verified there later does (the response to a forged
+    /// replay of an honest payload: a void by hash would refuse the honest twin too).
     uint8 internal constant RELEASE = 12; // (srcEid, sender, nonce, payloadHash)
     /// @notice Restore a claim the governor cancelled: pending again, claimable at queuedAt + the path's
     /// delay (usually long run). No early release exists: a claim waits its delay or this 48h timelock. Applied only to a
@@ -253,10 +263,10 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
 
     /// @notice Highest per-path limit (for millions a day): 250,000,000 imdUSD per window, so a message
     /// (<= the inbound limit) always fits a claim's 48-bit shared-decimals amount (2^48 / 1e6 ~ 281,474,976 imdUSD).
-    uint256 public constant MAX_LIMIT = 250_000_000e18;
+    uint256 internal constant MAX_LIMIT = 250_000_000e18;
     /// @notice How long a `hold` refuses a message: long enough for the Safe's signers to meet over a weekend
     /// and void a forgery for good; the honest message then runs by itself. Constant: no act can lengthen a hold.
-    uint256 public constant HOLD_TIME = 72 hours;
+    uint256 internal constant HOLD_TIME = 72 hours;
     /// @notice The launch values of a path's delay settings, written at its first SET_PATH so no
     /// open path is ever without a delay; SET_DELAY (48h) and `tighten` (instant) change them per path afterwards.
     /// Instant cap: most imdUSD a path mints at once per INSTANT_WINDOW (decaying), so the largest single message that can
@@ -274,8 +284,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// @notice Bounds on a path's claim delay: a zero delay would remove the Safe's window; 7 days caps how
     /// long honest transfers can be made to wait. No bound on the cap or the breaker beyond their 64-bit shared-decimals
     /// fields (~1.8e13 imdUSD).
-    uint256 public constant MIN_DELAY = 1 hours;
-    uint256 public constant MAX_DELAY = 7 days;
+    uint256 internal constant MIN_DELAY = 1 hours;
+    uint256 internal constant MAX_DELAY = 7 days;
     /// @notice The breaker window in UTC days: any HOLD_TIME (72 h) span of queue times falls inside BREAKER_DAYS days.
     uint256 internal constant BREAKER_DAYS = 4;
     uint8 internal constant CLAIM_PENDING = 1;
@@ -546,7 +556,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         // a held nonce waits out HOLD_TIME, and then runs only with the payload that was held (or released)
         HoldRecord storage hd = holds[origin.srcEid][origin.sender][origin.nonce];
         uint64 until = hd.until;
-        if (until != 0 && (block.timestamp < until || hd.payloadHash != payloadHash)) {
+        // a review before wave 5b: until == 2 is a DROP (RELEASE with hash 0): only the held payload is refused there, any other runs
+        if (until != 0 && (until == 2 ? hd.payloadHash == payloadHash : block.timestamp < until || hd.payloadHash != payloadHash)) {
             revert OnHold(origin.srcEid, origin.nonce, until);
         }
         uint256 amount = uint256(message.amountSD()) * CONVERSION;
@@ -560,6 +571,10 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         // what does not fit the path's instant allowance waits the path's delay as a claim
         Meter storage mt = instantIn[origin.srcEid];
         (uint256 used, uint256 capSD) = _instantUsed(mt);
+        // a review before wave 5b: the meter STARTS, empty, at the first message the path receives once the token has accepted this bridge
+        // (SET_BRIDGE applied), so whatever the order of SET_BRIDGE and the path, nothing mints at once before C x t / 1
+        // day has refilled since the path could first mint; until then everything queues (and claims revert in mint)
+        if (mt.lastUpdated == 0 && _accepted()) (mt.used, mt.lastUpdated) = (uint128(capSD * CONVERSION), uint64(block.timestamp));
         // a review before wave 5b: a payload the Safe blocked (held, at its expiry or RELEASE, or voided then UNVOIDed) never mints at once
         if (used + amount > capSD * CONVERSION || until != 0 || unvoided[payloadHash]) {
             _queue(origin, to, amount);
@@ -694,9 +709,11 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// hold later. Only the timelock's UNVOID lifts it; the endpoint keeps the packet, so an honest one then runs as it is.
     /// The void is by hash on every path and nonce (audit wave 5): a forged REPLAY of an honest (guid, message) at another
     /// nonce has the honest message's hash, so voiding it refuses the honest one too. For a replay use the nonce-scoped
-    /// route instead: `hold(srcEid, forgedNonce)`, then RELEASE that nonce naming a hash nothing has: that nonce never runs
-    /// and the honest one is untouched. TIMING (a review of the wave-5 fixes): the RELEASE must be PROPOSED within 24 h of the hold (72 h hold
-    /// - 48 h timelock), or the hold ends first and the replay runs; and the proposal slot must be free then.
+    /// DROP instead (a review before wave 5b): `hold(srcEid, forgedNonce)`, then RELEASE that nonce with hash 0: the held payload never
+    /// runs at that nonce, the honest twin at its own nonce is untouched (it runs, at once if it fits), and the honest
+    /// peer's next message at that nonce runs (as a claim) with no further act. TIMING (a review of the wave-5 fixes): the RELEASE must be
+    /// PROPOSED within 24 h of the hold (72 h hold - 48 h timelock) with the slot free; if the hold ends first, the replay
+    /// runs as a CLAIM (a review before wave 5b), to be cancelled within D.
     function voidPayload(bytes32 payloadHash) external onlyGovernor {
         voided[payloadHash] = true;
         emit Voided(0, 0, bytes32(0), 0, payloadHash);
@@ -737,9 +754,21 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
 
     /// @dev The path's instant allowance in use now (decayed at its cap per INSTANT_WINDOW), and the cap (shared decimals).
     /// After an instant lowering `used` may exceed the cap: nothing mints at once until it decays below.
+    /// @dev The token has made this bridge its minter (ImdUSD.bridge() == this; a token without `bridge()` counts as accepted).
+    function _accepted() private view returns (bool yes) {
+        address t = address(minterBurner);
+        assembly ("memory-safe") {
+            mstore(0, 0xe78cea92) // bridge()
+            let ok := staticcall(gas(), t, 28, 4, 0, 32)
+            yes := or(or(iszero(ok), lt(returndatasize(), 32)), eq(mload(0), address()))
+        }
+    }
+
     function _instantUsed(Meter storage mt) private view returns (uint256 used, uint256 capSD) {
         Meter memory m = mt;
         capSD = m.capSD;
+        // a review before wave 5b: a meter not started yet (no message since this token accepted the bridge) is EMPTY
+        if (m.lastUpdated == 0) return (capSD * CONVERSION, capSD);
         uint256 decayed = capSD * CONVERSION * (block.timestamp - m.lastUpdated) / INSTANT_WINDOW;
         used = m.used > decayed ? m.used - decayed : 0;
     }
@@ -911,8 +940,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else if (kind == RELEASE) {
             (, uint32 eid, bytes32 sender, uint64 nonce, bytes32 h) =
                 abi.decode(payload, (uint8, uint32, bytes32, uint64, bytes32));
-            // only a nonce that was held; the released payload is a real one (never empty or NIL)
-            if (holds[eid][sender][nonce].until == 0 || h == bytes32(0) || h == NIL_PAYLOAD_HASH) revert BadPayload();
+            // only a nonce that was held; the released payload is a real one (never NIL), or 0 = DROP (a review before wave 5b)
+            if (holds[eid][sender][nonce].until == 0 || h == NIL_PAYLOAD_HASH) revert BadPayload();
         } else if (kind == UNCANCEL) {
             (, uint32 eid, bytes32 guid) = abi.decode(payload, (uint8, uint32, bytes32));
             if (claims[eid][guid].state != CLAIM_CANCELLED) revert BadPayload();
@@ -1083,8 +1112,10 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else if (kind == RELEASE) {
             (, uint32 eid, bytes32 sender, uint64 nonce, bytes32 h) =
                 abi.decode(payload, (uint8, uint32, bytes32, uint64, bytes32));
-            // ended (1, never 0: the nonce stays "held once") and bound to the released payload
-            holds[eid][sender][nonce] = HoldRecord(h, 1);
+            // ended (1, never 0: the nonce stays "held once") and bound to the released payload; h == 0 DROPS the held one
+            // (a review before wave 5b: 2 = only the payload that was held is refused at that nonce, for good; any other runs, as a claim)
+            HoldRecord storage r = holds[eid][sender][nonce];
+            (r.payloadHash, r.until) = h == bytes32(0) ? (r.payloadHash, uint64(2)) : (h, uint64(1));
             emit HoldReleased(eid, sender, nonce, h);
         } else if (kind == UNCANCEL) {
             (, uint32 eid, bytes32 guid) = abi.decode(payload, (uint8, uint32, bytes32));
@@ -1140,6 +1171,15 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// the allowance empty (used at least the cap), so it refills at the cap's rate (audit wave 5).
     function _meter(uint32 eid, uint256 capSD, bool empty) private {
         Meter storage m = instantIn[eid];
+        // a review before wave 5b: a meter not started (the token has not accepted this bridge yet) stays not started; one that starts here
+        // (a path's first settings once the token accepts) starts EMPTY
+        if (m.lastUpdated == 0) {
+            if (!_accepted()) {
+                m.capSD = uint64(capSD);
+                return;
+            }
+            empty = true;
+        }
         (uint256 used,) = _instantUsed(m);
         if (empty && used < capSD * CONVERSION) used = capSD * CONVERSION;
         (m.used, m.lastUpdated, m.capSD) = (uint128(used), uint64(block.timestamp), uint64(capSD));

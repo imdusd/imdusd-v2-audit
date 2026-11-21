@@ -157,6 +157,9 @@ abstract contract W4Bridge is Test {
     function _openBoth(uint256 limit) internal {
         _govern(home, _launchBatch(home, RH, _b32(address(rh)), limit, limit));
         _govern(rh, _launchBatch(rh, HOME, _b32(address(home)), limit, limit));
+        // a review before wave 5b: a path's instant allowance starts EMPTY when it can first mint; these tests start from a path that has
+        // been open for a day (full allowance); the launch itself is tested in AuditW5BridgeLaunchOrder
+        vm.warp(vm.getBlockTimestamp() + 1 days);
     }
 
     /// @dev An honest send home -> rh of `amount` from `from` (minted to them first).

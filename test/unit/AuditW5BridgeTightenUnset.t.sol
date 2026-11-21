@@ -42,8 +42,8 @@ contract AuditW5BridgeTightenUnsetTest is W4Bridge {
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         rh.applyPending();
         (,,,, uint32 d,,) = rh.breakers(HOME);
-        assertGe(uint256(d), rh.MIN_DELAY());
-        assertLe(uint256(d), rh.MAX_DELAY());
+        assertGe(uint256(d), uint256(1 hours));
+        assertLe(uint256(d), uint256(7 days));
     }
 
     /// The same for a bridge with no path at all: nothing an instant act does leaves a delay under MIN_DELAY.

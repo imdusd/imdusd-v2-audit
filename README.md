@@ -85,7 +85,12 @@ All governance goes through `Parameters` (a 2-of-3 Safe as governor). **Launch o
 audit):** the Ethereum beta AND the full Robinhood Chain (chain 4663) core, with stock-token collateral (`src/stocks/`,
 `MarketCalendar`, `MarketHoursFeed`), the sequencer grace (`Pulse`) and the LayerZero V2 bridge (`ImdBridge`) on both
 chains. Value crosses the bridge only after the Safe's one-time `SET_BRIDGE` on each chain, which the Safe proposes only
-once the re-check of this round's bridge findings comes back clean. Not part of the launch: a leveraged loop vault
+once the re-check of this round's bridge findings comes back clean. LAUNCH ORDER (both chains; changed in wave 5b):
+12-05 the core is deployed and the Safe executes file B2 (it pauses the path in the same transaction, then proposes the
+path BATCH) and file B1 (`SET_BRIDGE`); 12-07 both apply, the path still PAUSED; then the per-nonce void sweep; then file
+B3 (`BridgeBatch.open()`, UNPAUSE, refused unless `SET_BRIDGE` has applied on that chain, the path is set and paused, and
+the sweep is marked done), which applies 48 h later, about 12-09: VALUE CROSSES ABOUT 12-09. The instant allowance then
+starts empty and refills over a day; transfers above it queue for 12 h and anyone claims them. Not part of the launch: a leveraged loop vault
 (`LoopVault`), an AMM of two ERC-4626 tokens (`src/dex/`) and `RateManager`. `script/` holds the deploy scripts the tests
 import, plus the four launch files listed under Audit scope (the rest of the launch tooling and the operator runbook are
 not public).
@@ -97,7 +102,7 @@ network is needed for the offline suites.
 
 ```bash
 forge build                                                    # solc via_ir: a clean build takes a long time
-forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,608 tests)
+forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,613 tests)
 forge build --use solar && forge test --use solar --no-match-path 'test/fork/*'   # fast dev loop (see below)
 
 # Fork suites: one file at a time, single-threaded (in parallel, set-up calls hit RPC rate limits)
@@ -158,7 +163,7 @@ deploys every contract below.
 | I. Measured depth | `DepthSampler`, `ImdDepth` | 430 |
 | Vendored (in scope as used) | `src/vendor/optimism`: `MerkleTrie`, `SecureMerkleTrie`, `RLPReader`, `RLPErrors`, `Bytes` (op-contracts/v9.0.0, imports made relative; PROVENANCE.md) | 349 |
 
-**Round 2: Robinhood Chain and the bridge, launching on 12-07 with the beta (1,883 nSLOC)**
+**Round 2: Robinhood Chain and the bridge, launching on 12-07 with the beta (1,931 nSLOC)**
 
 Audited early in wave 4 as "after the beta"; they now launch on 12-07. Robinhood Chain runs the SAME core contracts as
 Round 1 (one `Ledger`, `Parameters`, `Pricer`, ... per chain) with its own configuration; the chain-specific pieces are
@@ -166,11 +171,11 @@ below. The Robinhood configuration, its deploy scripts and the bridge Safe batch
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE` and `ImdUSD.checkBridge`; per-path inbound delay: instant cap, claims, cancels, bulk-cancel cutoff, queue breaker, governable settings; Safe-only pause, hold, void, cancel and tighten, no guardian), `Pulse` (the sequencer grace on a chain with no uptime feed) | 755 |
+| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE` and `ImdUSD.checkBridge`; per-path inbound delay: instant cap, claims, cancels, bulk-cancel cutoff, queue breaker, governable settings; Safe-only pause, hold, void, cancel and tighten, no guardian), `Pulse` (the sequencer grace on a chain with no uptime feed) | 773 |
 | Stock tokens | `src/stocks/StockVault.sol`, `src/stocks/StockJoin.sol`, `src/feeds/MarketHoursFeed.sol`, `src/feeds/MarketCalendar.sol` | 374 |
 | Robinhood configuration | `library RobinhoodConfig` in `script/DeployConfig.sol` (types, mats, lines incl. the IMD line 0 at genesis and its raise payload, feeds, chain line, Pulse gap/grace, bridge limits and inbound-delay launch values, DVNs, confirmations, enforced `lzReceive` gas) | 303 |
 | Robinhood deploy | `script/DeployRobinhood.s.sol`, `script/DeployChain.s.sol`, `script/deploy/StageChain.sol` (Pulse, ImdBridge and the stock module as resumable deploy hooks) | 201 |
-| Bridge Safe batches | `script/launch/BridgeBatch.s.sol` (each chain's path BATCH, and the separate, gated `SET_BRIDGE` file), `script/launch/Safe4663.s.sol` (re-creates the mainnet governance Safe at the same address on 4663, simulation only) | 250 |
+| Bridge Safe batches | `script/launch/BridgeBatch.s.sol` (each chain's path BATCH, created paused; the separate, gated `SET_BRIDGE` file; the gated UNPAUSE file B3), `script/launch/Safe4663.s.sol` (re-creates the mainnet governance Safe at the same address on 4663, simulation only) | 280 |
 
 Compile-only, OUT of scope: `script/launch/LaunchBase.sol` and `script/launch/SafeBatch.s.sol` (1,069 nSLOC), included
 only because the bridge batches import them (the deployment record, the stage post-checks and the Safe Transaction
@@ -588,7 +593,7 @@ Stock tokens:
 - **The standing answer after 5 minutes.** From 09:35 New York a type with no in-session print (SGOV; SPY on quiet days)
   is priced from the overnight or heartbeat answer, trusted only through the feed's deviation trigger. Up to 5 minutes
   of each open are unpriced (no borrow, bite or take; repay and deposit unaffected). (changed before wave 5b: with the
-  old 25 h max age a quiet type was unpriced all Monday after a missed Sunday heartbeat; every stock type now has a 5-day
+  old 25 h max age a quiet type was unpriced all Monday after a missed Sunday heartbeat; every stock type now has a 6-day
   max age, see the wave-5 section.)
 - **Stuck stock.** Stock sent to a `StockVault` outside a deposit (or a reissue above what was burned) is stuck; a
   partial burn with no reissue closes deposits to that type for good (withdrawals, liquidation and write-off keep working).
@@ -598,7 +603,7 @@ Stock tokens:
 - **Calendar:** an unscheduled closure needs the Safe on the day (`closeDay`, instant, close only).
 - **A real decimals change** of an aggregator leaves the type unpriced until the feed is redeployed.
 - **SGOV's 49 h max age:** a dead SGOV feed prices up to 24 h longer than the other types (a T-bill fund moves ~0.02% a day
-  against a 15% buffer). (changed before wave 5b: 5 days; see the wave-5 section.)
+  against a 15% buffer). (changed before wave 5b: 6 days for every stock type; see the wave-5 section.)
 - **After-hours design (the judge's information item):** stock types freeze outside the regular session and every gap
   is taken at the open; measured closed-market gaps Jun-Nov 2026 sit inside each type's buffer. No stricter ratio for
   new debt before long closures is built.
@@ -738,8 +743,13 @@ Bridge:
 - **The loss bound across a reopening needs the VOID SWEEP (corrected before wave 5b).** On chain a stockpile verified
   while the path was closed cannot be told from honest packets (lzReceive does not know when a packet was verified), so
   no code rule queues exactly those. The incident rule: before ANY reopening (UNPAUSE, a SET_PATH, a SET_DELAY raising
-  C), after the DVN fix has applied, the Safe voids every payload the endpoint stores for the path that no peer `Sent`
-  matches (the nonces above `lazyInboundNonce`, plus any the watcher saw verified). At the launch values (C 5,000/day,
+  C, and `SET_BRIDGE`, the launch opening), after the DVN fix has applied, the Safe compares every payload the endpoint
+  stores for the path (the nonces above `lazyInboundNonce`, plus any the watcher saw verified) with the peer's `Sent` AT
+  ITS NONCE; a payload that differs is refused PER NONCE: `voidPayload` if its hash equals no honest `Sent` at all, or
+  `hold` + RELEASE with hash 0 (a DROP) if it equals an honest `Sent` at another nonce (a replay; a void would refuse the
+  honest twin). Since wave 5b the instant meter also starts EMPTY only once the token's `bridge()` names this bridge
+  (`SET_BRIDGE` applied), and before that every inbound message queues (visible as `Queued`; its claim reverts in the
+  mint until `SET_BRIDGE`), whichever of `SET_BRIDGE` and the path comes first. At the launch values (C 5,000/day,
   D 12 h, B 50,000):
 
   | The Safe | Forged mints at most |
@@ -761,19 +771,24 @@ Bridge:
   silently: read the events (`HoldPlaced`, `ClaimCancelled`, `DelaySet`). A hold is still never renewed.
 - **The breaker window counts cancelled claims.** A cancel refunds nothing (like the inbound limit), so a B lowered by
   `tighten` may trip the path at once on claims the Safe has already cancelled.
-- **A void is by hash on every path and nonce.** A forged REPLAY of an honest (GUID, message) at another nonce has the
-  honest message's hash, so voiding it refuses the honest one too. The response to a replay is nonce-scoped: `hold` the
-  forged nonce, then RELEASE that nonce naming a hash nothing has (proposed within 24 h of the hold, 72 h less the 48 h
-  timelock, with the proposal slot free); the honest twin runs, the forged nonce never does
-  (`test/unit/AuditW5BridgeVoidReplay.t.sol`). The watcher must check whether a forged hash equals a waiting honest one
-  before the Safe voids. A nonce-scoped void is not built: it needs runtime room `ImdBridge` does not have.
-- **27 constant getters are internal.** To fit EIP-170, the 15 governance kind constants (SET_PATH ... SET_DELAY) and 12
+- **A void is by hash on every path and nonce; a replay is DROPPED per nonce (changed in wave 5b).** A forged REPLAY of
+  an honest (GUID, message) at another nonce has the honest message's hash, so voiding it would refuse the honest one too.
+  The response is `hold` the forged nonce, then RELEASE that nonce with payload hash 0, a DROP: only the held payload is
+  refused at that nonce, for good, and the honest peer's next message verified there runs (as a claim, since the nonce
+  was held) with no further Safe act; the honest twin at its own nonce mints at once when it fits. The RELEASE must be
+  proposed within 24 h of the hold (72 h less the 48 h timelock) with the proposal slot free; if the hold ends first the
+  replay runs as a claim, to be cancelled within D (`test/unit/AuditW5BridgeVoidReplay.t.sol`). RELEASE(0) is a new
+  meaning of RELEASE: the watcher and the Safe's procedure must use it for a replay. (Before wave 5b the procedure was a
+  RELEASE to a junk hash, which bound the nonce to the junk and left the next honest message there waiting for another
+  48 h RELEASE.)
+- **31 constant getters are internal.** To fit EIP-170, the 15 governance kind constants (SET_PATH ... SET_DELAY) and 16
   other constants nothing outside reads (MIN_WINDOW, MAX_WINDOW, MIN_AMOUNT, MAX_RECEIVE_GRACE, SHARED_DECIMALS,
   MAX_FEE_BPS, MIN_CONFIRMATIONS_FROM_ETHEREUM, ETHEREUM_EID, INSTANT_WINDOW, BREAKER_DAYS, CONVERSION,
-  MIN_CONFIRMATIONS_FROM_OTHER) have no public getter; integrations use the literal kinds (1-15, listed in the NatSpec).
-  `sharedDecimals()` still answers. Enforced `lzReceive` gas stays 250,000 (worst measured 194,511 under Solar, 198,284
-  under solc since wave 5b's queue rule, was 192,299; about 655,000-659,000 at the published Glamsterdam prices, so the
-  Safe raises it before that fork).
+  MIN_CONFIRMATIONS_FROM_OTHER, and since wave 5b HOLD_TIME, MIN_DELAY, MAX_DELAY, MAX_LIMIT) have no public getter (the
+  token check `_accepted` is the bridge's only inline assembly); integrations use the literal kinds (1-15, listed in the NatSpec).
+  `sharedDecimals()` still answers. Enforced `lzReceive` gas stays 250,000 (worst measured under solc 198,721 since wave
+  5b, was 192,299; the first message after `SET_BRIDGE`, which reads `bridge()`, starts the meter and queues, 157,537;
+  about 659,621 at the published Glamsterdam prices, so the Safe raises it before that fork).
 
 Stock tokens:
 - **Dead shares.** The first deposit into a never-used `StockVault` mints `DEAD_SHARES` (10^12, 10^6 wei of stock at the
@@ -795,14 +810,40 @@ Stock tokens:
   `StockVault` nothing but a reissue or a forfeit moves the rate (true since wave 5b's restart fix; before it, a 1 wei
   restart of an emptied vault also moved it), so the growth cap protected nothing and withheld a
   forfeited reissue from the holders who stayed. A deploy-config choice, not a contract change.
-- **Every stock type's max age is 5 days (since wave 5b; was SGOV only, the other 8 at 25 h).** Measured on 4663 over
-  108 sessions (2026-06-22..11-20): no feed prints Saturday or Sunday daytime (weekend gaps 74-81 h); with one print
-  missed the worst in-session age was SPY 100.7 h and AAPL 70.4 h, so at 25 h a quiet ticker was unpriced all Monday
-  after a missed Sunday heartbeat. `STOCK_MAX_AGE` 5 days covers Thursday 20:00 -> Tuesday 16:00 New York (116 h: a
-  weekend plus a Monday holiday with its heartbeat missed). TRADE-OFF: max age only detects a DEAD feed (a live one is
-  held within 0.5% by its deviation trigger), and a dead feed now prices up to 5 days on every ticker; on a volatile one
-  (MSTR, CRCL, TSLA) a dead feed could miss a move beyond the mat's buffer. The operator alerts on any feed silent past
-  25 h in session. `CL_MAX_AGE` (25 h) stays for the non-stock feeds (the peg quote feed and the other Chainlink nodes).
+- **Every stock type's max age is 6 days (since wave 5b; was SGOV only, the other 8 at 25 h).** Measured on 4663: the
+  price feeds' heartbeat is a 24 h timer that fires only inside Robinhood's 24/5 session (20:00 New York on the eve of a
+  trading day to 20:00 on it), plus a print when that session opens, never over a weekend or holiday, so a quiet
+  ticker's standing answer before a closure is at worst the eve's 20:00 print (deviation prints only shorten ages). A
+  calendar walk of that schedule over the config calendar 2026-11-20..2027-12-31 gives a worst in-session age with one
+  heartbeat missed of 115.9 h (Mon 2026-12-28 15:55, priced from Wed 12-23 20:00: the Monday after the Christmas Friday;
+  New Year, Good Friday, July 5 and Labor Day 2027 have the same shape); measured 2026-06-21..11-20: SGOV 115.9 h, SPY
+  100.7 h, AAPL 70.4 h. At 25 h a quiet ticker was unpriced all Monday after a missed Sunday heartbeat. `STOCK_MAX_AGE`
+  6 days (144 h) clears the one-missed worst by 28 h, more than a heartbeat; two missed (139.9 h) still price. TRADE-OFF:
+  max age only detects a DEAD feed (a live one is held within 0.5% by its deviation trigger), and a dead feed prices up
+  to 6 days on every ticker. Max age is therefore not the dead-feed control: the keeper's per-ticker calendar-time
+  silence alert (critical well before 6 days) is; on a volatile ticker (MSTR, CRCL, TSLA) an unalerted dead feed could
+  miss a move beyond the mat's buffer. `CL_MAX_AGE` (25 h) stays for the non-stock feeds (the peg quote feed and the
+  other Chainlink nodes).
+
+### What changed since the seventh commit (0a471c8)
+
+For the re-check: the eighth commit of this repository is the whole delta, from a second review before wave 5b. Bridge:
+`SET_BRIDGE` is a reopening too. A path's instant meter that has not started counts as EMPTY, and it STARTS, empty, at the
+first act or message after the token's `bridge()` names this bridge (`_accepted`, a 4-byte staticcall in assembly; a
+token without `bridge()` counts as accepted); until then every inbound message queues and its claim reverts in the mint.
+RELEASE with payload hash 0 is a DROP (`until = 2`): only the held payload is refused at that nonce, any other verified
+there runs as a claim. The void sweep is per nonce (header and `voidPayload` NatSpec). HOLD_TIME, MIN_DELAY, MAX_DELAY and
+MAX_LIMIT made internal (31 in all) for EIP-170. `BridgeBatch.s.sol`: file B2 pauses the path in the same Safe
+transaction before the path BATCH (and requires it paused in the simulation); new file B3 (`BridgeBatch.open()`) proposes
+UNPAUSE and refuses unless `SET_BRIDGE` has applied on that chain, the path is set and paused, and `LAUNCH_SWEEP_DONE=yes`.
+Stocks: `RobinhoodConfig.STOCK_MAX_AGE` 6 days for every stock type (the calendar walk above). Tests:
+`AuditW5BridgeLaunchOrder` (either order of `SET_BRIDGE` and the path, fuzzed over the gap), the rewritten
+`AuditW5BridgeVoidReplay` (the drop, and the honest peer's next message at the forged nonce), `AuditW5bStockMaxAge`
+(every holiday shape to 2027 with the reopening heartbeat missed, and maxAge over the one-missed worst by at least 24 h),
+`test/invariant/BridgeInvariants.t.sol` (the 4663 token is not the bridge's minter at the start; `setBridge` and a DROP
+are handler actions), and on the real EndpointV2 the first message after `SET_BRIDGE`
+(`test_fork_lzReceiveGasFirstMessageAfterSetBridge`); the bridge test harnesses start from a path that has run for a
+day; the dead-feed tests wait a full week. Each new property test fails on 0a471c8.
 
 ### What changed since the sixth commit (4fa4530)
 

@@ -980,17 +980,24 @@ library RobinhoodConfig {
         s.types[8].auctionFloor = 0.97e18;
         // maxAge (every type: STOCK_MAX_AGE, set in _stock). History: wave 4 (low) raised SGOV 25 h -> 49 h (heartbeat-only:
         // 3 of 114 rounds in session); wave 5 (low) SGOV -> 5 days (the weekend schedule); a review before wave 5b: the same
-        // schedule unpriced every QUIET ticker after one missed Sunday heartbeat, so all nine now share the rule.
+        // schedule unpriced every QUIET ticker after one missed Sunday heartbeat, so all nine share the rule; a review before wave 5b: 6 days
+        // (the holiday calendar to 2027, a whole heartbeat of margin).
     }
 
-    /// @notice maxAge of every stock type's MarketHoursFeed: covers the whole schedule with one missed heartbeat. Measured on
-    /// 4663 (every round of the nine feeds, 108 sessions 2026-06-22..11-20): no feed prints
-    /// Saturday or Sunday daytime (weekend gaps 74-81 h, Thursday or Friday 20:0x -> Sunday 20:00 New York; Monday 20:00
-    /// over a Monday holiday); SPY had no in-session print in 28 sessions, SGOV in all 99; the worst in-session age with one
-    /// print missed was SPY 100.7 h (Tuesday after Labor Day), AAPL 70.4 h. 5 days covers Thursday 20:00 -> Tuesday 16:00
-    /// (116 h: a weekend plus a Monday holiday with its heartbeat missed). Trade-off: maxAge only detects a DEAD feed (a live
-    /// one is held within 0.5% by its deviation trigger), and a dead feed now prices up to 5 days.
-    uint256 internal constant STOCK_MAX_AGE = 5 days;
+    /// @notice maxAge of every stock type's MarketHoursFeed: the whole NYSE schedule with one missed heartbeat, plus a whole
+    /// heartbeat of margin. Measured on 4663 (the feeds' rounds and a calendar walk of their heartbeat schedule):
+    /// the heartbeat is a 24 h timer that fires only inside Robinhood's 24/5 session (20:00 New York on the eve of a trading
+    /// day to 20:00 on it) plus a print at its open; none over a weekend or holiday (SGOV: Thu 07-02 -> Sun 07-05 over July
+    /// 3, Thu 09-03 -> Mon 09-07 20:00 over Labor Day). So a QUIET ticker's standing answer before a closure is at worst the
+    /// eve's 20:00 print. Worst in-session age with one print missed, over this calendar 2026-11-20..2027-12-31: 115.9 h
+    /// (Mon 2026-12-28 15:55 from Wed 12-23 20:00: Christmas Friday; the same shape at New Year, Good Friday, July 5 and
+    /// Labor Day 2027); measured 06-21..11-20: SGOV 115.9 h (Tuesday after Labor Day), SPY 100.7 h, AAPL 70.4 h, the
+    /// others under 24 h (they print in session). Two missed: 139.9 h. 6 days = 144 h: 28 h over the one-missed worst (more
+    /// than a heartbeat: a late or shifted DON schedule is not a few hours of slack), and two missed still price. One value
+    /// for all nine: every ticker can have a quiet day. Trade-off: maxAge only detects a DEAD feed (a live one is held
+    /// within 0.5% by its deviation trigger); a dead feed prices up to 6 days, so the keeper's per-ticker calendar-time
+    /// silence alert (critical well before maxAge) is what catches one.
+    uint256 internal constant STOCK_MAX_AGE = 6 days;
     /// @notice RateFeed.UNCAPPED: the stock types' RateFeeds follow the vault's live rate.
     uint256 internal constant RATE_UNCAPPED = type(uint256).max;
 

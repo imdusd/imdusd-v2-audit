@@ -283,6 +283,9 @@ contract BridgeInvariantsTest is TwoChains {
 }
 
 import {W4Bridge, W4Tok} from "../utils/W4Bridge.sol";
+import {GatedTok} from "../utils/W5Bridge.sol";
+import {IMintableBurnable} from "../../src/bridge/ImdBridge.sol";
+import {ILayerZeroEndpointV2} from "layerzero-v2/protocol/interfaces/ILayerZeroEndpointV2.sol";
 import {MockMessageLib} from "../utils/MockLzEndpoint.sol";
 
 /// @notice Wave 4 (audit 34e546c2) attack handler: honest sends, forged packets (zero, dust, normal, overwriting a waiting
@@ -323,6 +326,7 @@ contract BridgeAttackHandler is Test {
     mapping(uint64 => uint256) public ghostHoldAt; // nonce -> when its hold was placed (0 = never)
     mapping(uint64 => bytes32) public ghostHoldHash; // the hash it binds (after a RELEASE, the released one)
     mapping(uint64 => bool) public ghostReleased;
+    mapping(uint64 => bool) public ghostDropped; // a review before wave 5b: RELEASE with hash 0
     uint64[] internal heldNonces;
 
     // inbound delay
@@ -448,6 +452,16 @@ contract BridgeAttackHandler is Test {
         _probe();
     }
 
+    /// Since a review before wave 5b: SET_BRIDGE applies on this chain (the token makes the bridge its minter), at any point of the run.
+    bool public minterSet;
+
+    function setBridge() external {
+        if (minterSet) return;
+        GatedTok(address(rhTok)).setBridge(address(rh));
+        minterSet = true;
+        _probe();
+    }
+
     function deliverLatest() external {
         uint256 n = homeEp.packetCount();
         if (n != 0) this.deliver(n - 1);
@@ -471,7 +485,9 @@ contract BridgeAttackHandler is Test {
         ok_deliver++;
         _afterExecute(idx, nonce, amount, q0, b0);
         _checkUnblocked(idx, rhTok.totalSupply() - b0);
-        if (ghostHoldAt[nonce] != 0) {
+        if (ghostDropped[nonce]) {
+            if (h == ghostHoldHash[nonce]) heldExecuted++; // a review before wave 5b: a dropped payload never runs at its nonce
+        } else if (ghostHoldAt[nonce] != 0) {
             bool early = !ghostReleased[nonce] && vm.getBlockTimestamp() < ghostHoldAt[nonce] + T;
             if (early || h != ghostHoldHash[nonce]) heldExecuted++;
         }
@@ -506,7 +522,7 @@ contract BridgeAttackHandler is Test {
         bytes32 k = claimKeys[i % claimKeys.length];
         uint8 st = ghostClaimState[k];
         (,, bool tripped,,,,) = rh.breakers(HOME);
-        bool due = st == 1 && vm.getBlockTimestamp() >= ghostClaimAt[k] && !rh.paused(HOME) && !tripped;
+        bool due = st == 1 && vm.getBlockTimestamp() >= ghostClaimAt[k] && !rh.paused(HOME) && !tripped && minterSet;
         vm.prank(address(uint160(bound(who, 1, type(uint160).max))));
         try rh.claim(HOME, k) {
             ok_claim++;
@@ -620,7 +636,7 @@ contract BridgeAttackHandler is Test {
         if (forged[idx] || homeEp.isDelivered(idx)) return;
         (,, bytes32 sender, uint64 nonce,,,,) = homeEp.packets(idx);
         bytes32 h = homeEp.payloadHashOf(idx);
-        if (ghostHoldAt[nonce] == 0 || ghostReleased[nonce] || ghostHoldHash[nonce] != h) return;
+        if (ghostHoldAt[nonce] == 0 || ghostReleased[nonce] || ghostDropped[nonce] || ghostHoldHash[nonce] != h) return;
         if (vm.getBlockTimestamp() < ghostHoldAt[nonce] + T) return;
         if (rh.paused(HOME) || rh.voided(h) || rhEp.inboundPayloadHash(address(rh), HOME, sender, nonce) != h) return;
         if (!rh.configured(rh.receiveLibrary(HOME), HOME)) return;
@@ -718,7 +734,7 @@ contract BridgeAttackHandler is Test {
     /// paused path), 13 SET_PATH reopening it (a review of the wave-5 fixes), 14 SET_PATH shortening the inbound window to 1 h, 15 back to
     /// 1 day (a review before wave 5b); 6 UNVOIDs the last voided payload, forged or honest (a review before wave 5b)
     function govern(uint256 what) external {
-        what %= 16;
+        what %= 17;
         bytes32 unc;
         uint64 relNonce;
         bytes memory p;
@@ -770,7 +786,8 @@ contract BridgeAttackHandler is Test {
         } else {
             if (heldNonces.length == 0) return;
             relNonce = heldNonces[heldNonces.length - 1];
-            p = abi.encode(uint8(12), HOME, _b32(address(t.homeAddr())), relNonce, ghostHoldHash[relNonce]);
+            // 7 RELEASE of the held hash; 16 (a review before wave 5b) a DROP (hash 0): the held payload never runs at that nonce
+            p = abi.encode(uint8(12), HOME, _b32(address(t.homeAddr())), relNonce, what == 16 ? bytes32(0) : ghostHoldHash[relNonce]);
         }
         vm.prank(safe);
         try rh.propose(p) {}
@@ -790,8 +807,10 @@ contract BridgeAttackHandler is Test {
             }
             if (what == 7) {
                 ghostReleased[relNonce] = true;
+                ghostDropped[relNonce] = false; // a later RELEASE names what runs there (a timelocked Safe decision)
                 ok_release++;
             }
+            if (what == 16) ghostDropped[relNonce] = true;
             if (what == 8) {
                 ghostClaimState[unc] = 1;
                 ghostQueued += ghostClaimAmount[unc];
@@ -827,6 +846,11 @@ contract BridgeAttackInvariantsTest is W4Bridge {
 
     function setUp() public {
         _setUpW4();
+        // a review before wave 5b: the 4663 side's token is NOT the bridge's minter at the start: SET_BRIDGE is a handler action (any time),
+        // so the launch route (path open before SET_BRIDGE) is under the invariants
+        GatedTok g = new GatedTok();
+        rhTok = W4Tok(address(g));
+        rh = new ImdBridge(ILayerZeroEndpointV2(address(rhEp)), IMintableBurnable(address(g)), safe, makeAddr("rhTreasury"));
         _openBoth(LIM);
         handler = new BridgeAttackHandler(this, homeEp, rhEp, rh, rhTok, rhRecvLib, LIM);
         targetContract(address(handler));
@@ -955,6 +979,15 @@ contract BridgeAttackInvariantsTest is W4Bridge {
         assertEq(handler.acceptedNotApplied(), 0, "an accepted proposal reverted at application");
     }
 
+    /// @dev Since a review before wave 5b: SET_BRIDGE applied, the meter started (by a bare SET_PATH, which starts it empty once the token accepts)
+    /// and a day passed: the steady state the directed sequences below start from.
+    function _launched() internal {
+        handler.setBridge();
+        handler.govern(0);
+        handler.passTime(24 hours);
+        assertEq(rh.availableInstant(HOME), rh.DEFAULT_INSTANT_CAP());
+    }
+
     /// Non-hollow: one sequence through the main paths.
     function test_attackHandlerActionsSucceed() public {
         handler.send(100e18);
@@ -981,6 +1014,7 @@ contract BridgeAttackInvariantsTest is W4Bridge {
     /// honest C mints at once and uses the allowance; the next honest transfer queues, is refused early, then claimed by a
     /// stranger after D; a forgery above C queues and is cancelled, refused after D, restored by UNCANCEL and claimed.
     function test_delayHandlerActionsSucceed() public {
+        _launched();
         uint256 c = rh.DEFAULT_INSTANT_CAP();
         handler.send(c); // packet 0, nonce 1
         handler.deliver(0); // minted at once: the whole allowance
@@ -1013,6 +1047,7 @@ contract BridgeAttackInvariantsTest is W4Bridge {
     /// refused (not lost: not due while tripped); RESET_BREAKER of the current trip releases it and the claim runs; the Safe
     /// trips it again by hand; a reset naming the earlier trip is refused.
     function test_breakerHandlerActionsSucceed() public {
+        _launched();
         handler.forge(2, 30_000e18, 0); // packet 0: above the instant cap, queued (claim 0)
         handler.deliver(0);
         handler.passTime(1 days); // the limit refills; the same 4-day breaker window

@@ -277,7 +277,15 @@ contract BridgeTest is TwoChains {
         home.params.applyPending();
         deal(address(home.usd), alice, 1_000e18, true);
         _send(home.bridge, RH_EID, alice, 1_000e18);
-        assertFalse(homeEp.deliver(0), "rh token refuses a mint from a non-minter");
+        // a review before wave 5b: before SET_BRIDGE the path's instant allowance has not started, so the delivery QUEUES (visible, waits
+        // D) instead of reverting in the mint; its claim cannot mint until SET_BRIDGE
+        assertTrue(homeEp.deliver(0), "queued");
+        assertEq(rh.bridge.queued(), 1_000e18);
+        assertEq(rh.usd.balanceOf(alice), 0);
+        _warp(rh.bridge.DEFAULT_DELAY());
+        bytes32 k = _claimKey(homeEp, 0);
+        vm.expectRevert();
+        rh.bridge.claim(HOME_EID, k);
     }
 
     // ------------------------------------------------------------ chain line

@@ -181,6 +181,8 @@ contract AuditW4BridgeEndpointForkTest is Test {
         items[3] = _sendCfg(opt);
         items[4] = _recvCfg(address(RECV_ULN), 0xC000, opt);
         _govern(_batch(items));
+        // a review before wave 5b: the instant allowance starts EMPTY at the path's opening (token accepted); start from a day later (full)
+        vm.warp(vm.getBlockTimestamp() + 1 days);
     }
 
     function _header(uint64 n) internal view returns (bytes memory) {
@@ -414,7 +416,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         assertTrue(_exec(p2), "nonce 2 blocked by a held nonce 1");
         assertEq(EP.lazyInboundNonce(address(bridge), RH, peer), 2);
         assertEq(_stored(1), p1.hash, "nonce 1 still stored below lazy");
-        vm.warp(vm.getBlockTimestamp() + bridge.HOLD_TIME());
+        vm.warp(vm.getBlockTimestamp() + uint256(72 hours));
         assertTrue(_exec(p1), "the held nonce below lazy did not run");
         _claimLater(1); // a review before wave 5b: a held payload queues
         assertEq(tok.balanceOf(alice), 300e18);
@@ -460,7 +462,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         _verify(h, _dvns(0xC000), 20);
         vm.prank(safe);
         bridge.hold(RH, 1);
-        vm.warp(vm.getBlockTimestamp() + bridge.HOLD_TIME() - 1);
+        vm.warp(vm.getBlockTimestamp() + uint256(72 hours) - 1);
         assertFalse(_exec(h), "ran inside the hold");
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(makeAddr("stranger"));
@@ -512,7 +514,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         _verify(h, _dvns(0xC000), 20);
         vm.prank(safe);
         bridge.hold(RH, 1);
-        vm.warp(vm.getBlockTimestamp() + bridge.HOLD_TIME());
+        vm.warp(vm.getBlockTimestamp() + uint256(72 hours));
         uint256 g = gasleft();
         assertTrue(_exec(h));
         g -= gasleft();
@@ -566,6 +568,28 @@ contract AuditW4BridgeEndpointForkTest is Test {
         return g + d.created * 87_920 + d.updated * 7_100;
     }
 
+    /// Since a review before wave 5b: the launch-day path. The path opens before SET_BRIDGE (its meter not started); the FIRST message after
+    /// SET_BRIDGE reads the token's bridge() (cold), starts the meter empty and queues. Under the enforced option, and
+    /// nothing mints at once.
+    function test_fork_lzReceiveGasFirstMessageAfterSetBridge() public {
+        address tr = makeAddr("treasury");
+        ForkSetter fs = new ForkSetter(safe, tr);
+        ImdUSD u = new ImdUSD(address(this), 0);
+        u.wire(address(fs), address(fs), address(fs));
+        bridge = new ImdBridge(ILayerZeroEndpointV2(address(EP)), IMintableBurnable(address(u)), safe, tr);
+        _launch(); // the path first, then SET_BRIDGE a day later (the reviewer's order)
+        fs.setBridge(u, address(bridge));
+        Pkt memory p = _pkt(1, alice, 100e18);
+        _verify(p, _dvns(0xC000), 20);
+        uint256 g = gasleft();
+        assertTrue(_exec(p));
+        g -= gasleft();
+        console2.log("endpoint.lzReceive gas, first message after SET_BRIDGE (starts the meter, queues):", g);
+        assertLt(g, RobinhoodConfig.LZ_RECEIVE_GAS);
+        assertEq(u.balanceOf(alice), 0, "minted at once at the first message after SET_BRIDGE");
+        assertEq(bridge.queued(), 100e18);
+    }
+
     function _measure(string memory what, uint256 preSupply, bool hold, uint256 sinceBucket, bool steady)
         internal
         returns (uint256 g, uint256 glam)
@@ -586,7 +610,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         if (hold) {
             vm.prank(safe);
             bridge.hold(RH, n);
-            vm.warp(vm.getBlockTimestamp() + bridge.HOLD_TIME());
+            vm.warp(vm.getBlockTimestamp() + uint256(72 hours));
         }
         vm.warp(vm.getBlockTimestamp() + sinceBucket); // past the fee base's bucket: the low-water slot rolls
         vm.startStateDiffRecording();

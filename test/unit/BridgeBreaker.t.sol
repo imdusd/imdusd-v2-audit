@@ -78,7 +78,7 @@ contract BridgeBreakerTest is W4Bridge {
         // 10,000 -> 50,000 so whales' large transfers flow; the no-action 72 h bound is then
         // 4C + 50,000 = 70,000 > the 4663 line (30,000), accepted: the line holds when the Safe acts within DELAY
         assertEq(B, 50_000e18, "50,000 (whales; Safe within DELAY holds the line)");
-        assertLe(rh.HOLD_TIME(), (uint256(4) - 1) * 1 days, "a HOLD_TIME span of queue times fits the window");
+        assertLe(uint256(72 hours), (uint256(4) - 1) * 1 days, "a HOLD_TIME span of queue times fits the window");
     }
 
     /// Exactly QUEUE_BREAKER queued does not trip (normal use below it is unchanged); one unit more does, by the bridge.

@@ -467,9 +467,15 @@ contract RobinhoodMainnetLzTest is RobinhoodFork {
         m.bridge.propose(batch);
         vm.warp(vm.getBlockTimestamp() + 48 hours);
         m.bridge.applyPending();
+        // a review before wave 5b: a path's instant allowance starts EMPTY once it can first mint (SET_BRIDGE applied, path set) and
+        // refills over a day; the round trip below runs on paths open a day (the launch day itself: AuditW5BridgeLaunchOrder)
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        assertEq(m.bridge.availableInstant(RobinhoodConfig.EID), RobinhoodConfig.INSTANT_CAP, "mainnet: full allowance");
         // 4663's Safe
         vm.selectFork(rhFork);
         _openBridge(RobinhoodConfig.MAINNET_EID, _b32(address(m.bridge)), RobinhoodConfig.OUT_LIMIT, RobinhoodConfig.IN_LIMIT);
+        _keepAlive(1 days); // the same on 4663 (feeds kept fresh)
+        assertEq(d.bridge.availableInstant(RobinhoodConfig.MAINNET_EID), RobinhoodConfig.INSTANT_CAP, "4663: full allowance");
         deal(RobinhoodConfig.WETH, alice, 100e18);
         _approve(RobinhoodConfig.WETH);
         vm.deal(alice, 1 ether);

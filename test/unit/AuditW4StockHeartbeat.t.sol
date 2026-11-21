@@ -42,13 +42,13 @@ contract AuditW4StockHeartbeatTest is Test {
         assertFalse(feed.isStale(), "a live heartbeat-only feed that missed one heartbeat is unpriced all session");
     }
 
-    /// A dead feed reads stale. Wave 5 (AuditW5StockSgovWeekend): SGOV's maxAge is 5 days so one heartbeat missed after a
-    /// weekend (plus a Monday holiday) still prices; two missed weekday heartbeats now price too, a feed silent past 5 days
+    /// A dead feed reads stale. Wave 5 (AuditW5StockSgovWeekend): every stock type's maxAge is 6 days (STOCK_MAX_AGE) so one heartbeat missed after a
+    /// weekend (plus a Monday holiday) still prices; two missed weekday heartbeats now price too, a feed silent past 6 days
     /// reads stale.
     function test_deadFeedIsStale() public {
         MarketHoursFeed feed = new MarketHoursFeed(address(agg), address(stock), address(0xCAFE), cal, _sgovMaxAge());
         agg.set(100e8, wed - 1 days - 3 hours); // Mon 20:00 New York; nothing after
-        vm.warp(wed + 5 days + 14 hours + 35 minutes); // the next Monday 09:35
+        vm.warp(wed + 6 days + 14 hours + 35 minutes); // the next Tuesday 09:35 (past STOCK_MAX_AGE, 6 days)
         assertTrue(feed.isStale(), "a week silent: a dead feed");
     }
 }

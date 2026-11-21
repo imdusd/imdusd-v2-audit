@@ -37,12 +37,12 @@ contract AuditW4BridgeInLimitLineTest is W4Bridge {
         assertEq(safeActs, 7_500e18, "5,000 + 2,500 instant within D");
         assertLe(safeActs, RobinhoodConfig.CHAIN_LINE, "a forgery the Safe cancels within D spends past the line");
         // the Safe's window is shorter than the weekend: the breaker is the backstop for a slower Safe
-        assertLt(D, rh.HOLD_TIME());
+        assertLt(D, uint256(72 hours));
     }
 
     /// (b) the no-action 72 h figure at the launch values, recorded: it EXCEEDS the 4663 line by decision.
     function test_noActionWeekendFigureRecorded() public view {
-        uint256 instant = C + C * rh.HOLD_TIME() / (1 days);
+        uint256 instant = C + C * uint256(72 hours) / (1 days);
         assertEq(instant, 4 * C, "the instant part over 72 h is 4C");
         uint256 noAction = instant + B;
         assertEq(noAction, 70_000e18, "20,000 instant + 50,000 through claims");
@@ -51,6 +51,6 @@ contract AuditW4BridgeInLimitLineTest is W4Bridge {
 
     /// (c) the breaker window covers any HOLD_TIME span of queue times, or the breaker bounds less than 72 h.
     function test_breakerWindowCoversTheWeekend() public view {
-        assertLe(rh.HOLD_TIME(), (uint256(4) - 1) * 1 days, "breaker window shorter than the weekend");
+        assertLe(uint256(72 hours), (uint256(4) - 1) * 1 days, "breaker window shorter than the weekend");
     }
 }

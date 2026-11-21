@@ -17,17 +17,28 @@ import {SafeBatch} from "./SafeBatch.s.sol";
 ///       + the executor config + the ULN config on each library: 3 REQUIRED DVNs (LayerZero Labs, Twinstake, P2P, sorted),
 ///       optional = NIL, 15 confirmations from mainnet / 20 from 4663. Needs LAUNCH_PEER_BRIDGE (the other record's bridge).
 ///       Reversible: until SET_BRIDGE the bridge mints nothing, and the Safe can pause the path at once.
+///       SINCE A REVIEW BEFORE WAVE 5B: the file PAUSES the path first (instant, the same Safe transaction), so the
+///       path is created closed and stays closed until file B3; packets verified meanwhile wait at the endpoint.
 ///
 ///   forge script script/launch/BridgeBatch.s.sol:BridgeBatch<Beta|Robinhood> --sig "setBridge()" --rpc-url <rpc>
 ///       (launch.sh setbridge)  file B1: Parameters.propose(SET_BRIDGE, ImdBridge). ImdUSD.setBridge works ONCE
 ///       (AlreadySet): the bridge contract becomes imdUSD's minter for good, only pausable. Refused unless
 ///       LAUNCH_WAVE5_RECHECK=clean: write it only after the wave-5 audit re-check of the bridge came back clean.
 ///
-/// Both proposals wait 48 h (Parameters' SET_BRIDGE, ImdBridge's own Governed timelock); anyone applies after. Value can
-/// cross only once all four (SET_BRIDGE x2, path x2) have applied on both chains. Files go to LAUNCH_SAFE_DIR/bridge/.
+///   forge script script/launch/BridgeBatch.s.sol:BridgeBatch<Beta|Robinhood> --sig "open()" --rpc-url <rpc>
+///       (launch.sh bridgeopen)  file B3: ImdBridge.propose(UNPAUSE). Refused unless SET_BRIDGE has APPLIED on this chain
+///       (imdUSD's bridge = this bridge), the path is set and paused, and LAUNCH_SWEEP_DONE=yes: the Safe has done the
+///       VOID SWEEP (voidPayload of every payload the endpoint stores for the path that no peer Sent matches at that
+///       nonce, ImdBridge header) after SET_BRIDGE applied. UNPAUSE restarts the instant allowance empty.
+///
+/// ORDER (a review before wave 5b): B2 (path, paused) and B1 (SET_BRIDGE) in either order, then the sweep, then B3 (48 h). The old order
+/// (the path OPEN before SET_BRIDGE) let packets verified in between run into a full allowance at SET_BRIDGE; B2 now
+/// refuses to leave the path open. All proposals wait 48 h (Parameters' SET_BRIDGE, ImdBridge's own Governed timelock);
+/// anyone applies after. Value can cross only once SET_BRIDGE x2, path x2 and UNPAUSE x2 have applied on both chains.
+/// Files go to LAUNCH_SAFE_DIR/bridge/.
 abstract contract BridgeBatch is SafeBatch {
     function run() external pure override {
-        revert("BridgeBatch: call path() or setBridge() (two separate steps)");
+        revert("BridgeBatch: call path(), setBridge() or open() (separate steps, 1207-LAUNCH)");
     }
 
     /// @notice The path's enforced options: the ONE source is RobinhoodConfig.enforcedOptions() (lzReceive gas LZ_RECEIVE_GAS =
@@ -65,8 +76,9 @@ abstract contract BridgeBatch is SafeBatch {
         bytes32 peer32 = bytes32(uint256(uint160(peer)));
         bytes memory payload = _pathBatch(peer32);
         uint256 at = vm.getBlockTimestamp();
-        Tx[] memory t = new Tx[](1);
-        t[0] = Tx(address(b), abi.encodeWithSignature("propose(bytes)", payload));
+        Tx[] memory t = new Tx[](2);
+        t[0] = Tx(address(b), abi.encodeWithSignature("pause(uint32)", eid)); // a review before wave 5b: created closed, opened by file B3
+        t[1] = Tx(address(b), abi.encodeWithSignature("propose(bytes)", payload));
         _exec(config().governor, t);
         _applyBridge(b);
         require(b.peers(eid) == peer32, "simulated: peer");
@@ -74,7 +86,7 @@ abstract contract BridgeBatch is SafeBatch {
         require(b.configured(b.sendLibrary(eid), eid) && b.configured(b.receiveLibrary(eid), eid), "simulated: ULN configs set");
         require(keccak256(b.enforcedOptions(eid)) == keccak256(enforcedOptions()), "simulated: enforced options");
         require(b.availableOut(eid) != 0 && b.availableIn(eid) != 0, "simulated: limits");
-        require(!b.paused(eid), "simulated: path open");
+        require(b.paused(eid), "simulated: path paused until SET_BRIDGE, the void sweep and file B3");
         require(_delayIs(b, eid), "simulated: delay settings (instant cap, claim delay, queue breaker)");
         _write(
             dir,
@@ -86,7 +98,8 @@ abstract contract BridgeBatch is SafeBatch {
                 "; SET_DELAY instant cap ", vm.toString(RobinhoodConfig.INSTANT_CAP / 1e18), " imdUSD/day, claim delay ",
                 vm.toString(RobinhoodConfig.CLAIM_DELAY / 1 hours), " h, queue breaker ", vm.toString(RobinhoodConfig.QUEUE_BREAKER / 1e18),
                 " imdUSD over 4 UTC days; pin send + receive ULN302; executor + ULN config, 3 required DVNs, optional NIL). ",
-                "Anyone calls ImdBridge.applyPending() 48 h after it executes. Mints nothing until SET_BRIDGE (file B1) applies."
+                "Pauses the path first: it stays CLOSED until file B3 (after SET_BRIDGE and the void sweep). ",
+                "Anyone calls ImdBridge.applyPending() 48 h after it executes."
             ),
             config().governor,
             t
@@ -138,6 +151,36 @@ abstract contract BridgeBatch is SafeBatch {
                 "). ImdUSD.setBridge works once: this bridge becomes imdUSD's minter for good (pausable, never replaceable). ",
                 "Written only after the wave-5 audit re-check was declared clean. Anyone calls Parameters.applyPending() 48 h after it executes."
             ),
+            config().governor,
+            t
+        );
+    }
+
+    /// @notice File B3, UNPAUSE of the path (a review before wave 5b): only after SET_BRIDGE has applied here and the Safe swept.
+    function open() external {
+        (Deployed memory d, string memory dir) = _start();
+        ImdBridge b = d.bridge;
+        uint32 eid = _remoteEid();
+        require(d.usd.bridge() == address(b), "file B3: SET_BRIDGE (file B1) has not applied on this chain");
+        require(b.peers(eid) != bytes32(0) && b.paused(eid), "file B3: the path (file B2) is not set, or not paused");
+        require(
+            keccak256(bytes(vm.envOr("LAUNCH_SWEEP_DONE", string("")))) == keccak256("yes"),
+            "file B3: do the void sweep first (voidPayload of every stored payload no peer Sent matches at its nonce), then LAUNCH_SWEEP_DONE=yes"
+        );
+        if (b.pendingEta() != 0) return console2.log("file B3 not written: a proposal is pending on the bridge (apply or cancel it first)");
+        uint256 at = vm.getBlockTimestamp();
+        Tx[] memory t = new Tx[](1);
+        t[0] = Tx(address(b), abi.encodeWithSignature("propose(bytes)", abi.encode(uint8(5), eid)));
+        _exec(config().governor, t);
+        _applyBridge(b);
+        require(!b.paused(eid), "simulated: path open");
+        require(b.availableInstant(eid) == 0, "simulated: the instant allowance starts empty at the reopening");
+        _write(
+            dir,
+            3,
+            at,
+            string.concat("Open the bridge path to eid ", vm.toString(uint256(eid)), " (UNPAUSE)"),
+            "ImdBridge.propose(UNPAUSE). Only after SET_BRIDGE applied on this chain and the void sweep. The instant allowance starts empty and refills over a day. Anyone calls ImdBridge.applyPending() 48 h after it executes.",
             config().governor,
             t
         );
