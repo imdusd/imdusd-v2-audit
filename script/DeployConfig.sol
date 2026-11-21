@@ -978,19 +978,19 @@ library RobinhoodConfig {
         s.types[8].risk.chop = 0.05e18;
         s.types[8].risk.rateFloor = 0.04e18;
         s.types[8].auctionFloor = 0.97e18;
-        // Audit wave 4 (low): SGOV's feed prints only at its 20:00 New York heartbeat (3 of 114 rounds Jul-Nov 2026 inside the
-        // session), so one skipped heartbeat left a live feed unpriced a whole session at 25 h. 49 h covers one missed
-        // weekday heartbeat (Mon 20:00 -> Wed 16:00 = 44 h); two in a row still read stale. A T-bill fund moves ~0.02% a day,
-        // so a dead feed priced 24 h longer is far inside its 15% buffer. The other types keep 25 h (they print in session).
-        // Audit wave 5 (low): the feed never prints Saturday or Sunday daytime (last print Thursday or Friday 20:0x, next
-        // Sunday 20:00, Monday 20:00 over a Monday holiday), so one skipped heartbeat after a weekend left Monday unpriced at
-        // 49 h. 5 days covers Thursday 20:00 -> Tuesday 16:00 (116 h: a weekend plus a Monday holiday with its heartbeat
-        // missed). Trade-off: two missed WEEKDAY heartbeats now still price (a dead feed is caught after 5 days, ~0.1% of
-        // T-bill drift against a 15% buffer).
-        s.types[8].maxAge = SGOV_MAX_AGE;
+        // maxAge (every type: STOCK_MAX_AGE, set in _stock). History: wave 4 (low) raised SGOV 25 h -> 49 h (heartbeat-only:
+        // 3 of 114 rounds in session); wave 5 (low) SGOV -> 5 days (the weekend schedule); a review before wave 5b: the same
+        // schedule unpriced every QUIET ticker after one missed Sunday heartbeat, so all nine now share the rule.
     }
 
-    uint256 internal constant SGOV_MAX_AGE = 5 days;
+    /// @notice maxAge of every stock type's MarketHoursFeed: covers the whole schedule with one missed heartbeat. Measured on
+    /// 4663 (every round of the nine feeds, 108 sessions 2026-06-22..11-20): no feed prints
+    /// Saturday or Sunday daytime (weekend gaps 74-81 h, Thursday or Friday 20:0x -> Sunday 20:00 New York; Monday 20:00
+    /// over a Monday holiday); SPY had no in-session print in 28 sessions, SGOV in all 99; the worst in-session age with one
+    /// print missed was SPY 100.7 h (Tuesday after Labor Day), AAPL 70.4 h. 5 days covers Thursday 20:00 -> Tuesday 16:00
+    /// (116 h: a weekend plus a Monday holiday with its heartbeat missed). Trade-off: maxAge only detects a DEAD feed (a live
+    /// one is held within 0.5% by its deviation trigger), and a dead feed now prices up to 5 days.
+    uint256 internal constant STOCK_MAX_AGE = 5 days;
     /// @notice RateFeed.UNCAPPED: the stock types' RateFeeds follow the vault's live rate.
     uint256 internal constant RATE_UNCAPPED = type(uint256).max;
 
@@ -1002,7 +1002,7 @@ library RobinhoodConfig {
         t.ilk = ilk;
         t.stock = token;
         t.aggregator = agg;
-        t.maxAge = CL_MAX_AGE;
+        t.maxAge = STOCK_MAX_AGE;
         t.auctionTime = 1 hours;
         t.auctionFloor = 0.9e18;
         t.risk = _r(mat, 0.1e18, 0.05e18, 0, line);
@@ -1183,7 +1183,7 @@ library RobinhoodConfig {
     /// options set the delivery gas, and an under-funded message waits at the endpoint (retryable, but stuck until someone
     /// pays). MEASURED on the real mainnet EndpointV2 WITH THE REAL ImdUSD (test/fork/AuditW4BridgeEndpoint.t.sol
     /// test_fork_lzReceiveGasRealImdUsd; re-measured on the audited code after the instant meter + governable delay: the earlier
-    /// 155,179 / 163,815 used a two-slot stub token): a path's first message on a token's first mint 192,275; first message to
+    /// 155,179 / 163,815 used a two-slot stub token): a path's first message on a token's first mint 192,299; first message to
     /// a new holder after an expired hold 166,812; a steady path to a new holder 124,083, 132,827 after an expired hold with
     /// the fee-base bucket rolled. 250,000 covers all today.
     /// GLAMSTERDAM (EIP-8037/8038 as published, not final: a new slot 22,100 -> 110,020, an update 5,000 -> 12,100) would

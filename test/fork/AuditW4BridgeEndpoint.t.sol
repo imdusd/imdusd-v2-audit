@@ -220,6 +220,14 @@ contract AuditW4BridgeEndpointForkTest is Test {
         } catch {}
     }
 
+    /// @dev Since a review before wave 5b: a payload the Safe held or voided runs as a claim; anyone claims it after the path's delay.
+    function _claimLater(uint64 n) internal {
+        vm.warp(vm.getBlockTimestamp() + bridge.DEFAULT_DELAY());
+        bytes32 k = keccak256(abi.encodePacked(n, RH, peer, uint32(30101), bytes32(uint256(uint160(address(bridge))))));
+        vm.prank(makeAddr("anyone"));
+        bridge.claim(RH, k);
+    }
+
     function _stored(uint64 n) internal view returns (bytes32) {
         return EP.inboundPayloadHash(address(bridge), RH, peer, n);
     }
@@ -368,6 +376,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         assertFalse(_exec(h), "voided payload executed without the timelock");
         _govern(abi.encode(uint8(11), h.hash));
         assertTrue(_exec(h));
+        _claimLater(1); // a review before wave 5b: an unvoided payload queues
         assertEq(tok.balanceOf(alice), 100e18);
     }
 
@@ -407,6 +416,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         assertEq(_stored(1), p1.hash, "nonce 1 still stored below lazy");
         vm.warp(vm.getBlockTimestamp() + bridge.HOLD_TIME());
         assertTrue(_exec(p1), "the held nonce below lazy did not run");
+        _claimLater(1); // a review before wave 5b: a held payload queues
         assertEq(tok.balanceOf(alice), 300e18);
     }
 
@@ -455,6 +465,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         vm.warp(vm.getBlockTimestamp() + 1);
         vm.prank(makeAddr("stranger"));
         EP.lzReceive(Origin(RH, peer, 1), address(bridge), h.guid, h.message, "");
+        _claimLater(1); // a review before wave 5b: a held payload queues
         assertEq(tok.balanceOf(alice), 100e18);
     }
 
@@ -489,6 +500,7 @@ contract AuditW4BridgeEndpointForkTest is Test {
         assertFalse(_exec(f), "overwriting forgery ran after the hold");
         _verify(h, _dvns(0xC000), 20); // honest DVNs restore it
         assertTrue(_exec(h));
+        _claimLater(1); // a review before wave 5b: a held payload queues
         assertEq(tok.balanceOf(alice), 100e18);
         assertEq(tok.balanceOf(attacker), 0);
     }
@@ -582,7 +594,9 @@ contract AuditW4BridgeEndpointForkTest is Test {
         assertTrue(_exec(h), "lzReceive with the real ImdUSD");
         g -= gasleft();
         Diff memory d = _count(vm.stopAndReturnStateDiff());
-        assertEq(u.balanceOf(makeAddr(what)), 100e18);
+        // a review before wave 5b: after a hold the message queues (never mints at once): the worst of those paths is measured
+        if (hold) assertEq(bridge.queued(), 100e18);
+        else assertEq(u.balanceOf(makeAddr(what)), 100e18);
         glam = _glamsterdam(g, d);
         console2.log(what);
         console2.log("  gas today / slots created / updated:", g, d.created, d.updated);

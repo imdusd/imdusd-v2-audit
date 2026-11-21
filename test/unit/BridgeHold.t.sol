@@ -8,7 +8,8 @@ import {Governed} from "../../src/Governed.sol";
 /// @notice Bridge-local holds, no guardian. Properties:
 ///  H1 a forged payload under hold or void never executes;
 ///  H2 an honest message is never lost: a hold delays it at most HOLD_TIME and then anyone executes it, with no DVN or
-///     governance action, unless its payload changed or the Safe voided it;
+///     governance action, unless its payload changed or the Safe voided it (since a review before wave 5b it then runs as a claim:
+///     anyone claims it after the path's delay D; a held payload never mints at once);
 ///  H3 no instant act opens or releases anything (only delay or permanent void by the governor; RELEASE/UNVOID/UNPAUSE are
 ///     timelocked);
 ///  H4 a hold cannot be renewed past HOLD_TIME for the same nonce.
@@ -26,6 +27,14 @@ contract BridgeHoldTest is W4Bridge {
         (n,) = _origin(i);
         vm.prank(safe);
         rh.hold(HOME, n);
+    }
+
+    /// @dev Since a review before wave 5b: a payload the Safe held runs as a claim (never at once); anyone claims it after the path's delay.
+    function _claimLater(uint256 i) internal {
+        vm.warp(vm.getBlockTimestamp() + rh.DEFAULT_DELAY());
+        bytes32 k = _claimKey(homeEp, i);
+        vm.prank(makeAddr("anyone"));
+        rh.claim(HOME, k);
     }
 
     function _release(uint256 i, bytes32 h) internal {
@@ -60,6 +69,7 @@ contract BridgeHoldTest is W4Bridge {
         // H2: honest DVNs verify the held payload back: it runs, nobody else needed
         assertTrue(homeEp.reverify(h));
         assertTrue(homeEp.deliver(h));
+        _claimLater(h);
         assertEq(rhTok.balanceOf(alice), 100e18);
     }
 
@@ -75,6 +85,7 @@ contract BridgeHoldTest is W4Bridge {
         vm.warp(placed + T + dt);
         vm.prank(anyone);
         assertTrue(homeEp.deliver(h), "not executable at HOLD_TIME");
+        _claimLater(h); // a review before wave 5b: a held payload queues when it runs
         assertEq(rhTok.balanceOf(alice), 100e18);
     }
 
@@ -87,6 +98,7 @@ contract BridgeHoldTest is W4Bridge {
         assertGt(rhEp.lazyInboundNonce(address(rh), HOME, _b32(address(home))), n1);
         vm.warp(vm.getBlockTimestamp() + T);
         assertTrue(homeEp.deliver(h1), "the held nonce below lazy did not run");
+        _claimLater(h1); // a review before wave 5b: a held payload queues when it runs
         assertEq(rhTok.balanceOf(alice), 300e18);
     }
 

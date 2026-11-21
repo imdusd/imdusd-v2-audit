@@ -57,10 +57,12 @@ contract AuditW5BridgeReopenRoutesTest is W5Bridge {
         assertEq(rhTok.balanceOf(attacker), 0, "a stockpile minted at once at a peer restore");
     }
 
-    /// A SET_PATH that changes neither the peer nor raises the inbound limit (here: the outbound limit) keeps the honest
-    /// instant allowance.
-    function test_unrelatedSetPathKeepsTheAllowance() public {
+    /// Since a review before wave 5b (the class): ANY SET_PATH on a set path restarts the allowance empty (here one that changes only the outbound
+    /// limit), since any of its fields can unblock packets; it refills at C per day.
+    function test_anySetPathRestartsTheAllowance() public {
         _governRh(_path(HOME, _b32(address(home)), LIM / 2, LIM));
+        assertEq(rh.availableInstant(HOME), 0);
+        _warp(1 days);
         assertEq(rh.availableInstant(HOME), C);
     }
 

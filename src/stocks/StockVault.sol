@@ -37,7 +37,11 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 /// opening rate) to `DEAD`, paid by that depositor (it receives 10^12 fewer shares, or pays 10^6 wei more for a mint). The
 /// supply never falls below `DEAD_SHARES` again, so no single deposit, mint, withdraw or redeem moves the rate by more than
 /// about 1 wei over the >= 10^6 wei the dead shares stand for. A vault whose only shares are the dead ones is EMPTY in every
-/// rule above (never impaired; the next deposit restarts `managedAssets` at the opening rate and mints no more dead shares).
+/// rule above (never impaired; the next deposit restarts `managedAssets` and, like the first, pays for the dead shares again
+/// (a review before wave 5b): the reset leaves them standing for no stock, and a restart priced at the bare opening rate
+/// against them (a 1 wei restart) pinned the rate at 10^-6 of the opening rate for every later depositor. So an emptied
+/// vault restarts exactly like a never-used one (same shares, same rate; a restart under 10^6 wei + 1 reverts NoShares),
+/// minting no more dead shares).
 /// Cost: the dead shares are a holder like any other, so they keep DEAD_SHARES / supply of a reissue forfeited to the
 /// stayers (10^-14 at 100 tokens; a real share of it only when the stayers are themselves dust) and ~10^6 wei of a restart.
 contract StockVault is ERC4626 {
@@ -110,22 +114,18 @@ contract StockVault is ERC4626 {
         return impaired() ? 0 : type(uint256).max;
     }
 
-    /// @notice Into a never-used vault: the opening rate less the `DEAD_SHARES` the deposit also pays for; into an empty one
-    /// (dead shares only): the opening rate.
+    /// @notice Into a never-used or emptied (dead shares only) vault: the opening rate less the `DEAD_SHARES` the deposit
+    /// also pays for (minted to DEAD on first use; re-backed on a restart).
     function previewDeposit(uint256 assets) public view override returns (uint256) {
-        uint256 supply = totalSupply();
-        if (supply > DEAD_SHARES) return super.previewDeposit(assets);
+        if (totalSupply() > DEAD_SHARES) return super.previewDeposit(assets);
         uint256 shares = assets * 10 ** _decimalsOffset();
-        if (supply != 0) return shares;
         return shares > DEAD_SHARES ? shares - DEAD_SHARES : 0;
     }
 
-    /// @notice Into a never-used vault: the opening rate for `shares` plus the `DEAD_SHARES`, rounded up; into an empty one:
-    /// the opening rate.
+    /// @notice Into a never-used or emptied vault: the opening rate for `shares` plus the `DEAD_SHARES`, rounded up.
     function previewMint(uint256 shares) public view override returns (uint256) {
-        uint256 supply = totalSupply();
-        if (supply > DEAD_SHARES) return super.previewMint(shares);
-        return Math.ceilDiv(supply == 0 ? shares + DEAD_SHARES : shares, 10 ** _decimalsOffset());
+        if (totalSupply() > DEAD_SHARES) return super.previewMint(shares);
+        return Math.ceilDiv(shares + DEAD_SHARES, 10 ** _decimalsOffset());
     }
 
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {

@@ -110,6 +110,8 @@ contract AuditW5StockFirstMintTest is Test {
         (uint256 perShare,) = price.latestValue();
         uint256 value = shares * perShare / 1e18;
         assertApproxEqRel(value, amount * 100, 0.0001e18, "the deposit is valued at its worth ($100 a token)");
+        // a review before wave 5b: the property is the RATE, not only the value (an uncapped feed values a pinned vault right)
+        assertApproxEqRel(vault.convertToAssets(1e18), 1e12, 0.0001e18, "the share rate stays the opening rate");
     }
 
     /// The judge's first route: mint(1) into the empty vault.
@@ -138,6 +140,50 @@ contract AuditW5StockFirstMintTest is Test {
         try vault.redeem(vault.balanceOf(attacker) > 1 ? vault.balanceOf(attacker) - 1 : 0, attacker, attacker) {} catch {}
         vm.stopPrank();
         _honestDepositIsValued(100e18);
+    }
+
+    /// A review before wave 5b: an EMPTIED vault (dead shares only) restarts exactly like a never-used one. The
+    /// proof (ProofFrRestartPin): 5e18 in and out, then a 1 wei restart priced at assets x 1e6 against the 10^12 dead
+    /// shares, pinning the rate at 10^-6 of the opening rate for every later depositor. Both paths to empty: plain exits,
+    /// and a forfeited reissue left counted.
+    function test_frProof_restartPin() public {
+        vm.startPrank(attacker);
+        vault.deposit(5e18, attacker);
+        vault.redeem(vault.balanceOf(attacker), attacker, attacker);
+        try vault.deposit(1, attacker) {} catch {}
+        vm.stopPrank();
+        _honestDepositIsValued(100e18);
+    }
+
+    /// Fuzz: the same restart deposit (any size, 1 wei .. 1e24) into an emptied vault and into a never-used one: both
+    /// revert or both mint the same shares at the same rate.
+    function testFuzz_emptiedRestartsLikeNew(uint256 opening, uint256 x, bool viaMint) public {
+        opening = bound(opening, 2e6, 1e24);
+        x = bound(x, 1, 1e24);
+        StockVault fresh = new StockVault(IERC20Metadata(address(stock)));
+        vm.startPrank(attacker);
+        stock.approve(address(fresh), type(uint256).max);
+        vault.deposit(opening, attacker);
+        vault.redeem(vault.balanceOf(attacker), attacker, attacker);
+        assertEq(vault.totalSupply(), vault.DEAD_SHARES(), "emptied");
+        bool okA;
+        bool okB;
+        uint256 sA;
+        uint256 sB;
+        if (viaMint) {
+            (okA,) = address(vault).call(abi.encodeCall(vault.mint, (x, attacker)));
+            (okB,) = address(fresh).call(abi.encodeCall(fresh.mint, (x, attacker)));
+        } else {
+            (okA,) = address(vault).call(abi.encodeCall(vault.deposit, (x, attacker)));
+            (okB,) = address(fresh).call(abi.encodeCall(fresh.deposit, (x, attacker)));
+        }
+        vm.stopPrank();
+        assertEq(okA, okB, "the restart succeeds exactly when a first deposit would");
+        if (!okA) return;
+        sA = vault.balanceOf(attacker);
+        sB = fresh.balanceOf(attacker);
+        assertEq(sA, sB, "same shares");
+        assertApproxEqRel(vault.convertToAssets(1e18), fresh.convertToAssets(1e18), 1e12, "same rate (to 1e-6)");
     }
 
     /// Fuzz: any 12 small calls (mint, deposit, redeem, withdraw of up to 1e13 units) on the fresh vault, then an honest

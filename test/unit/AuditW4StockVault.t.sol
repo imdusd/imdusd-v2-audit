@@ -154,7 +154,7 @@ contract AuditW4StockVaultTest is Test {
         a = uint96(bound(a, 2e6, 1e27)); // wave 5: the opening deposit also pays the 10^6-wei dead shares
         burnBps = uint16(bound(burnBps, 1, 10_000));
         reissueBps = uint16(bound(reissueBps, 1, 10_000));
-        x = uint96(bound(x, 1, 1e27));
+        x = uint96(bound(x, 1e6 + 1, 1e27)); // a review before wave 5b: a restart pays the dead shares like a first deposit (smaller: NoShares)
         _deposit(alice, a);
         uint256 burned = uint256(a) * burnBps / 10_000;
         if (burned == 0) burned = 1;

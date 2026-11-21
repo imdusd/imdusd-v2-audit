@@ -75,9 +75,12 @@ interface IMintableBurnable {
 ///    Kelp sequence: pause; void every forged payload (both instant, one Safe signature round each); fix the DVN config
 ///    (48h); then unpause (48h, its own proposal: UNPAUSE may not share a BATCH with a path, library or config change for
 ///    that eid, so nothing verified under the old DVNs can run in the block the path reopens), without changing the peer.
-///    Before the UNPAUSE, void every payload the endpoint stores for the path above the last nonce matched to a peer
-///    `Sent` (audit wave 5: a stockpile verified but not executed outlasts the pause and the DVN fix; the reopened instant
-///    allowance starts empty, so what is missed queues and needs the Safe's answer within D again).
+///    INCIDENT RULE, THE VOID SWEEP (a review before wave 5b): before ANY reopening (UNPAUSE, a SET_PATH, a SET_DELAY raising C), and
+///    after the DVN fix has applied, `voidPayload` every payload the endpoint stores for the path that no peer `Sent`
+///    matches (the nonces above lazyInboundNonce, and any the watcher saw verified). The bridge cannot tell a stockpile
+///    verified while the path was closed from an honest packet; missed, it runs after the reopening in pieces that fit
+///    the refilling allowance: instant Received, no Queued, at most C per day. A `hold` is only a delay: the held
+///    payload queues when it runs, and that claim must be cancelled within D.
 ///
 /// LIMITS. Per path, an outbound and an inbound limit in LayerZero RateLimiter's form: the amount in flight
 /// decays linearly at limit/window, so at most `limit` passes at once and at most limit + limit x t / window in ANY interval
@@ -124,10 +127,14 @@ interface IMintableBurnable {
 /// B, lengthen D) also instantly by the governor (`tighten`), which bumps the path's settings version: a SET_DELAY
 /// names the version it was proposed against, so one proposed before a tightening is refused when applied. A claim is claimable at queuedAt + the path's D AT CLAIM TIME: a
 /// lengthening applies to claims already queued (it never shortens a wait), and a shortening, being timelocked, applies
-/// to them only after 48h. A lowered C stops instant mints at once (what was used still counts). Nothing LOOSENS the
-/// instant allowance at once (audit wave 5): after an UNPAUSE, and after a SET_DELAY raising C, the allowance restarts empty
-/// and refills at C per day, so packets verified but not executed while it was closed (a forged stockpile) queue when they
-/// run. `tighten` never reverts on a set path (audit wave 5): each field lands at the tighter of its argument and what stands,
+/// to them only after 48h. A lowered C stops instant mints at once (what was used still counts). NOTHING THAT UNBLOCKS A
+/// PACKET FREES INSTANT ROOM (audit wave 5; a review before wave 5b: the class, by lzReceive's revert reasons): every path-level block is
+/// lifted only by a timelocked path act, and each of them restarts the allowance EMPTY (refilling at C per day): UNPAUSE
+/// (PathPaused), ANY SET_PATH on a set path (OnlyPeer; RateLimited at a closed, lowered or shortened limit), a SET_DELAY
+/// raising C (the cap); every payload-level block is a Safe act, and a payload the Safe held (at its expiry or RELEASE)
+/// or voided (after UNVOID) always QUEUES for D, never mints at once. So in the t after any change that unblocks a packet
+/// at most C x t / 1 day mints at once. Not a block: RateLimited at an unchanged limit (the limiter's own refill: the
+/// instant cap's normal rate applies); Unconfigured cannot return after launch; ZeroAmount/BelowMinimum never pass. `tighten` never reverts on a set path (audit wave 5): each field lands at the tighter of its argument and what stands,
 /// so no one can make the Safe's signed act fail by applying a matured SET_DELAY first; a breaker lowered below what its
 /// window holds trips the path (audit wave 5). The window counts what QUEUED, cancelled claims included (a cancel refunds
 /// nothing, like the inbound limit), so a lowered B may trip on claims the Safe already cancelled (a review of the wave-5 fixes).
@@ -143,8 +150,10 @@ interface IMintableBurnable {
 /// AT THE LAUNCH VALUES: no human action over a 72 h weekend, 4C + B = 20,000 + 50,000 = 70,000, ABOVE the 4663 chain line
 /// (30,000), accepted for whales; the bound that holds the line is the Safe acting within D (12h),
 /// which cancels every queued forgery before it matures, leaving only the instant part, C x (1 + D / 1 day) = 7,500 <=
-/// 30,000. The breaker is the backstop for a Safe that takes longer, not the line's guarantee; a larger C or B, or a
-/// shorter D, widens both bounds (the Safe decides it in public, 48h ahead).
+/// 30,000, PROVIDED the Safe also does the void sweep before any reopening (a review before wave 5b; without it each reopening adds up
+/// to C x (1 + D' / 1 day), D' = its time to answer the first forged Received after the reopening). The breaker is the
+/// backstop for a Safe that takes longer, not the line's guarantee; a larger C or B, or a shorter D, widens both bounds
+/// (the Safe decides it in public, 48h ahead).
 ///
 /// FEE. Per destination, `feeBps[eid]` of each send (0 until the timelock sets it, at most MAX_FEE_BPS).
 /// The sender is burned the whole amount; the destination receives the amount less the fee (and less the dust below 1e-6
@@ -328,6 +337,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
     /// @notice Payload hashes (keccak256(guid ‖ message), EndpointV2's) voided by `voidPayload`, ENDPOINT_NILIFY or
     /// ENDPOINT_BURN: never executed here until UNVOID (audit wave 4).
     mapping(bytes32 payloadHash => bool) public voided;
+    /// @dev Payload hashes an UNVOID lifted (a review before wave 5b): such a payload queues for D when it runs, never mints at once.
+    mapping(bytes32 payloadHash => bool) internal unvoided;
     /// @notice Holds by path (srcEid, sender = the peer when placed) and nonce; at most one per nonce, ever.
     mapping(uint32 srcEid => mapping(bytes32 sender => mapping(uint64 nonce => HoldRecord))) public holds;
     /// @notice The receive library still valid at the endpoint after a re-pin with grace, and the block it stops (audit wave 4).
@@ -549,7 +560,8 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         // what does not fit the path's instant allowance waits the path's delay as a claim
         Meter storage mt = instantIn[origin.srcEid];
         (uint256 used, uint256 capSD) = _instantUsed(mt);
-        if (used + amount > capSD * CONVERSION) {
+        // a review before wave 5b: a payload the Safe blocked (held, at its expiry or RELEASE, or voided then UNVOIDed) never mints at once
+        if (used + amount > capSD * CONVERSION || until != 0 || unvoided[payloadHash]) {
             _queue(origin, to, amount);
             return;
         }
@@ -1016,9 +1028,6 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else if (kind == SET_PATH) {
             (, uint32 eid, bytes32 peer, uint256 outLimit, uint256 outWindow, uint256 inLimit, uint256 inWindow, bytes memory opts) =
                 abi.decode(payload, (uint8, uint32, bytes32, uint256, uint256, uint256, uint256, bytes));
-            // a review of the wave-5 fixes: a new peer or a raised inbound limit lets packets run that could not before (verified while
-            // the path was closed to them), so on a set path the instant allowance restarts empty, as at UNPAUSE
-            bool reopens = peer != peers[eid] || inLimit > inbound[eid].limit;
             peers[eid] = peer;
             enforcedOptions[eid] = opts;
             _setLimit(outbound[eid], outLimit, outWindow);
@@ -1030,7 +1039,9 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
                 b.day = uint40(block.timestamp / 1 days);
                 breakerBuckets[eid] = 1 << 255;
                 _setDelay(eid, DEFAULT_INSTANT_CAP, DEFAULT_DELAY, DEFAULT_QUEUE_BREAKER, 0);
-            } else if (reopens) {
+            } else {
+                // a review before wave 5b (the class): ANY SET_PATH on a set path can unblock packets (a peer back, a limit raised or its
+                // window shortened, after a close), so the instant allowance restarts empty, as at UNPAUSE
                 _meter(eid, instantIn[eid].capSD, true);
             }
             emit PathSet(eid, peer, outLimit, outWindow, inLimit, inWindow);
@@ -1067,6 +1078,7 @@ contract ImdBridge is Governed, TransientReentrancyGuard {
         } else if (kind == UNVOID) {
             (, bytes32 h) = abi.decode(payload, (uint8, bytes32));
             voided[h] = false;
+            unvoided[h] = true; // a review before wave 5b: it runs as a claim (waits D), never at once
             emit Unvoided(h);
         } else if (kind == RELEASE) {
             (, uint32 eid, bytes32 sender, uint64 nonce, bytes32 h) =

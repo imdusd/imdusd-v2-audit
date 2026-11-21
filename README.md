@@ -97,7 +97,7 @@ network is needed for the offline suites.
 
 ```bash
 forge build                                                    # solc via_ir: a clean build takes a long time
-forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,595 tests)
+forge test --no-match-path 'test/fork/*'                       # offline: unit + invariant suites (1,608 tests)
 forge build --use solar && forge test --use solar --no-match-path 'test/fork/*'   # fast dev loop (see below)
 
 # Fork suites: one file at a time, single-threaded (in parallel, set-up calls hit RPC rate limits)
@@ -158,7 +158,7 @@ deploys every contract below.
 | I. Measured depth | `DepthSampler`, `ImdDepth` | 430 |
 | Vendored (in scope as used) | `src/vendor/optimism`: `MerkleTrie`, `SecureMerkleTrie`, `RLPReader`, `RLPErrors`, `Bytes` (op-contracts/v9.0.0, imports made relative; PROVENANCE.md) | 349 |
 
-**Round 2: Robinhood Chain and the bridge, launching on 12-07 with the beta (1,886 nSLOC)**
+**Round 2: Robinhood Chain and the bridge, launching on 12-07 with the beta (1,883 nSLOC)**
 
 Audited early in wave 4 as "after the beta"; they now launch on 12-07. Robinhood Chain runs the SAME core contracts as
 Round 1 (one `Ledger`, `Parameters`, `Pricer`, ... per chain) with its own configuration; the chain-specific pieces are
@@ -166,9 +166,9 @@ below. The Robinhood configuration, its deploy scripts and the bridge Safe batch
 
 | Area | Contracts | nSLOC |
 |---|---|---|
-| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE` and `ImdUSD.checkBridge`; per-path inbound delay: instant cap, claims, cancels, bulk-cancel cutoff, queue breaker, governable settings; Safe-only pause, hold, void, cancel and tighten, no guardian), `Pulse` (the sequencer grace on a chain with no uptime feed) | 754 |
-| Stock tokens | `src/stocks/StockVault.sol`, `src/stocks/StockJoin.sol`, `src/feeds/MarketHoursFeed.sol`, `src/feeds/MarketCalendar.sol` | 377 |
-| Robinhood configuration | `library RobinhoodConfig` in `script/DeployConfig.sol` (types, mats, lines incl. the IMD line 0 at genesis and its raise payload, feeds, chain line, Pulse gap/grace, bridge limits and inbound-delay launch values, DVNs, confirmations, enforced `lzReceive` gas) | 304 |
+| Bridge | `src/bridge/ImdBridge.sol` (LayerZero V2 burn and mint; imdUSD's bridge minter, `Parameters`' `SET_BRIDGE` and `ImdUSD.checkBridge`; per-path inbound delay: instant cap, claims, cancels, bulk-cancel cutoff, queue breaker, governable settings; Safe-only pause, hold, void, cancel and tighten, no guardian), `Pulse` (the sequencer grace on a chain with no uptime feed) | 755 |
+| Stock tokens | `src/stocks/StockVault.sol`, `src/stocks/StockJoin.sol`, `src/feeds/MarketHoursFeed.sol`, `src/feeds/MarketCalendar.sol` | 374 |
+| Robinhood configuration | `library RobinhoodConfig` in `script/DeployConfig.sol` (types, mats, lines incl. the IMD line 0 at genesis and its raise payload, feeds, chain line, Pulse gap/grace, bridge limits and inbound-delay launch values, DVNs, confirmations, enforced `lzReceive` gas) | 303 |
 | Robinhood deploy | `script/DeployRobinhood.s.sol`, `script/DeployChain.s.sol`, `script/deploy/StageChain.sol` (Pulse, ImdBridge and the stock module as resumable deploy hooks) | 201 |
 | Bridge Safe batches | `script/launch/BridgeBatch.s.sol` (each chain's path BATCH, and the separate, gated `SET_BRIDGE` file), `script/launch/Safe4663.s.sol` (re-creates the mainnet governance Safe at the same address on 4663, simulation only) | 250 |
 
@@ -240,8 +240,9 @@ reading for the wiring (`script/deploy/Stage*.sol`): what is set at genesis and 
   what mints at once is at most the instant cap C per day (decaying; C + C x t / 1 day over any interval t); anything else
   queues and is claimable by anyone only after the path's delay D, inside which the Safe pauses the path or cancels; with
   no human action at all, at most the queue breaker B queued within 4 UTC days reaches a claim before the path trips
-  (launch values per path: C 5,000/day, D 12 h, B 50,000; limits 50,000 per day each way). Every act that lets packets
-  run again (UNPAUSE, a raised cap, a raised inbound limit, a new peer) restarts the instant allowance empty. The minimum transfer (10
+  (launch values per path: C 5,000/day, D 12 h, B 50,000; limits 50,000 per day each way). Every timelocked act that can let
+  a refused packet run again (UNPAUSE, ANY SET_PATH on a set path, a SET_DELAY raising C) restarts the instant allowance
+  empty, and a payload the Safe held or voided always queues for D when it runs (a hold is a delay, not a void). The minimum transfer (10
   imdUSD) bounds how many honest nonces a forger can consume. An off-chain watcher holds no key: it matches `Received`,
   `Queued` and `PacketVerified` on one chain with `Sent` on the other and alerts the Safe's signers.
 - **Robinhood Chain sequencer:** a silence longer than the Pulse gap opens a grace in which liquidations, stock auction
@@ -586,7 +587,9 @@ Price design:
 Stock tokens:
 - **The standing answer after 5 minutes.** From 09:35 New York a type with no in-session print (SGOV; SPY on quiet days)
   is priced from the overnight or heartbeat answer, trusted only through the feed's deviation trigger. Up to 5 minutes
-  of each open are unpriced (no borrow, bite or take; repay and deposit unaffected).
+  of each open are unpriced (no borrow, bite or take; repay and deposit unaffected). (changed before wave 5b: with the
+  old 25 h max age a quiet type was unpriced all Monday after a missed Sunday heartbeat; every stock type now has a 5-day
+  max age, see the wave-5 section.)
 - **Stuck stock.** Stock sent to a `StockVault` outside a deposit (or a reissue above what was burned) is stuck; a
   partial burn with no reissue closes deposits to that type for good (withdrawals, liquidation and write-off keep working).
 - **Auction clock bound.** Each span in which nobody could take costs at most `TICK_SPAN` (5 min) of descent; without
@@ -620,7 +623,8 @@ Bridge:
   transfers are not tripped); `test/unit/AuditW4BridgeInLimitLine.t.sol` records it. The safety case is the Safe acting
   within D of the first forged `Queued`: pause the path, or `tighten` the cap to 0 with a cutoff at or before that
   `Queued`, cancels everything queued, leaving only the instant part C x (1 + D / 1 day) = 7,500. Paging the signers is
-  off chain.
+  off chain. (changed before wave 5b: the 7,500 holds across a reopening only with the void sweep; see the wave-5
+  section's bound.)
 - **A pending loosening applies by anyone.** Every timelocked bridge act (SET_DELAY, UNPAUSE, RESET_BREAKER, UNCANCEL,
   ...) may be applied by anyone once its 48 h has run. In an incident the Safe must also `cancel()` any pending proposal;
   `tighten` bumps the path's settings version, so a SET_DELAY proposed before it is refused when applied, but other kinds
@@ -722,12 +726,32 @@ Price:
   changed.
 
 Bridge:
-- **Every reopening starts the instant allowance empty.** After an UNPAUSE, a SET_DELAY that raises C, or a SET_PATH that
-  changes the peer or raises the inbound limit on a set path, the path's instant allowance restarts EMPTY and refills at
-  C per day: honest transfers above the refill queue for D (12 h) and need a claim, for up to a day after the change. A
-  cap raise restarts the allowance empty rather than adding only its headroom. Residual: a forged stockpile verified
-  while the path was closed runs in pieces at C per day; the procedure before an UNPAUSE is to void every payload the
-  endpoint stores above the last nonce matched to a peer `Sent`. UNPAUSE is refused on an open path (`PathOpen`).
+- **Every reopening starts the instant allowance empty.** After an UNPAUSE, a SET_DELAY that raises C, or ANY SET_PATH
+  on a set path (outbound-only changes included; changed before wave 5b, it was only a peer change or a raised inbound
+  limit), the path's instant allowance restarts EMPTY and refills at C per day: honest transfers above the refill queue
+  for D (12 h) and need a claim, for up to a day after the change. A cap raise restarts the allowance empty rather than
+  adding only its headroom. UNPAUSE is refused on an open path (`PathOpen`).
+- **Held and voided payloads always queue (since wave 5b).** A payload the Safe held (at its expiry or RELEASE) or
+  voided and then UNVOIDed never mints at once: it queues for D, honest ones too. A hold is therefore a DELAY, not a
+  void: the claim a held forgery becomes must be cancelled within D. A hold placed by mistake costs the user D plus a
+  claim (anyone, or the keeper, claims).
+- **The loss bound across a reopening needs the VOID SWEEP (corrected before wave 5b).** On chain a stockpile verified
+  while the path was closed cannot be told from honest packets (lzReceive does not know when a packet was verified), so
+  no code rule queues exactly those. The incident rule: before ANY reopening (UNPAUSE, a SET_PATH, a SET_DELAY raising
+  C), after the DVN fix has applied, the Safe voids every payload the endpoint stores for the path that no peer `Sent`
+  matches (the nonces above `lazyInboundNonce`, plus any the watcher saw verified). At the launch values (C 5,000/day,
+  D 12 h, B 50,000):
+
+  | The Safe | Forged mints at most |
+  |---|---|
+  | acts within D (pause, or C 0 with a cutoff at or before the first forged `Queued`) AND sweeps before every reopening | C x (1 + D / 1 day) = 7,500, across any number of reopenings |
+  | acts within D but does not sweep | 7,500 plus C x (1 + D' / 1 day) per reopening (D' = its time to answer the first forged instant `Received` after it; e.g. a 20,000 stockpile drains at <= C per day past 7,500) |
+  | takes no action at all | 4C + B = 70,000 in any 72 h (above the 4663 line of 30,000, accepted) |
+
+  The pieces that run without the sweep are instant `Received` with no `Queued`; the watcher's Received-vs-Sent rule
+  names each. Residual of the sweep: a packet the endpoint refused (hash replaced, lower nonce unverified) and later
+  re-verified is a new verification after the sweep. `test/unit/AuditW5BridgeIncidentBound.t.sol`,
+  `test/unit/AuditW5BridgeUnblockClass.t.sol`.
 - **RESET_BREAKER only on a paused path.** It is accepted only on a paused path, at proposal and at application, so
   releasing a trip also stops sends and receipts on that path until the BATCH [RESET_BREAKER, UNPAUSE] applies (48 h).
 - **Incident acts are silent no-ops on a stale target.** `hold` (nonce executed, empty, NIL or held before),
@@ -747,12 +771,16 @@ Bridge:
   other constants nothing outside reads (MIN_WINDOW, MAX_WINDOW, MIN_AMOUNT, MAX_RECEIVE_GRACE, SHARED_DECIMALS,
   MAX_FEE_BPS, MIN_CONFIRMATIONS_FROM_ETHEREUM, ETHEREUM_EID, INSTANT_WINDOW, BREAKER_DAYS, CONVERSION,
   MIN_CONFIRMATIONS_FROM_OTHER) have no public getter; integrations use the literal kinds (1-15, listed in the NatSpec).
-  `sharedDecimals()` still answers. Enforced `lzReceive` gas stays 250,000 (worst measured 192,299; about 653,000 at the
-  published Glamsterdam prices).
+  `sharedDecimals()` still answers. Enforced `lzReceive` gas stays 250,000 (worst measured 194,511 under Solar, 198,284
+  under solc since wave 5b's queue rule, was 192,299; about 655,000-659,000 at the published Glamsterdam prices, so the
+  Safe raises it before that fork).
 
 Stock tokens:
 - **Dead shares.** The first deposit into a never-used `StockVault` mints `DEAD_SHARES` (10^12, 10^6 wei of stock at the
-  opening rate) to `0x…dEaD`, paid by that depositor; the supply never falls below it again. The dead shares are a holder
+  opening rate) to `0x…dEaD`, paid by that depositor; the supply never falls below it again. An EMPTIED vault (dead
+  shares only) restarts exactly like a never-used one: the restarting depositor pays the dead shares again (they are
+  re-backed, none minted), and a restart under 10^6 + 1 wei reverts `NoShares`. (changed before wave 5b: a 1 wei deposit
+  into an emptied vault pinned its share rate at 10^-6 of the opening rate.) The dead shares are a holder
   like any other: they keep DEAD_SHARES / supply of a forfeited reissue (about 10^-14 for real positions).
 - **Write-off needs chained readings.** `writeOff` arms at the first worthless reading; readings at most `WRITEOFF_STEP`
   (15 min) apart write the type off at the first reading at or after `worthlessSince + WRITEOFF_DELAY` (1 h); a longer
@@ -764,10 +792,38 @@ Stock tokens:
   seizes a position whose custody holds less than that. A donation of at least 10^-6 of the claim keeps a hollowed type
   priced at that value, on the liquidation path: the griefing costs that donation.
 - **Stock RateFeeds are uncapped.** A stock type's share rate follows the vault's live rate (`RateFeed.UNCAPPED`): on a
-  `StockVault` nothing but a reissue or a forfeit moves the rate, so the growth cap protected nothing and withheld a
+  `StockVault` nothing but a reissue or a forfeit moves the rate (true since wave 5b's restart fix; before it, a 1 wei
+  restart of an emptied vault also moved it), so the growth cap protected nothing and withheld a
   forfeited reissue from the holders who stayed. A deploy-config choice, not a contract change.
-- **SGOV max age 5 days.** Covers a missed Sunday heartbeat after a weekend and a Monday holiday; a dead SGOV feed prices
-  up to about 5 days (a T-bill fund moves ~0.02% a day against a 15% buffer).
+- **Every stock type's max age is 5 days (since wave 5b; was SGOV only, the other 8 at 25 h).** Measured on 4663 over
+  108 sessions (2026-06-22..11-20): no feed prints Saturday or Sunday daytime (weekend gaps 74-81 h); with one print
+  missed the worst in-session age was SPY 100.7 h and AAPL 70.4 h, so at 25 h a quiet ticker was unpriced all Monday
+  after a missed Sunday heartbeat. `STOCK_MAX_AGE` 5 days covers Thursday 20:00 -> Tuesday 16:00 New York (116 h: a
+  weekend plus a Monday holiday with its heartbeat missed). TRADE-OFF: max age only detects a DEAD feed (a live one is
+  held within 0.5% by its deviation trigger), and a dead feed now prices up to 5 days on every ticker; on a volatile one
+  (MSTR, CRCL, TSLA) a dead feed could miss a move beyond the mat's buffer. The operator alerts on any feed silent past
+  25 h in session. `CL_MAX_AGE` (25 h) stays for the non-stock feeds (the peg quote feed and the other Chainlink nodes).
+
+### What changed since the sixth commit (4fa4530)
+
+For the re-check: the seventh commit of this repository is the whole delta, from a review of the wave-5 fixes before
+wave 5b. Bridge: the unblock CLASS, derived from `lzReceive`'s revert reasons. At the path level every timelocked act
+that lifts a block restarts the instant allowance empty: UNPAUSE, ANY SET_PATH on a set path (replacing the peer /
+inbound-limit comparison; a shortened inbound window and an outbound-only change included), a SET_DELAY raising C. At
+the payload level a payload the Safe blocked always queues for D when it runs: a held nonce at its expiry or RELEASE
+(`until != 0`), and a payload UNVOIDed (new internal `unvoided[hash]`, set by UNVOID). The VOID SWEEP before any
+reopening is documented as the incident rule in `ImdBridge`'s header, with the loss bound above. Stocks: an emptied
+`StockVault` restarts like a never-used one (`previewDeposit`/`previewMint` charge `DEAD_SHARES` whenever supply <=
+`DEAD_SHARES`); every stock type's max age 5 days (`RobinhoodConfig.STOCK_MAX_AGE`). Tests:
+`AuditW5BridgeUnblockClass` (fuzz over six unblocking routes), `AuditW5BridgeIncidentBound` (the bound with and without
+the sweep), `test/invariant/BridgeInvariants.t.sol` (`invariant_unblockedPacketWithinTheRate` replaces
+`invariant_reopeningStartsEmpty`: a packet is "unblocked" when the harness finds a packet that reverted executable,
+whatever act or time did it; new handler actions for voids, holds, UNVOID, RELEASE, UNPAUSE and window changes),
+`AuditW5bStockMaxAge`, and the restart cases in `AuditW5StockFirstMint` (the share RATE, not only the value) and
+`AuditW4StockVault`; held and unvoided payloads now run as claims in `BridgeHold`, `AuditW4BridgeNilifyReverify` and
+`test/fork/AuditW4BridgeEndpoint.t.sol`; the `RobinhoodStocks` auction fork tests size their debt from the fork block's
+SPY answer (they no longer depend on the market); `lzReceive` gas comments updated. Each new property test fails on
+4fa4530.
 
 ### What changed since the fifth public audit (422a337)
 

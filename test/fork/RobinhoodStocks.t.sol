@@ -65,6 +65,14 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
         d.ledger.open(SPY, 0, Adjust(int256(amount), int256(debt), 0.05e18, 0, 0, true, type(uint256).max, address(0)));
     }
 
+    /// @dev Debt for `amount` SPY that is healthy at the fork block's answer by a 10% margin (collateral ratio = mat x 1.1)
+    /// whatever SPY trades at (market-independent): a 20% fall then puts it under mat (0.8 x 1.1 = 0.88), triggering the
+    /// auction, while the sale at 80% still covers the debt.
+    function _debtAtMargin(uint256 amount) internal view returns (uint256) {
+        uint256 value = amount * uint256(spyAnswer) * 1e10 / 1e18; // 8-decimal answer -> 18-decimal USD
+        return value * 1e18 / (uint256(d.params.risk(SPY).mat) * 11 / 10);
+    }
+
     /// @dev An hour into a session that still has at least an hour to run (the fork block may sit late in one).
     function _inSession() internal {
         uint256 t = _nextOpen(vm.getBlockTimestamp() + 1);
@@ -240,7 +248,7 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
     /// @notice The auction settled in USDG, its SPY sold on the real SPY/USDG v4 pool: the liquidator's whole round trip.
     function test_auctionSettledInUsdgAndSoldOnTheRealPool() public {
         _inSession();
-        _position(3e18, 1_500e18);
+        _position(3e18, _debtAtMargin(3e18)); // market-independent (was a fixed 1,500: unhealthy at open once SPY < ~$700)
         _spy(spyAnswer * 80 / 100);
         d.liquidator.liquidate(_pid(SPY, alice));
         _walk(vm.getBlockTimestamp() + 30 minutes);
@@ -268,7 +276,7 @@ contract RobinhoodStocksTest is RobinhoodStocksFork {
     /// the price resumes where it stood (at most TICK_SPAN lower) and a take settles.
     function test_usdgFreezeAtTheJoinStopsTheAuctionClock() public {
         _inSession();
-        _position(3e18, 1_500e18);
+        _position(3e18, _debtAtMargin(3e18)); // market-independent (was a fixed 1,500: unhealthy at open once SPY < ~$700)
         _spy(spyAnswer * 80 / 100);
         uint256 id = _pid(SPY, alice);
         d.liquidator.liquidate(id);

@@ -31,7 +31,7 @@ abstract contract BridgeBatch is SafeBatch {
     }
 
     /// @notice The path's enforced options: the ONE source is RobinhoodConfig.enforcedOptions() (lzReceive gas LZ_RECEIVE_GAS =
-    /// 250,000; the worst path measured with the real ImdUSD today is 192,275, see its note for Glamsterdam), so a path cannot
+    /// 250,000; the worst path measured with the real ImdUSD today is 192,299, see its note for Glamsterdam), so a path cannot
     /// carry another value.
     function enforcedOptions() public pure returns (bytes memory) {
         return RobinhoodConfig.enforcedOptions();

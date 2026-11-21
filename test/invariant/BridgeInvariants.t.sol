@@ -351,10 +351,15 @@ contract BridgeAttackHandler is Test {
     uint256 public ok_reset;
     uint256 public staleReset; // B3: a RESET_BREAKER naming an earlier trip applied
     uint256[] internal ghostQueueAt; // queue times since the last reset (with amounts)
-    // a review of the wave-5 fixes: every reopening (UNPAUSE, a cap raise, an inbound-limit raise) and what minted at once since the last one
-    uint256 public reopenAt;
-    uint256 public mintedSinceReopen;
-    uint256 public reopenings;
+    // a review before wave 5b: a reopening defined from the harness, not the code's list: a packet whose execution REVERTED (for any
+    // reason but the inbound limiter's own refill) and that the harness later finds executable has been UNBLOCKED; when it
+    // then mints at once, its amount must fit C x (time since it was found executable) / 1 day
+    mapping(uint256 => uint256) public blockedAt; // packet -> when an execution of it last reverted (0 = never / cleared)
+    mapping(uint256 => uint256) public unblockedAt; // packet -> when the harness first found it executable after that
+    uint256 public unblockedMintedAtOnce; // violations
+    uint256 public unblocks; // packets seen going from blocked to executable
+    uint256 public unblockedRuns; // such packets that then executed
+    bytes32[] internal voidedAll;
     uint256 public ok_tightenC;
     uint256[] internal ghostQueueAmt;
 
@@ -403,6 +408,51 @@ contract BridgeAttackHandler is Test {
         forged[i] = true;
     }
 
+    /// A forged packet that fits the instant cap (a review before wave 5b: so an unblocked one would mint at once), and the newest packet
+    /// acted on directly, to reach block -> unblock -> run sequences within the fuzzer's depth.
+    function forgeSmall(uint256 amount) external {
+        bytes memory m = abi.encodePacked(_b32(attacker), uint64(bound(amount, 10e18, 5_000e18) / 1e12));
+        forged[homeEp.forge(RH, _b32(address(rh)), _b32(address(t.homeAddr())), m)] = true;
+        _probe();
+    }
+
+    function voidLatest() external {
+        uint256 n = homeEp.packetCount();
+        if (n != 0) this.voidPayload(n - 1);
+    }
+
+    function holdLatest() external {
+        uint256 n = homeEp.packetCount();
+        if (n != 0) this.hold(n - 1);
+    }
+
+    /// Since a review before wave 5b: the unblocking acts as their own actions (so the fuzzer reaches them as often as the blocking ones).
+    function unvoid() external {
+        this.govern(6);
+    }
+
+    function release() external {
+        this.govern(7);
+    }
+
+    function unpause() external {
+        this.govern(4);
+    }
+
+    function shortenInboundWindow() external {
+        this.govern(14);
+    }
+
+    function letHoldsExpire() external {
+        vm.warp(vm.getBlockTimestamp() + T);
+        _probe();
+    }
+
+    function deliverLatest() external {
+        uint256 n = homeEp.packetCount();
+        if (n != 0) this.deliver(n - 1);
+    }
+
     function deliver(uint256 idx) external {
         uint256 n = homeEp.packetCount();
         if (n == 0) return;
@@ -414,9 +464,13 @@ contract BridgeAttackHandler is Test {
         (,,, uint64 nonce,,,,) = homeEp.packets(idx);
         uint256 q0 = rh.queued();
         uint256 b0 = rhTok.totalSupply();
-        if (!homeEp.deliver(idx)) return;
+        if (!homeEp.deliver(idx)) {
+            _markBlocked(idx, nonce, h, amount);
+            return;
+        }
         ok_deliver++;
         _afterExecute(idx, nonce, amount, q0, b0);
+        _checkUnblocked(idx, rhTok.totalSupply() - b0);
         if (ghostHoldAt[nonce] != 0) {
             bool early = !ghostReleased[nonce] && vm.getBlockTimestamp() < ghostHoldAt[nonce] + T;
             if (early || h != ghostHoldHash[nonce]) heldExecuted++;
@@ -441,7 +495,6 @@ contract BridgeAttackHandler is Test {
             ghostQueueAt.push(vm.getBlockTimestamp());
             ghostQueueAmt.push(amount);
         } else {
-            mintedSinceReopen += rhTok.totalSupply() - b0;
             instantMinted += rhTok.totalSupply() - b0;
             if (forged[idx]) forgedSpendable += amount;
         }
@@ -519,6 +572,7 @@ contract BridgeAttackHandler is Test {
     function pause() external {
         vm.prank(safe);
         rh.pause(HOME);
+        _probe();
     }
 
     /// The Safe's instant permanent void of packet idx's payload hash.
@@ -532,7 +586,9 @@ contract BridgeAttackHandler is Test {
         rh.voidPayload(h);
         ok_void++;
         ghostVoided[h] = true;
+        voidedAll.push(h);
         if (!forged[idx]) voidedHonest.push(h);
+        _probe();
     }
 
     /// The Safe's instant hold on packet idx's nonce (whatever the endpoint stores there).
@@ -552,6 +608,7 @@ contract BridgeAttackHandler is Test {
         ghostHoldHash[nonce] = stored;
         if (boundHash != stored) holdRenewed++;
         heldNonces.push(nonce);
+        _probe();
     }
 
     /// H2 as a liveness check: an honest packet whose hold has ended runs for anyone when nothing else stops it (path open,
@@ -577,11 +634,60 @@ contract BridgeAttackHandler is Test {
         vm.prank(address(uint160(uint256(keccak256(abi.encode(idx, nonce))))));
         if (homeEp.deliver(idx)) {
             _afterExecute(idx, nonce, homeEp.amountOf(idx), q0, b0);
+            _checkUnblocked(idx, rhTok.totalSupply() - b0);
             ok_expiredRun++;
             ok_deliver++;
             inboundExecuted++;
         } else {
             honestLost++;
+        }
+    }
+
+    /// @dev An execution of packet idx reverted. A block unless the only reason is the inbound limiter at an open, nonzero
+    /// limit (its refill is the instant cap's normal rate, not a reopening); zero and dust packets never run (not blocks).
+    function _markBlocked(uint256 idx, uint64 nonce, bytes32 h, uint256 amount) internal {
+        if (amount < 10e18) return;
+        // refused by the ENDPOINT, not the bridge (its hash replaced by another verify, or a lower nonce not verified): a
+        // later (re-)verification is a new verification, the residual the void sweep answers, not an unblock here
+        bytes32 sender = _b32(address(t.homeAddr()));
+        if (rhEp.inboundPayloadHash(address(rh), HOME, sender, nonce) != h) return;
+        for (uint64 j = rhEp.lazyInboundNonce(address(rh), HOME, sender) + 1; j < nonce; ++j) {
+            if (rhEp.inboundPayloadHash(address(rh), HOME, sender, j) == bytes32(0)) return;
+        }
+        (uint128 lim,,,) = rh.inbound(HOME);
+        bool limiterOnly = lim != 0 && rh.availableIn(HOME) < amount && !rh.paused(HOME) && !ghostVoided[h]
+            && (ghostHoldAt[nonce] == 0 || vm.getBlockTimestamp() >= ghostHoldAt[nonce] + T);
+        if (limiterOnly) return;
+        (blockedAt[idx], unblockedAt[idx]) = (vm.getBlockTimestamp(), 0);
+    }
+
+    /// @dev Packet idx just executed and minted `minted` at once (0 if it queued): if it had been blocked, that must fit the
+    /// instant cap's rate since the harness found it executable.
+    function _checkUnblocked(uint256 idx, uint256 minted) internal {
+        if (blockedAt[idx] == 0) return;
+        unblockedRuns++;
+        uint256 since = unblockedAt[idx] == 0 ? 0 : vm.getBlockTimestamp() - unblockedAt[idx];
+        if (minted > rh.DEFAULT_INSTANT_CAP() * since / 1 days) unblockedMintedAtOnce++;
+    }
+
+    /// @dev After every state change: try each recent undelivered packet in a snapshot. A revert marks it blocked; a
+    /// blocked packet that now executes is unblocked NOW (whatever act or time did it).
+    function _probe() internal {
+        uint256 n = homeEp.packetCount();
+        for (uint256 i = n > 12 ? n - 12 : 0; i < n; ++i) {
+            if (homeEp.isDelivered(i)) continue;
+            (,,, uint64 nonce,,,,) = homeEp.packets(i);
+            bytes32 h = homeEp.payloadHashOf(i);
+            uint256 amount = homeEp.amountOf(i);
+            uint256 snap = vm.snapshotState();
+            bool ok = homeEp.deliver(i);
+            vm.revertToState(snap);
+            if (!ok) {
+                _markBlocked(i, nonce, h, amount);
+            } else if (blockedAt[i] != 0 && unblockedAt[i] == 0) {
+                unblockedAt[i] = vm.getBlockTimestamp();
+                unblocks++;
+            }
         }
     }
 
@@ -602,15 +708,17 @@ contract BridgeAttackHandler is Test {
 
     function passTime(uint256 dt) external {
         vm.warp(vm.getBlockTimestamp() + bound(dt, 1 minutes, 36 hours));
+        _probe();
     }
 
     /// 0 bare SET_PATH (same limits), 1 bare receive pin, 2 pin + config, 3 config change, 4 UNPAUSE, 5 [config, UNPAUSE],
     /// 6 UNVOID of an honest payload voided by mistake, 7 RELEASE (early) of the last hold, with the hash it binds,
     /// 8 UNCANCEL of the last cancelled claim, 9 RESET_BREAKER of the current trip, 10 RESET_BREAKER of an earlier trip
     /// 11 SET_DELAY restoring the launch cap (D and B as they stand), 12 SET_PATH closing the inbound side (limit 0, on a
-    /// paused path), 13 SET_PATH reopening it (a review of the wave-5 fixes: both reopening routes under the invariant)
+    /// paused path), 13 SET_PATH reopening it (a review of the wave-5 fixes), 14 SET_PATH shortening the inbound window to 1 h, 15 back to
+    /// 1 day (a review before wave 5b); 6 UNVOIDs the last voided payload, forged or honest (a review before wave 5b)
     function govern(uint256 what) external {
-        what %= 14;
+        what %= 16;
         bytes32 unc;
         uint64 relNonce;
         bytes memory p;
@@ -629,8 +737,8 @@ contract BridgeAttackHandler is Test {
         } else if (what == 5) {
             p = _two(t.recvCfg(rhEp.receiveLibrary(address(rh), HOME), HOME, ++dvnBase * 16), abi.encode(uint8(5), HOME));
         } else if (what == 6) {
-            if (voidedHonest.length == 0) return;
-            p = abi.encode(uint8(11), voidedHonest[voidedHonest.length - 1]);
+            if (voidedAll.length == 0) return;
+            p = abi.encode(uint8(11), voidedAll[voidedAll.length - 1]);
         } else if (what == 9 || what == 10) {
             (, uint16 trips,,,,,) = rh.breakers(HOME);
             if (what == 10 && trips < 2) return;
@@ -650,8 +758,10 @@ contract BridgeAttackHandler is Test {
             vm.prank(safe);
             rh.pause(HOME);
             p = abi.encode(uint8(1), HOME, _b32(address(t.homeAddr())), L, uint256(1 days), uint256(0), uint256(1 days), bytes(""));
-        } else if (what == 13) {
+        } else if (what == 13 || what == 15) {
             p = abi.encode(uint8(1), HOME, _b32(address(t.homeAddr())), L, uint256(1 days), L, uint256(1 days), bytes(""));
+        } else if (what == 14) {
+            p = abi.encode(uint8(1), HOME, _b32(address(t.homeAddr())), L, uint256(1 days), L, uint256(1 hours), bytes(""));
         } else if (what == 8) {
             if (cancelledKeys.length == 0) return;
             unc = cancelledKeys[cancelledKeys.length - 1];
@@ -665,21 +775,18 @@ contract BridgeAttackHandler is Test {
         vm.prank(safe);
         try rh.propose(p) {}
         catch {
+            _probe();
             return;
         }
         vm.warp(vm.getBlockTimestamp() + 48 hours);
-        (bool p0, uint256 in0, uint64 cap0) = _openState();
         try rh.applyPending() {
             ok_govern++;
-            (bool p1, uint256 in1, uint64 cap1) = _openState();
-            if ((p0 && !p1) || in1 > in0 || cap1 > cap0) {
-                (reopenAt, mintedSinceReopen) = (vm.getBlockTimestamp(), 0);
-                reopenings++;
-            }
             if (what == 2) ghostConfigured[newLib] = true;
             if (what == 6) {
-                ghostVoided[voidedHonest[voidedHonest.length - 1]] = false;
-                voidedHonest.pop();
+                bytes32 uh = voidedAll[voidedAll.length - 1];
+                ghostVoided[uh] = false;
+                voidedAll.pop();
+                if (voidedHonest.length != 0 && voidedHonest[voidedHonest.length - 1] == uh) voidedHonest.pop();
             }
             if (what == 7) {
                 ghostReleased[relNonce] = true;
@@ -702,13 +809,7 @@ contract BridgeAttackHandler is Test {
             vm.prank(safe);
             rh.cancel();
         }
-    }
-
-    function _openState() internal view returns (bool paused_, uint256 inLimit, uint64 capSD) {
-        paused_ = rh.paused(HOME);
-        (uint128 lim,,,) = rh.inbound(HOME);
-        inLimit = lim;
-        (,, capSD) = rh.instantIn(HOME);
+        _probe();
     }
 
     function _two(bytes memory a, bytes memory b) internal pure returns (bytes memory) {
@@ -836,12 +937,11 @@ contract BridgeAttackInvariantsTest is W4Bridge {
         );
     }
 
-    /// The empty allowance on every route (a review of the wave-5 fixes): from the last reopening (UNPAUSE, a cap raise, an inbound-limit raise) what mints
-    /// at once is at most C x t / 1 day: the allowance restarts empty, so a stockpile cannot mint a fresh C at once.
-    function invariant_reopeningStartsEmpty() public view {
-        if (handler.reopenAt() == 0) return;
-        uint256 t = vm.getBlockTimestamp() - handler.reopenAt();
-        assertLe(handler.mintedSinceReopen(), rh.DEFAULT_INSTANT_CAP() * t / 1 days, "a reopening minted a fresh cap at once");
+    /// The reopening class (a review before wave 5b), defined from the harness and not from the code's list: a packet whose execution
+    /// reverted (any reason but the limiter's own refill) and that the harness later finds executable was unblocked then;
+    /// if it mints at once, its amount fits C x (time since) / 1 day (a payload the Safe held or voided: nothing at once).
+    function invariant_unblockedPacketWithinTheRate() public view {
+        assertEq(handler.unblockedMintedAtOnce(), 0, "an unblocked packet minted at once above C x t / 1 day");
     }
 
     /// D7: queued == Σ pending claims, and supply == received - sent (token-only harness: no ledger terms).
@@ -962,28 +1062,33 @@ contract BridgeAttackInvariantsTest is W4Bridge {
         invariant_acceptedApplies();
     }
 
-    /// Non-hollow for the reopening routes (a review of the wave-5 fixes): a cap restore, an inbound close + UNPAUSE, an inbound reopen, each
-    /// a reopening, with a stockpile run after each; the invariant holds.
-    function test_reopenRoutesHandlerActionsSucceed() public {
-        handler.tightenCap(0);
-        handler.forge(2, 2_000e18, 0); // packet 0, stockpiled
+    /// Non-hollow for the unblock class (a review before wave 5b): packets blocked by a pause, a void, a hold and the inbound limit
+    /// at 0, then unblocked by UNPAUSE, UNVOID, RELEASE, a hold's expiry, an inbound reopen and a window change; the harness
+    /// finds each executable and the invariant holds.
+    function test_unblockRoutesHandlerActionsSucceed() public {
+        handler.forge(2, 2_000e18, 0); // packet 0
         handler.forge(2, 2_000e18, 0); // packet 1
         handler.forge(2, 2_000e18, 0); // packet 2
-        handler.passTime(1 days);
-        handler.govern(11); // C restored: reopening 1
-        assertEq(handler.reopenings(), 1);
+        handler.forge(2, 2_000e18, 0); // packet 3
+        handler.passTime(36 hours);
+        handler.voidPayload(1); // packet 1 voided
+        handler.hold(2); // packet 2 held
+        handler.pause(); // all blocked
         handler.deliver(0);
-        invariant_reopeningStartsEmpty();
-        handler.govern(12); // pause + inbound closed
-        handler.govern(4); // UNPAUSE: reopening 2
-        assertEq(handler.reopenings(), 2);
-        handler.passTime(1 days);
-        handler.govern(13); // inbound reopened: reopening 3
-        assertEq(handler.reopenings(), 3);
+        handler.govern(4); // UNPAUSE: packet 0 (and 3) unblocked
+        handler.deliver(0);
+        handler.govern(6); // UNVOID packet 1
         handler.deliver(1);
+        handler.govern(7); // RELEASE packet 2 (inside its hold)
         handler.deliver(2);
-        assertGt(handler.ok_deliver(), 2);
-        invariant_reopeningStartsEmpty();
+        handler.govern(12); // pause + inbound closed: packet 3 blocked
+        handler.govern(4); // UNPAUSE (still inbound 0)
+        handler.passTime(1 days);
+        handler.govern(14); // window change with limit 50,000: inbound reopened
+        handler.deliver(3);
+        assertGt(handler.unblocks(), 3);
+        assertGt(handler.unblockedRuns(), 3);
+        invariant_unblockedPacketWithinTheRate();
         invariant_queuedAccounting();
         invariant_acceptedApplies();
     }

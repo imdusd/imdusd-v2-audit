@@ -62,6 +62,9 @@ contract AuditW4BridgeNilifyReverifyTest is W4Bridge {
         assertFalse(homeEp.deliver(h), "voided payload executed without the timelock");
         _govern(rh, abi.encode(uint8(11), ph));
         assertTrue(homeEp.deliver(h), "no re-verification needed");
+        // a review before wave 5b: an unvoided payload runs as a claim (never at once); anyone claims it after the delay
+        vm.warp(vm.getBlockTimestamp() + rh.DEFAULT_DELAY());
+        rh.claim(HOME, _claimKey(homeEp, h));
         assertEq(rhTok.balanceOf(alice), 100e18);
     }
 }
